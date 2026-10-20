@@ -1,0 +1,477 @@
+//! wl_compositor, wl_surface, wl_region, wl_subcompositor: double-buffered
+//! surface state, subsurface sync semantics and commit handling.
+
+use wayland_server::backend::{ClientId, ObjectId};
+use wayland_server::protocol::{
+    wl_buffer, wl_callback, wl_compositor, wl_output, wl_region, wl_subcompositor, wl_subsurface, wl_surface,
+};
+use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
+
+use crate::shm::Texture;
+use crate::state::{State, guard};
+
+#[derive(Debug, Clone, Copy)]
+pub enum RegionOp {
+    Add(i32, i32, i32, i32),
+    Sub(i32, i32, i32, i32),
+}
+
+fn region_contains(ops: &[RegionOp], x: i32, y: i32) -> bool {
+    let inside = |rx: i32, ry: i32, rw: i32, rh: i32| x >= rx && y >= ry && x < rx.saturating_add(rw) && y < ry.saturating_add(rh);
+    let mut r = false;
+    for op in ops {
+        match *op {
+            RegionOp::Add(a, b, c, d) if inside(a, b, c, d) => r = true,
+            RegionOp::Sub(a, b, c, d) if inside(a, b, c, d) => r = false,
+            _ => {}
+        }
+    }
+    r
+}
+
+/// Double-buffered state (pending or cached for synchronized subsurfaces).
+#[derive(Default)]
+pub struct SurfState {
+    /// None = no attach; Some(None) = attached null (unmap).
+    pub buffer: Option<Option<wl_buffer::WlBuffer>>,
+    pub scale: Option<i32>,
+    /// None = unchanged; Some(None) = infinite.
+    pub input: Option<Option<Vec<RegionOp>>>,
+    pub frame_cbs: Vec<wl_callback::WlCallback>,
+}
+
+impl SurfState {
+    fn merge(&mut self, newer: SurfState) {
+        if newer.buffer.is_some() {
+            self.buffer = newer.buffer;
+        }
+        if newer.scale.is_some() {
+            self.scale = newer.scale;
+        }
+        if newer.input.is_some() {
+            self.input = newer.input;
+        }
+        self.frame_cbs.extend(newer.frame_cbs);
+    }
+}
+
+pub struct SubInfo {
+    pub parent: ObjectId,
+    pub pos: (i32, i32),
+    pub pending_pos: Option<(i32, i32)>,
+    pub sync: bool,
+}
+
+pub enum Role {
+    None,
+    Xdg,
+    Sub,
+    Cursor,
+}
+
+pub struct Surface {
+    pub res: wl_surface::WlSurface,
+    pub pending: SurfState,
+    /// State committed on a synchronized subsurface, applied with the parent.
+    pub cached: Option<SurfState>,
+    pub texture: Option<Texture>,
+    pub buffer_scale: i32,
+    pub input: Option<Vec<RegionOp>>,
+    pub frame_cbs: Vec<wl_callback::WlCallback>,
+    pub role: Role,
+    /// The xdg_surface object, if one was created for this surface.
+    pub xdg: Option<ObjectId>,
+    pub sub: Option<SubInfo>,
+    pub above: Vec<ObjectId>,
+    pub below: Vec<ObjectId>,
+}
+
+impl Surface {
+    pub fn logical_size(&self) -> Option<(i32, i32)> {
+        let t = self.texture.as_ref()?;
+        let s = self.buffer_scale.max(1);
+        Some((t.width / s, t.height / s))
+    }
+
+    pub fn accepts_input(&self, x: i32, y: i32) -> bool {
+        match &self.input {
+            None => true,
+            Some(ops) => region_contains(ops, x, y),
+        }
+    }
+}
+
+impl GlobalDispatch<wl_compositor::WlCompositor, ()> for State {
+    fn bind(_: &mut State, _: &DisplayHandle, _: &Client, res: New<wl_compositor::WlCompositor>, _: &(), init: &mut DataInit<'_, State>) {
+        init.init(res, ());
+    }
+}
+
+impl Dispatch<wl_compositor::WlCompositor, ()> for State {
+    fn request(
+        st: &mut State,
+        client: &Client,
+        _: &wl_compositor::WlCompositor,
+        req: wl_compositor::Request,
+        _: &(),
+        dh: &DisplayHandle,
+        init: &mut DataInit<'_, State>,
+    ) {
+        guard("wl_compositor", client, dh, || match req {
+            wl_compositor::Request::CreateSurface { id } => {
+                let s = init.init(id, ());
+                if s.version() >= 6 {
+                    s.preferred_buffer_scale(st.scale);
+                    s.preferred_buffer_transform(wl_output::Transform::Normal);
+                }
+                st.surfaces.insert(
+                    s.id(),
+                    Surface {
+                        res: s,
+                        pending: SurfState::default(),
+                        cached: None,
+                        texture: None,
+                        buffer_scale: 1,
+                        input: None,
+                        frame_cbs: Vec::new(),
+                        role: Role::None,
+                        xdg: None,
+                        sub: None,
+                        above: Vec::new(),
+                        below: Vec::new(),
+                    },
+                );
+            }
+            wl_compositor::Request::CreateRegion { id } => {
+                let r = init.init(id, ());
+                st.regions.insert(r.id(), Vec::new());
+            }
+            _ => {}
+        });
+    }
+}
+
+impl Dispatch<wl_region::WlRegion, ()> for State {
+    fn request(
+        st: &mut State,
+        _: &Client,
+        r: &wl_region::WlRegion,
+        req: wl_region::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, State>,
+    ) {
+        let Some(ops) = st.regions.get_mut(&r.id()) else { return };
+        match req {
+            wl_region::Request::Add { x, y, width, height } => ops.push(RegionOp::Add(x, y, width, height)),
+            wl_region::Request::Subtract { x, y, width, height } => ops.push(RegionOp::Sub(x, y, width, height)),
+            _ => {}
+        }
+        // Bound the op list so a client cannot grow it forever.
+        if ops.len() > 4096 {
+            ops.drain(..2048);
+        }
+    }
+
+    fn destroyed(st: &mut State, _: ClientId, r: &wl_region::WlRegion, _: &()) {
+        st.regions.remove(&r.id());
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for State {
+    fn request(_: &mut State, _: &Client, _: &wl_callback::WlCallback, _: wl_callback::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, State>) {}
+}
+
+impl Dispatch<wl_surface::WlSurface, ()> for State {
+    fn request(
+        st: &mut State,
+        client: &Client,
+        res: &wl_surface::WlSurface,
+        req: wl_surface::Request,
+        _: &(),
+        dh: &DisplayHandle,
+        init: &mut DataInit<'_, State>,
+    ) {
+        guard("wl_surface", client, dh, || {
+            let sid = res.id();
+            match req {
+                wl_surface::Request::Frame { callback } => {
+                    let cb = init.init(callback, ());
+                    if let Some(s) = st.surfaces.get_mut(&sid) {
+                        s.pending.frame_cbs.push(cb);
+                    }
+                }
+                wl_surface::Request::Commit => commit(st, &sid),
+                _ => {
+                    let Some(s) = st.surfaces.get_mut(&sid) else { return };
+                    match req {
+                        wl_surface::Request::Attach { buffer, .. } => s.pending.buffer = Some(buffer),
+                        wl_surface::Request::SetBufferScale { scale } => {
+                            if scale < 1 {
+                                res.post_error(wl_surface::Error::InvalidScale, "scale must be positive");
+                            } else {
+                                s.pending.scale = Some(scale);
+                            }
+                        }
+                        wl_surface::Request::SetInputRegion { region } => {
+                            let ops = region.and_then(|r| st.regions.get(&r.id()).cloned());
+                            s.pending.input = Some(ops);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+    }
+
+    fn destroyed(st: &mut State, _: ClientId, res: &wl_surface::WlSurface, _: &()) {
+        let sid = res.id();
+        destroy_surface(st, &sid);
+    }
+}
+
+fn destroy_surface(st: &mut State, sid: &ObjectId) {
+    st.mark_dirty(sid);
+    let Some(s) = st.surfaces.remove(sid) else { return };
+    // Detach from the parent and orphan the children.
+    if let Some(sub) = &s.sub {
+        if let Some(p) = st.surfaces.get_mut(&sub.parent) {
+            p.above.retain(|c| c != sid);
+            p.below.retain(|c| c != sid);
+        }
+    }
+    for c in s.above.iter().chain(s.below.iter()) {
+        if let Some(cs) = st.surfaces.get_mut(c) {
+            cs.sub = None;
+        }
+    }
+    st.seat.surface_gone(sid);
+}
+
+fn effectively_sync(st: &State, sid: &ObjectId) -> bool {
+    let mut cur = sid.clone();
+    for _ in 0..64 {
+        let Some(sub) = st.surfaces.get(&cur).and_then(|s| s.sub.as_ref()) else { return false };
+        if sub.sync {
+            return true;
+        }
+        cur = sub.parent.clone();
+    }
+    false
+}
+
+fn commit(st: &mut State, sid: &ObjectId) {
+    let Some(s) = st.surfaces.get_mut(sid) else { return };
+    let pending = std::mem::take(&mut s.pending);
+    if effectively_sync(st, sid) {
+        let s = st.surfaces.get_mut(sid).unwrap();
+        match &mut s.cached {
+            Some(c) => c.merge(pending),
+            None => s.cached = Some(pending),
+        }
+        return;
+    }
+    apply(st, sid, pending);
+}
+
+/// Makes `state` current on the surface, then applies cached state of
+/// synchronized children and runs role-specific commit logic.
+fn apply(st: &mut State, sid: &ObjectId, state: SurfState) {
+    let mut new_texture: Option<Option<crate::shm::Texture>> = None;
+    if let Some(buffer) = &state.buffer {
+        new_texture = Some(match buffer {
+            Some(b) => {
+                let tex = st.buffers.get(&b.id()).and_then(|info| info.read());
+                if tex.is_none() {
+                    log::warn!("client buffer unreadable; disconnecting client");
+                    if let Ok(client) = st.dh.get_client(b.id()) {
+                        client.kill(
+                            &st.dh,
+                            wayland_server::backend::protocol::ProtocolError {
+                                code: 0,
+                                object_id: b.id().protocol_id(),
+                                object_interface: "wl_buffer".into(),
+                                message: "buffer memory is not accessible".into(),
+                            },
+                        );
+                    }
+                    return;
+                }
+                // Contents are copied, so the client may reuse the buffer now.
+                b.release();
+                tex
+            }
+            None => None,
+        });
+    }
+    let Some(s) = st.surfaces.get_mut(sid) else { return };
+    if let Some(t) = new_texture {
+        s.texture = t;
+    }
+    if let Some(scale) = state.scale {
+        s.buffer_scale = scale;
+    }
+    if let Some(input) = state.input {
+        s.input = input;
+    }
+    s.frame_cbs.extend(state.frame_cbs);
+    let children: Vec<ObjectId> = s.below.iter().chain(s.above.iter()).cloned().collect();
+    let is_cursor = matches!(s.role, Role::Cursor);
+    let xdg = s.xdg.clone();
+
+    for c in children {
+        let Some(cs) = st.surfaces.get_mut(&c) else { continue };
+        if let Some(sub) = cs.sub.as_mut() {
+            if let Some(p) = sub.pending_pos.take() {
+                sub.pos = p;
+            }
+        }
+        if let Some(cached) = cs.cached.take() {
+            apply(st, &c, cached);
+        }
+    }
+
+    if is_cursor {
+        crate::seat::cursor_committed(st, sid);
+    } else if let Some(xs) = xdg {
+        crate::shell::xdg_committed(st, &xs);
+    }
+    st.mark_dirty(sid);
+    // Surfaces not shown in any window would wait forever for a frame.
+    if st.window_of(sid).is_none() {
+        let now = st.now_ms();
+        if let Some(s) = st.surfaces.get_mut(sid) {
+            for cb in s.frame_cbs.drain(..) {
+                cb.done(now);
+            }
+        }
+    }
+}
+
+// ---- subsurfaces -------------------------------------------------------
+
+impl GlobalDispatch<wl_subcompositor::WlSubcompositor, ()> for State {
+    fn bind(_: &mut State, _: &DisplayHandle, _: &Client, res: New<wl_subcompositor::WlSubcompositor>, _: &(), init: &mut DataInit<'_, State>) {
+        init.init(res, ());
+    }
+}
+
+impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for State {
+    fn request(
+        st: &mut State,
+        client: &Client,
+        res: &wl_subcompositor::WlSubcompositor,
+        req: wl_subcompositor::Request,
+        _: &(),
+        dh: &DisplayHandle,
+        init: &mut DataInit<'_, State>,
+    ) {
+        guard("wl_subcompositor", client, dh, || {
+            if let wl_subcompositor::Request::GetSubsurface { id, surface, parent } = req {
+                let sub = init.init(id, surface.id());
+                let (sid, pid) = (surface.id(), parent.id());
+                if sid == pid || st.surfaces.get(&sid).is_none_or(|s| !matches!(s.role, Role::None)) {
+                    res.post_error(wl_subcompositor::Error::BadSurface, "surface already has a role");
+                    return;
+                }
+                // Reject cycles: the parent must not be a descendant.
+                let mut cur = pid.clone();
+                for _ in 0..64 {
+                    match st.surfaces.get(&cur).and_then(|s| s.sub.as_ref()) {
+                        Some(si) if si.parent == sid => {
+                            res.post_error(wl_subcompositor::Error::BadParent, "parent is a descendant");
+                            return;
+                        }
+                        Some(si) => cur = si.parent.clone(),
+                        None => break,
+                    }
+                }
+                let _ = sub;
+                if let Some(s) = st.surfaces.get_mut(&sid) {
+                    s.role = Role::Sub;
+                    s.sub = Some(SubInfo { parent: pid.clone(), pos: (0, 0), pending_pos: None, sync: true });
+                }
+                if let Some(p) = st.surfaces.get_mut(&pid) {
+                    p.above.push(sid);
+                }
+            }
+        });
+    }
+}
+
+impl Dispatch<wl_subsurface::WlSubsurface, ObjectId> for State {
+    fn request(
+        st: &mut State,
+        client: &Client,
+        _: &wl_subsurface::WlSubsurface,
+        req: wl_subsurface::Request,
+        sid: &ObjectId,
+        dh: &DisplayHandle,
+        _: &mut DataInit<'_, State>,
+    ) {
+        guard("wl_subsurface", client, dh, || {
+            let Some(parent) = st.surfaces.get(sid).and_then(|s| s.sub.as_ref()).map(|s| s.parent.clone()) else {
+                return;
+            };
+            match req {
+                wl_subsurface::Request::SetPosition { x, y } => {
+                    if let Some(sub) = st.surfaces.get_mut(sid).and_then(|s| s.sub.as_mut()) {
+                        sub.pending_pos = Some((x, y));
+                    }
+                }
+                wl_subsurface::Request::PlaceAbove { sibling } => restack(st, sid, &parent, &sibling.id(), true),
+                wl_subsurface::Request::PlaceBelow { sibling } => restack(st, sid, &parent, &sibling.id(), false),
+                wl_subsurface::Request::SetSync => {
+                    if let Some(sub) = st.surfaces.get_mut(sid).and_then(|s| s.sub.as_mut()) {
+                        sub.sync = true;
+                    }
+                }
+                wl_subsurface::Request::SetDesync => {
+                    if let Some(sub) = st.surfaces.get_mut(sid).and_then(|s| s.sub.as_mut()) {
+                        sub.sync = false;
+                    }
+                    if !effectively_sync(st, sid) {
+                        if let Some(cached) = st.surfaces.get_mut(sid).and_then(|s| s.cached.take()) {
+                            apply(st, sid, cached);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+    }
+
+    fn destroyed(st: &mut State, _: ClientId, _: &wl_subsurface::WlSubsurface, sid: &ObjectId) {
+        st.mark_dirty(sid);
+        let Some(s) = st.surfaces.get_mut(sid) else { return };
+        let Some(sub) = s.sub.take() else { return };
+        s.role = Role::None;
+        s.cached = None;
+        if let Some(p) = st.surfaces.get_mut(&sub.parent) {
+            p.above.retain(|c| c != sid);
+            p.below.retain(|c| c != sid);
+        }
+    }
+}
+
+/// Places `sid` directly above/below `sibling` (which may be the parent).
+fn restack(st: &mut State, sid: &ObjectId, parent: &ObjectId, sibling: &ObjectId, above: bool) {
+    let Some(p) = st.surfaces.get_mut(parent) else { return };
+    p.above.retain(|c| c != sid);
+    p.below.retain(|c| c != sid);
+    if sibling == parent {
+        if above {
+            p.above.insert(0, sid.clone());
+        } else {
+            p.below.push(sid.clone());
+        }
+        return;
+    }
+    for list in [&mut p.below, &mut p.above] {
+        if let Some(i) = list.iter().position(|c| c == sibling) {
+            list.insert(if above { i + 1 } else { i }, sid.clone());
+            return;
+        }
+    }
+    p.above.push(sid.clone());
+}

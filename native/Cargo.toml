@@ -1,0 +1,25 @@
+[package]
+name = "awb"
+version = "0.1.0"
+edition = "2024"
+description = "Wayland compositor that maps each toplevel to its own Android window"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "unstable"] }
+jni = "0.21"
+libc = "0.2"
+log = "0.4"
+
+[profile.release]
+# Panics must unwind so a bug triggered by one client is caught and only that
+# client is disconnected (see guard() in lib.rs).
+panic = "unwind"
+debug = 1
+
+[profile.dev]
+panic = "unwind"
+opt-level = 2

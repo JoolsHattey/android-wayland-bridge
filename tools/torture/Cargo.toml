@@ -1,0 +1,10 @@
+[package]
+name = "awb-torture"
+version = "0.1.0"
+edition = "2024"
+description = "Misbehaving Wayland client for testing compositor robustness"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+libc = "0.2"
