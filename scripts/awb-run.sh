@@ -15,9 +15,9 @@ mountpoint -q $R/run/awb || mount -o bind $APPDIR $R/run/awb
 CFG=$R/root/.config/gtk-4.0
 mkdir -p $CFG
 if grep -q '^gtk-decoration-layout' $CFG/settings.ini 2>/dev/null; then
-    sed -i 's/^gtk-decoration-layout=.*/gtk-decoration-layout=menu:close/' $CFG/settings.ini
+    sed -i 's/^gtk-decoration-layout=.*/gtk-decoration-layout=close:close/' $CFG/settings.ini
 else
-    printf '[Settings]\ngtk-decoration-layout=menu:close\n' >> $CFG/settings.ini
+    printf '[Settings]\ngtk-decoration-layout=close:close\n' >> $CFG/settings.ini
 fi
 IMPORT='@import url("file:///run/awb/gtk.css");'
 grep -qF "$IMPORT" $CFG/gtk.css 2>/dev/null || echo "$IMPORT" >> $CFG/gtk.css

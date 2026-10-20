@@ -12,11 +12,12 @@ use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel};
 use wayland_server::backend::ObjectId;
 use wayland_server::backend::protocol::ProtocolError;
-use wayland_server::protocol::{wl_output, wl_surface};
+use wayland_server::protocol::wl_surface;
 use wayland_server::{Client, DisplayHandle};
 
 use crate::Shared;
 use crate::host::Host;
+use crate::output::{Outputs, to_logical};
 use crate::seat::Seat;
 use crate::shell::Positioner;
 use crate::shm::{BufferInfo, Pool};
@@ -58,6 +59,8 @@ pub struct Window {
     pub mapped: bool,
     /// Android surface size in px (0 until the Activity's surface exists).
     pub px: (i32, i32),
+    /// Android display the window is on; its density sets the scale.
+    pub display: i32,
     /// Last configured size in logical px and activated state.
     pub configured: Option<(i32, i32, bool)>,
     pub focused: bool,
@@ -87,9 +90,6 @@ pub struct State {
     pub dh: DisplayHandle,
     pub shared: Arc<Shared>,
     pub host: Host,
-    /// Output scale: Android px per logical px.
-    pub scale: i32,
-    pub display_px: (i32, i32),
     pub start: Instant,
     serial: u32,
     pub surfaces: HashMap<ObjectId, Surface>,
@@ -102,7 +102,7 @@ pub struct State {
     pub popups: HashMap<ObjectId, Popup>,
     pub next_window: u32,
     pub seat: Seat,
-    pub outputs: Vec<wl_output::WlOutput>,
+    pub outputs: Outputs,
 }
 
 /// Runs a request handler, turning a panic into a disconnect of the client
@@ -123,13 +123,11 @@ pub fn guard(what: &str, client: &Client, dh: &DisplayHandle, f: impl FnOnce()) 
 }
 
 impl State {
-    pub fn new(dh: DisplayHandle, shared: Arc<Shared>, host: Host, scale: i32, display_px: (i32, i32)) -> Self {
+    pub fn new(dh: DisplayHandle, shared: Arc<Shared>, host: Host) -> Self {
         State {
             dh,
             shared,
             host,
-            scale,
-            display_px,
             start: Instant::now(),
             serial: 1,
             surfaces: HashMap::new(),
@@ -142,7 +140,7 @@ impl State {
             popups: HashMap::new(),
             next_window: 1,
             seat: Seat::default(),
-            outputs: Vec::new(),
+            outputs: Outputs::default(),
         }
     }
 
@@ -245,12 +243,32 @@ impl State {
         None
     }
 
+    /// Scale of a window in 120ths, from the display it is on.
+    pub fn window_scale(&self, id: u32) -> u32 {
+        let display = self.windows.get(&id).map_or_else(|| self.outputs.default_display(), |w| w.display);
+        self.outputs.scale120(display)
+    }
+
+    /// Logical size of a window's content area for its Android size.
+    pub fn logical_window_size(&self, id: u32) -> (i32, i32) {
+        let scale = self.window_scale(id);
+        match self.windows.get(&id) {
+            Some(w) if w.px.0 > 0 => (
+                to_logical(w.px.0 as f64, scale) as i32,
+                to_logical((w.px.1 - w.caption.top) as f64, scale) as i32,
+            ),
+            _ => (0, 0),
+        }
+    }
+
     /// Sends configure for a toplevel using its Android size (if known).
     pub fn configure_window(&mut self, id: u32) {
-        let scale = self.scale;
+        let (lw, lh) = self.logical_window_size(id);
+        let Some((sid, display)) = self.windows.get(&id).map(|w| (w.surface.id(), w.display)) else { return };
+        // The scale first, so the client draws the configured frame at it.
+        crate::output::ensure_scale(self, &sid, display);
         let serial = self.next_serial();
         let Some(w) = self.windows.get_mut(&id) else { return };
-        let (lw, lh) = if w.px.0 > 0 { (w.px.0 / scale, (w.px.1 - w.caption.top) / scale) } else { (0, 0) };
         let v = w.toplevel.version();
         let mut states: Vec<u32> = Vec::new();
         if w.focused {

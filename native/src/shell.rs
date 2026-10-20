@@ -243,6 +243,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
                             app_id: String::new(),
                             mapped: false,
                             px: (0, 0),
+                            display: st.outputs.default_display(),
                             configured: None,
                             focused: false,
                             popups: Vec::new(),
@@ -348,7 +349,6 @@ pub fn xdg_committed(st: &mut State, xid: &ObjectId) {
                 st.configure_window(win);
                 return;
             }
-            let scale = st.scale;
             let Some(w) = st.windows.get_mut(&win) else { return };
             if has_buffer && !w.mapped {
                 w.mapped = true;
@@ -361,7 +361,7 @@ pub fn xdg_committed(st: &mut State, xid: &ObjectId) {
                     .unwrap_or((640, 480));
                 let (title, app_id) = (w.title.clone(), w.app_id.clone());
                 log::info!("toplevel {win} mapped {}x{} '{title}' ({app_id})", size.0, size.1);
-                st.host.map(win, size.0 * scale, size.1 * scale, &title, &app_id);
+                st.host.map(win, size.0, size.1, &title, &app_id);
             } else if !has_buffer && w.mapped {
                 w.mapped = false;
                 if let Some(xs) = st.xdg_surfaces.get_mut(xid) {
@@ -372,6 +372,8 @@ pub fn xdg_committed(st: &mut State, xid: &ObjectId) {
         }
         XdgRole::Popup => {
             if first {
+                let display = crate::output::display_of(st, &sid);
+                crate::output::ensure_scale(st, &sid, display);
                 if let Some(p) = st.popups.get(&sid) {
                     let r = p.rect;
                     p.popup.configure(r.x, r.y, r.w, r.h);

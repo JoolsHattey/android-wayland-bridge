@@ -17,7 +17,7 @@ class MainActivity : Activity() {
                 Wayland compositor running.
 
                 Socket: ${app.socketPath}
-                Scale: ${app.scale}
+                Scale here: ${app.scale120(display.displayId) / 120f}
 
                 In the Debian chroot: scripts/awb-run.sh <app>
             """.trimIndent()

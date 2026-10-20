@@ -5,6 +5,7 @@ use wayland_server::backend::{ClientId, ObjectId};
 use wayland_server::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_output, wl_region, wl_subcompositor, wl_subsurface, wl_surface,
 };
+use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
 use crate::shm::Texture;
@@ -38,6 +39,10 @@ pub struct SurfState {
     /// None = unchanged; Some(None) = infinite.
     pub input: Option<Option<Vec<RegionOp>>>,
     pub frame_cbs: Vec<wl_callback::WlCallback>,
+    /// wp_viewport source (x, y, w, h in surface units); Some(None) = unset.
+    pub vp_src: Option<Option<[f64; 4]>>,
+    /// wp_viewport destination size; Some(None) = unset.
+    pub vp_dst: Option<Option<(i32, i32)>>,
 }
 
 impl SurfState {
@@ -50,6 +55,12 @@ impl SurfState {
         }
         if newer.input.is_some() {
             self.input = newer.input;
+        }
+        if newer.vp_src.is_some() {
+            self.vp_src = newer.vp_src;
+        }
+        if newer.vp_dst.is_some() {
+            self.vp_dst = newer.vp_dst;
         }
         self.frame_cbs.extend(newer.frame_cbs);
     }
@@ -84,13 +95,42 @@ pub struct Surface {
     pub sub: Option<SubInfo>,
     pub above: Vec<ObjectId>,
     pub below: Vec<ObjectId>,
+    pub has_viewport: bool,
+    pub vp_src: Option<[f64; 4]>,
+    pub vp_dst: Option<(i32, i32)>,
+    pub fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
+    /// Display and scale (120ths) last announced to the client.
+    pub entered: Option<(i32, u32)>,
 }
 
 impl Surface {
+    /// Size in surface-local (logical) px: the viewport destination, else
+    /// the viewport source size, else the buffer size over its scale.
     pub fn logical_size(&self) -> Option<(i32, i32)> {
         let t = self.texture.as_ref()?;
+        if let Some(d) = self.vp_dst {
+            return Some(d);
+        }
+        if let Some(src) = self.vp_src {
+            return Some((src[2] as i32, src[3] as i32));
+        }
         let s = self.buffer_scale.max(1);
         Some((t.width / s, t.height / s))
+    }
+
+    /// The part of the texture shown, in texture px (x, y, w, h), clamped
+    /// to the texture.
+    pub fn source_rect(&self) -> Option<[f64; 4]> {
+        let t = self.texture.as_ref()?;
+        let (tw, th) = (t.width as f64, t.height as f64);
+        Some(match self.vp_src {
+            Some([x, y, w, h]) => {
+                let s = self.buffer_scale.max(1) as f64;
+                let (x, y) = ((x * s).min(tw), (y * s).min(th));
+                [x, y, (w * s).min(tw - x), (h * s).min(th - y)]
+            }
+            None => [0.0, 0.0, tw, th],
+        })
     }
 
     pub fn accepts_input(&self, x: i32, y: i32) -> bool {
@@ -121,7 +161,6 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for State {
             wl_compositor::Request::CreateSurface { id } => {
                 let s = init.init(id, ());
                 if s.version() >= 6 {
-                    s.preferred_buffer_scale(st.scale);
                     s.preferred_buffer_transform(wl_output::Transform::Normal);
                 }
                 st.surfaces.insert(
@@ -139,6 +178,11 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for State {
                         sub: None,
                         above: Vec::new(),
                         below: Vec::new(),
+                        has_viewport: false,
+                        vp_src: None,
+                        vp_dst: None,
+                        fractional: None,
+                        entered: None,
                     },
                 );
             }
@@ -313,6 +357,12 @@ fn apply(st: &mut State, sid: &ObjectId, state: SurfState) {
     }
     if let Some(input) = state.input {
         s.input = input;
+    }
+    if let Some(src) = state.vp_src {
+        s.vp_src = src;
+    }
+    if let Some(dst) = state.vp_dst {
+        s.vp_dst = dst;
     }
     s.frame_cbs.extend(state.frame_cbs);
     let children: Vec<ObjectId> = s.below.iter().chain(s.above.iter()).cloned().collect();

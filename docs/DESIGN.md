@@ -108,9 +108,47 @@ disconnect itself.
   (RGBA_8888, window-sized), composites the toplevel tree (subsurfaces with
   sync/desync semantics, then popups) on the CPU, posts the frame, then sends
   frame callbacks. `unlockAndPost` back-pressure paces the clients.
-* Output scale is an integer: `round(densityDpi / 160)`, taken from the
-  display the process starts on. Clients get `preferred_buffer_scale` and
-  `wl_output.scale`.
+* The renderer honours `wp_viewporter` (source crop and destination
+  size). A buffer whose size matches its on-screen pixel rect is copied 1:1.
+  That is what fractional-scale clients produce. Anything else, such as a
+  2× or 1× buffer on a 1.5× window, is scaled bilinearly. Surface edges
+  are rounded separately, so neighbouring surfaces meet without gaps.
+
+### Scale, per display
+
+* Kotlin reports every Android display through `DisplayManager` and its
+  listener: mode size, density, refresh rate, physical size and name. Each
+  display becomes its own `wl_output` global, with `xdg_output` logical
+  geometry. Displays are laid out left to right by id.
+* A display's scale is its Android density, kept in 120ths as
+  `wp_fractional_scale_v1` does: 240 dpi gives 180 (1.5×) and the 223 dpi
+  4K monitor gives 167 (1.39×). One GTK logical px is therefore one Android
+  dp, as with Chrome's CSS px. `scale=<float>` in `files/awb.properties`
+  overrides it for all displays.
+* Each window follows its Activity's display. `ToplevelActivity` reports it
+  in `onCreate` (before the surface exists) and again on configuration
+  changes, which is how a move between displays arrives. Window space is in
+  logical px; configure sizes are `floor(px / scale)`.
+* `output::ensure_scale` runs for the toplevel before every configure, for
+  popups before their first configure, and for every surface the renderer
+  paints. It sends what changed: `wl_surface.leave/enter` for the outputs,
+  `preferred_buffer_scale` (scale rounded up, for integer-only clients) and
+  `wp_fractional_scale_v1.preferred_scale`.
+* New windows open on the display of the last focused window (Kotlin passes
+  `setLaunchDisplayId`, and the compositor uses the same display as its
+  default). Clients therefore render the first frame at the right scale.
+  The compositor sends logical sizes to `onMap`; Kotlin multiplies by the
+  target display's density for the launch bounds.
+* Cursor images are scaled by the window's scale over their buffer scale
+  before becoming a `PointerIcon`.
+* Verified on the device:
+  - GTK binds both protocols.
+  - It gets `preferred_scale(180)` on the panel and renders 1260×924 for
+    840×616 logical.
+  - After `moveToNextDisplay`, the window becomes 1115 px wide (still 800
+    logical) at `preferred_scale(167)`.
+  - A new gtk4-demo window on the 4K display renders 1169×891 for an
+    840×640 viewport.
 
 ### Input
 
@@ -151,7 +189,9 @@ the Android side. It bind-mounts that directory into the chroot at
    offsets the surface and pointer by that `top` and configures the client
    that much shorter.
 4. **GTK.** The app writes `files/gtk.css` from those rects.
-   `awb-run.sh` sets `gtk-decoration-layout=menu:close` and imports the CSS.
+   `awb-run.sh` sets `gtk-decoration-layout=close:close` and imports the CSS.
+   A real button is needed on both sides: with `menu:` the start box is
+   hidden and its `min-width` reserves nothing.
    GTK's own controls stay in the layout but are invisible and sized to the
    system rects (`windowcontrols.start/end { min-width }`). Libadwaita's split
    header bars therefore leave exactly the right room at the outer edges, and
@@ -256,10 +296,13 @@ Tested with adwaita-1-demo, gtk4-demo, foot and weston-simple-shm.
 
 ## Known gaps and open questions
 
-* **Scale.** One integer scale per process, from the display the process
-  starts on. The test laptop has a 240 dpi panel and a 223 dpi 4K monitor.
-  Needed: per-window scale from the window's display, plus
-  `wp_fractional_scale_v1` and `wp_viewporter` (1.5× on the panel).
+* **Scale.**
+  - Integer-only clients are scaled bilinearly, which is slightly soft;
+    fractional clients are pixel-exact.
+  - Displays are laid out left to right by id, not by their real
+    arrangement (which isn't public).
+  - `gtk.css` sizes are per scale, so they are slightly off on the other
+    display until GTK restarts.
 * **SSD-preferring clients** (foot) still draw their own title bar, a thin
   strip with an extra ✕. Planned: honour
   `zxdg_toplevel_decoration_v1.set_mode(server_side)` by keeping Android's
@@ -285,7 +328,7 @@ Tested with adwaita-1-demo, gtk4-demo, foot and weston-simple-shm.
 
 ## Roadmap
 
-1. Per-window scale, fractional scaling and viewporter.
+1. ~~Per-window scale, fractional scaling and viewporter.~~ Done.
 2. SSD mode (opaque system caption) per the client's decoration preference.
 3. `linux-dmabuf`: import client dmabufs as `AHardwareBuffer` and present
    them through `ASurfaceTransaction` (`SurfaceControl`) without copies.

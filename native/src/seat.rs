@@ -9,6 +9,7 @@ use wayland_server::protocol::{wl_keyboard, wl_pointer, wl_seat, wl_touch};
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
 use crate::PointerEvent;
+use crate::output::to_logical;
 use crate::state::{State, guard};
 use crate::surface::Role;
 
@@ -116,10 +117,10 @@ fn in_popup(st: &State, sid: &ObjectId) -> bool {
 }
 
 pub fn handle_pointer(st: &mut State, ev: PointerEvent) {
-    let scale = st.scale as f64;
     let win = ev.win;
+    let scale = st.window_scale(win);
     let top = st.windows.get(&win).map_or(0, |w| w.caption.top) as f64;
-    let (x, y) = (ev.x as f64 / scale, (ev.y as f64 - top) / scale);
+    let (x, y) = (to_logical(ev.x as f64, scale), to_logical(ev.y as f64 - top, scale));
     if ev.action == 2 {
         if st.seat.buttons == 0 {
             set_pointer_focus(st, None);
@@ -347,7 +348,9 @@ pub fn cursor_committed(st: &mut State, sid: &ObjectId) {
             ((a << 24) | (un(r) << 16) | (un(g) << 8) | un(b)) as i32
         })
         .collect();
-    st.host.cursor(win, Some((&argb, t.width, t.height, hx * bs, hy * bs)));
+    // Android shows the bitmap 1:1 in display px; scale it to the window.
+    let scale = st.window_scale(win) as f32 / 120.0 / bs as f32;
+    st.host.cursor(win, Some((&argb, t.width, t.height, hx * bs, hy * bs, scale)));
 }
 
 fn keymap_fd() -> Option<(OwnedFd, u32)> {

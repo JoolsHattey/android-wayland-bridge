@@ -4,6 +4,7 @@
 
 mod android;
 mod host;
+mod output;
 mod render;
 mod seat;
 mod server;
@@ -36,6 +37,23 @@ pub enum Cmd {
     Close(u32),
     /// Caption geometry of a window (see `Caption`).
     Caption(u32, Caption),
+    /// An Android display appeared or changed.
+    Display(DisplayInfo),
+    DisplayRemoved(i32),
+    /// The window is now on this Android display.
+    WindowDisplay(u32, i32),
+}
+
+#[derive(Debug, Clone)]
+pub struct DisplayInfo {
+    pub id: i32,
+    pub width: i32,
+    pub height: i32,
+    /// Scale in 120ths (wp_fractional_scale units): Android density * 120.
+    pub scale120: u32,
+    pub refresh_mhz: i32,
+    pub phys_mm: (i32, i32),
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -119,9 +137,6 @@ pub extern "system" fn Java_dev_awb_Native_start(
     mut env: JNIEnv,
     _cls: JClass,
     socket_path: JString,
-    scale: jint,
-    display_w: jint,
-    display_h: jint,
     callbacks: JObject,
 ) -> jboolean {
     android::init_logging();
@@ -147,7 +162,7 @@ pub extern "system" fn Java_dev_awb_Native_start(
             slots: Mutex::new(HashMap::new()),
         });
         let _ = SHARED.set(shared.clone());
-        let cfg = server::Config { socket_path: path, scale: scale.max(1), display_w, display_h };
+        let cfg = server::Config { socket_path: path };
         std::thread::Builder::new()
             .name("awb-compositor".into())
             .spawn(move || server::run(cfg, shared, host::Host::new(vm, cb)))
@@ -247,4 +262,41 @@ pub extern "system" fn Java_dev_awb_Native_caption(
         let controls = flat.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
         push(Cmd::Caption(win as u32, Caption { top, height, controls, auto_exclusion: auto_exclusion != 0 }));
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_display(
+    mut env: JNIEnv,
+    _cls: JClass,
+    id: jint,
+    width: jint,
+    height: jint,
+    scale120: jint,
+    refresh_mhz: jint,
+    width_mm: jint,
+    height_mm: jint,
+    name: JString,
+) {
+    ffi_guard("display", (), || {
+        let name: String = env.get_string(&name).map(Into::into).unwrap_or_default();
+        push(Cmd::Display(DisplayInfo {
+            id,
+            width,
+            height,
+            scale120: scale120.clamp(60, 960) as u32,
+            refresh_mhz,
+            phys_mm: (width_mm, height_mm),
+            name,
+        }));
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_displayRemoved(_env: JNIEnv, _cls: JClass, id: jint) {
+    push(Cmd::DisplayRemoved(id));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_windowDisplay(_env: JNIEnv, _cls: JClass, win: jint, display: jint) {
+    push(Cmd::WindowDisplay(win as u32, display));
 }

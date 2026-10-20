@@ -33,7 +33,8 @@ impl Host {
         }
     }
 
-    /// A toplevel got its first buffer: open an Android window of `w`x`h` px.
+    /// A toplevel got its first buffer: open an Android window for `w`x`h`
+    /// logical px (Kotlin applies the target display's density).
     pub fn map(&self, win: u32, w: i32, h: i32, title: &str, app_id: &str) {
         self.with_env(|env, cb| {
             let t = env.new_string(title)?;
@@ -100,17 +101,26 @@ impl Host {
     }
 
     /// Client cursor image (RGBA as ARGB ints) or `None` to hide the pointer.
-    pub fn cursor(&self, win: u32, image: Option<(&[i32], i32, i32, i32, i32)>) {
+    /// `scale` maps image px to display px.
+    pub fn cursor(&self, win: u32, image: Option<(&[i32], i32, i32, i32, i32, f32)>) {
         self.with_env(|env, cb| {
             match image {
-                Some((argb, w, h, hx, hy)) => {
+                Some((argb, w, h, hx, hy, scale)) => {
                     let arr = env.new_int_array(argb.len() as i32)?;
                     env.set_int_array_region(&arr, 0, argb)?;
                     env.call_method(
                         cb,
                         "onCursor",
-                        "(I[IIIII)V",
-                        &[JValue::Int(win as i32), JValue::Object(&arr), JValue::Int(w), JValue::Int(h), JValue::Int(hx), JValue::Int(hy)],
+                        "(I[IIIIIF)V",
+                        &[
+                            JValue::Int(win as i32),
+                            JValue::Object(&arr),
+                            JValue::Int(w),
+                            JValue::Int(h),
+                            JValue::Int(hx),
+                            JValue::Int(hy),
+                            JValue::Float(scale),
+                        ],
                     )?;
                 }
                 None => {
@@ -118,8 +128,16 @@ impl Host {
                     env.call_method(
                         cb,
                         "onCursor",
-                        "(I[IIIII)V",
-                        &[JValue::Int(win as i32), JValue::Object(&null), JValue::Int(0), JValue::Int(0), JValue::Int(0), JValue::Int(0)],
+                        "(I[IIIIIF)V",
+                        &[
+                            JValue::Int(win as i32),
+                            JValue::Object(&null),
+                            JValue::Int(0),
+                            JValue::Int(0),
+                            JValue::Int(0),
+                            JValue::Int(0),
+                            JValue::Float(1.0),
+                        ],
                     )?;
                 }
             }

@@ -7,22 +7,21 @@ use std::sync::Arc;
 
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
-use wayland_protocols::xdg::xdg_output::zv1::server::{zxdg_output_manager_v1, zxdg_output_v1};
+use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
+use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1;
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use wayland_server::protocol::{
-    wl_compositor, wl_data_device, wl_data_device_manager, wl_data_source, wl_output, wl_seat, wl_shm, wl_subcompositor,
+    wl_compositor, wl_data_device, wl_data_device_manager, wl_data_source, wl_seat, wl_shm, wl_subcompositor,
 };
-use wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, ListeningSocket, New, Resource};
+use wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, ListeningSocket, New};
 
 use crate::host::Host;
-use crate::state::{State, guard};
+use crate::state::State;
 use crate::{Cmd, Shared};
 
 pub struct Config {
     pub socket_path: String,
-    pub scale: i32,
-    pub display_w: i32,
-    pub display_h: i32,
 }
 
 struct ClientState;
@@ -50,8 +49,10 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
     dh.create_global::<State, wl_subcompositor::WlSubcompositor, ()>(1, ());
     dh.create_global::<State, wl_shm::WlShm, ()>(1, ());
     dh.create_global::<State, wl_seat::WlSeat, ()>(7, ());
-    dh.create_global::<State, wl_output::WlOutput, ()>(4, ());
+    // wl_output globals come and go with Android displays (output.rs).
     dh.create_global::<State, zxdg_output_manager_v1::ZxdgOutputManagerV1, ()>(3, ());
+    dh.create_global::<State, WpViewporter, ()>(1, ());
+    dh.create_global::<State, WpFractionalScaleManagerV1, ()>(1, ());
     dh.create_global::<State, wl_data_device_manager::WlDataDeviceManager, ()>(3, ());
     dh.create_global::<State, XdgWmBase, ()>(6, ());
     dh.create_global::<State, ZxdgDecorationManagerV1, ()>(1, ());
@@ -70,9 +71,9 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
         let c = std::ffi::CString::new(cfg.socket_path.clone()).unwrap_or_default();
         libc::chmod(c.as_ptr(), 0o777);
     }
-    log::info!("listening on {} (scale {}, display {}x{})", path.display(), cfg.scale, cfg.display_w, cfg.display_h);
+    log::info!("listening on {}", path.display());
 
-    let mut st = State::new(dh.clone(), shared.clone(), host, cfg.scale, (cfg.display_w, cfg.display_h));
+    let mut st = State::new(dh.clone(), shared.clone(), host);
 
     loop {
         let mut fds = [
@@ -126,12 +127,28 @@ fn handle_cmd(st: &mut State, cmd: Cmd) {
             let Some(w) = st.windows.get_mut(&win) else { return };
             w.px = (pw, ph);
             w.dirty = true;
-            let (lw, lh) = (pw / st.scale, (ph - w.caption.top) / st.scale);
-            if w.configured.map(|(cw, ch, _)| (cw, ch)) != Some((lw, lh)) {
+            let (lw, lh) = st.logical_window_size(win);
+            if st.windows[&win].configured.map(|(cw, ch, _)| (cw, ch)) != Some((lw, lh)) {
                 st.configure_window(win);
             }
         }
-        Cmd::Focus(win, focused) => crate::seat::focus_window(st, win, focused),
+        Cmd::Focus(win, focused) => {
+            if focused {
+                st.outputs.default = st.windows.get(&win).map(|w| w.display);
+            }
+            crate::seat::focus_window(st, win, focused)
+        }
+        Cmd::Display(info) => crate::output::display_changed(st, info),
+        Cmd::DisplayRemoved(id) => crate::output::display_removed(st, id),
+        Cmd::WindowDisplay(win, display) => {
+            let Some(w) = st.windows.get_mut(&win) else { return };
+            if w.display != display {
+                log::info!("toplevel {win}: now on display {display}");
+                w.display = display;
+                w.dirty = true;
+                st.configure_window(win);
+            }
+        }
         Cmd::Pointer(ev) => crate::seat::handle_pointer(st, ev),
         Cmd::Key { win, code, down, time } => crate::seat::handle_key(st, win, code, down, time),
         Cmd::Close(win) => {
@@ -154,78 +171,6 @@ fn handle_cmd(st: &mut State, cmd: Cmd) {
             }
         }
     }
-}
-
-// ---- outputs -----------------------------------------------------------
-
-impl GlobalDispatch<wl_output::WlOutput, ()> for State {
-    fn bind(st: &mut State, _: &DisplayHandle, _: &Client, res: New<wl_output::WlOutput>, _: &(), init: &mut DataInit<'_, State>) {
-        let o = init.init(res, ());
-        let (w, h) = st.display_px;
-        o.geometry(0, 0, 302, 189, wl_output::Subpixel::Unknown, "Android".into(), "awb".into(), wl_output::Transform::Normal);
-        o.mode(wl_output::Mode::Current | wl_output::Mode::Preferred, w, h, 60_000);
-        if o.version() >= 2 {
-            o.scale(st.scale);
-        }
-        if o.version() >= 4 {
-            o.name("AWB-1".into());
-            o.description("Android display".into());
-        }
-        if o.version() >= 2 {
-            o.done();
-        }
-        st.outputs.push(o);
-    }
-}
-
-impl Dispatch<wl_output::WlOutput, ()> for State {
-    fn request(_: &mut State, _: &Client, _: &wl_output::WlOutput, _: wl_output::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, State>) {}
-
-    fn destroyed(st: &mut State, _: ClientId, o: &wl_output::WlOutput, _: &()) {
-        st.outputs.retain(|x| x != o);
-    }
-}
-
-impl GlobalDispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for State {
-    fn bind(_: &mut State, _: &DisplayHandle, _: &Client, res: New<zxdg_output_manager_v1::ZxdgOutputManagerV1>, _: &(), init: &mut DataInit<'_, State>) {
-        init.init(res, ());
-    }
-}
-
-impl Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for State {
-    fn request(
-        st: &mut State,
-        client: &Client,
-        _: &zxdg_output_manager_v1::ZxdgOutputManagerV1,
-        req: zxdg_output_manager_v1::Request,
-        _: &(),
-        dh: &DisplayHandle,
-        init: &mut DataInit<'_, State>,
-    ) {
-        guard("zxdg_output_manager_v1", client, dh, || {
-            if let zxdg_output_manager_v1::Request::GetXdgOutput { id, output } = req {
-                let xo = init.init(id, ());
-                let (w, h) = st.display_px;
-                xo.logical_position(0, 0);
-                xo.logical_size(w / st.scale, h / st.scale);
-                if xo.version() >= 2 {
-                    xo.name("AWB-1".into());
-                    xo.description("Android display".into());
-                }
-                if xo.version() >= 3 {
-                    if output.version() >= 2 {
-                        output.done();
-                    }
-                } else {
-                    xo.done();
-                }
-            }
-        });
-    }
-}
-
-impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for State {
-    fn request(_: &mut State, _: &Client, _: &zxdg_output_v1::ZxdgOutputV1, _: zxdg_output_v1::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, State>) {}
 }
 
 // ---- data device (inert until clipboard support) ----------------------

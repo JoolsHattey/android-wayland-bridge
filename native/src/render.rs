@@ -2,6 +2,7 @@
 
 use crate::Caption;
 use crate::android::Frame;
+use crate::output::to_px;
 use crate::shm::Texture;
 use crate::state::State;
 
@@ -22,41 +23,68 @@ fn blend(src: u32, dst: u32) -> u32 {
     src.wrapping_add(rb | ag)
 }
 
-/// Draws `t` with its top-left at (x, y) px. `num/den` scales texture px to
-/// output px (nearest neighbour; 1/1 is the common case).
-fn blit(frame: &mut Frame, t: &Texture, x: i32, y: i32, num: i32, den: i32, opaque_copy: bool) {
-    let dw = t.width * num / den;
-    let dh = t.height * num / den;
-    let x0 = x.max(0);
-    let y0 = y.max(0);
-    let x1 = (x + dw).min(frame.width);
-    let y1 = (y + dh).min(frame.height);
+/// Interpolates two premultiplied RGBA pixels, `f` in 0..=256.
+#[inline]
+fn lerp(a: u32, b: u32, f: u32) -> u32 {
+    let g = 256 - f;
+    let rb = ((a & 0x00ff00ff) * g + (b & 0x00ff00ff) * f) >> 8 & 0x00ff00ff;
+    let ag = ((a >> 8) & 0x00ff00ff) * g + ((b >> 8) & 0x00ff00ff) * f & 0xff00ff00;
+    rb | ag
+}
+
+/// Draws the `src` rect of `t` (texture px) into the `dst` rect of the
+/// frame (x, y, w, h px). Equal sizes copy pixels 1:1 (what fractional-scale
+/// clients produce); anything else is scaled bilinearly.
+fn blit(frame: &mut Frame, t: &Texture, src: [f64; 4], dst: [i32; 4], opaque_copy: bool) {
+    let [dx, dy, dw, dh] = dst;
+    if dw <= 0 || dh <= 0 || src[2] <= 0.0 || src[3] <= 0.0 || t.width <= 0 || t.height <= 0 {
+        return;
+    }
+    let (x0, y0) = (dx.max(0), dy.max(0));
+    let (x1, y1) = ((dx + dw).min(frame.width), (dy + dh).min(frame.height));
     if x0 >= x1 || y0 >= y1 {
         return;
     }
     let stride = frame.stride as usize;
-    for dy in y0..y1 {
-        let sy = ((dy - y) * den / num) as usize;
-        let src_row = &t.data[sy * t.width as usize..(sy + 1) * t.width as usize];
-        let dst_row = &mut frame.pixels[dy as usize * stride..dy as usize * stride + frame.width as usize];
-        if num == den {
-            let sx0 = (x0 - x) as usize;
-            let src = &src_row[sx0..sx0 + (x1 - x0) as usize];
-            let dst = &mut dst_row[x0 as usize..x1 as usize];
+    let tw = t.width as usize;
+    let put = |d: &mut u32, s: u32| *d = if opaque_copy { s } else { blend(s, *d) };
+    let exact = src[2] as i32 == dw && src[3] as i32 == dh && src[0].fract() == 0.0 && src[1].fract() == 0.0;
+    if exact {
+        let (sx, sy) = (src[0] as i32, src[1] as i32);
+        for y in y0..y1 {
+            let row = (sy + y - dy) as usize * tw;
+            let s = &t.data[row + (sx + x0 - dx) as usize..row + (sx + x1 - dx) as usize];
+            let d = &mut frame.pixels[y as usize * stride + x0 as usize..y as usize * stride + x1 as usize];
             if opaque_copy {
-                dst.copy_from_slice(src);
+                d.copy_from_slice(s);
             } else {
-                for (d, s) in dst.iter_mut().zip(src) {
+                for (d, s) in d.iter_mut().zip(s) {
                     *d = blend(*s, *d);
                 }
             }
-        } else {
-            for dx in x0..x1 {
-                let sx = ((dx - x) * den / num) as usize;
-                let s = src_row[sx.min(src_row.len() - 1)];
-                let d = &mut dst_row[dx as usize];
-                *d = if opaque_copy { s } else { blend(s, *d) };
-            }
+        }
+        return;
+    }
+    // Sample at pixel centres; 8 fractional bits per axis.
+    let (sxs, sys) = (src[2] / dw as f64, src[3] / dh as f64);
+    let (maxx, maxy) = (t.width as f64 - 1.0, t.height as f64 - 1.0);
+    let cols: Vec<(usize, usize, u32)> = (x0..x1)
+        .map(|x| {
+            let fx = (src[0] + (x - dx) as f64 * sxs + sxs / 2.0 - 0.5).clamp(0.0, maxx);
+            let ix = fx as usize;
+            (ix, (ix + 1).min(tw - 1), ((fx - ix as f64) * 256.0) as u32)
+        })
+        .collect();
+    for y in y0..y1 {
+        let fy = (src[1] + (y - dy) as f64 * sys + sys / 2.0 - 0.5).clamp(0.0, maxy);
+        let iy = fy as usize;
+        let (r0, r1) = (iy * tw, (iy + 1).min(t.height as usize - 1) * tw);
+        let wy = ((fy - iy as f64) * 256.0) as u32;
+        let d = &mut frame.pixels[y as usize * stride + x0 as usize..y as usize * stride + x1 as usize];
+        for (d, &(a, b, wx)) in d.iter_mut().zip(&cols) {
+            let top = lerp(t.data[r0 + a], t.data[r0 + b], wx);
+            let bottom = lerp(t.data[r1 + a], t.data[r1 + b], wx);
+            put(d, lerp(top, bottom, wy));
         }
     }
 }
@@ -135,8 +163,14 @@ fn render_window(st: &mut State, id: u32) {
     if !slot.is_attached() {
         return;
     }
-    let scale = st.scale;
+    let display = w.display;
     let list = st.paint_list(w);
+    // New subsurfaces and popups learn the window's output and scale here.
+    for (sid, _, _) in &list {
+        crate::output::ensure_scale(st, sid, display);
+    }
+    let scale = st.window_scale(id);
+    let Some(w) = st.windows.get(&id) else { return };
     let (pw, ph) = w.px;
     let caption = w.caption.clone();
     let top = caption.top;
@@ -146,19 +180,20 @@ fn render_window(st: &mut State, id: u32) {
         let mut first = true;
         for (sid, ox, oy) in &list {
             let Some(s) = st.surfaces.get(sid) else { continue };
-            let Some(t) = &s.texture else { continue };
-            let bs = s.buffer_scale.max(1);
-            let (x, y) = (ox * scale, oy * scale + top);
+            let (Some(t), Some((lw, lh)), Some(src)) = (&s.texture, s.logical_size(), s.source_rect()) else { continue };
+            // Edges are rounded separately so adjacent surfaces meet exactly.
+            let (x, y) = (to_px(*ox as f64, scale), to_px(*oy as f64, scale) + top);
+            let (x1, y1) = (to_px((ox + lw) as f64, scale), to_px((oy + lh) as f64, scale) + top);
             if first {
                 // Fill only what the toplevel does not cover (live resize).
-                let covers = x <= 0 && y <= 0 && x + t.width * scale / bs >= frame.width && y + t.height * scale / bs >= frame.height;
+                let covers = x <= 0 && y <= 0 && x1 >= frame.width && y1 >= frame.height;
                 if !(covers && t.opaque) {
                     for row in frame.pixels.chunks_mut(frame.stride as usize) {
                         row.fill(BACKGROUND);
                     }
                 }
             }
-            blit(frame, t, x, y, scale, bs, first && t.opaque);
+            blit(frame, t, src, [x, y, x1 - x, y1 - y], first && t.opaque);
             first = false;
         }
         if first {

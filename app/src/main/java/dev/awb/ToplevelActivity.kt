@@ -2,6 +2,7 @@ package dev.awb
 
 import android.app.Activity
 import android.app.ActivityManager
+import android.content.res.Configuration
 import android.graphics.Rect
 import android.os.Bundle
 import android.util.Log
@@ -31,6 +32,8 @@ class ToplevelActivity : Activity() {
             return
         }
         setWindowTitle(intent.getStringExtra(EXTRA_TITLE).orEmpty())
+        // Before the surface exists, so the first configure uses this display's scale.
+        reportDisplay()
         window.insetsController?.setSystemBarsAppearance(
             WindowInsetsController.APPEARANCE_TRANSPARENT_CAPTION_BAR_BACKGROUND,
             WindowInsetsController.APPEARANCE_TRANSPARENT_CAPTION_BAR_BACKGROUND,
@@ -79,7 +82,7 @@ class ToplevelActivity : Activity() {
         if (top == 0 && height > 0) {
             val start = controls.filter { it.left == 0 }.maxOfOrNull { it.right } ?: 0
             val end = controls.filter { it.right >= width }.maxOfOrNull { width - it.left } ?: 0
-            AwbApp.instance.writeGtkCss(start, end, height)
+            AwbApp.instance.writeGtkCss(start, end, height, AwbApp.instance.scale120(displayId))
         }
     }
 
@@ -118,8 +121,26 @@ class ToplevelActivity : Activity() {
         finishAndRemoveTask()
     }
 
+    private var displayId = -1
+
+    /** Tells the compositor which display (and so which scale) the window is on. */
+    private fun reportDisplay() {
+        val id = display.displayId
+        if (id != displayId) {
+            displayId = id
+            Native.windowDisplay(win, id)
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Moving the window to another display arrives as a configuration change.
+        if (win >= 0) reportDisplay()
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) AwbApp.instance.lastDisplay = displayId
         Native.focus(win, hasFocus)
     }
 

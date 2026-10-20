@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wayland-server = "0.31"
-wayland-protocols = { version = "0.32", features = ["server", "unstable"] }
+wayland-protocols = { version = "0.32", features = ["server", "unstable", "staging"] }
 jni = "0.21"
 libc = "0.2"
 log = "0.4"
