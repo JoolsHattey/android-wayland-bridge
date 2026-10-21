@@ -154,6 +154,30 @@ through its `/dev` bind mount.
   - **Per window:** a swapchain on the `ANativeWindow` (R8G8B8A8, FIFO). It
     lives in the window's slot, so `surfaceDestroyed` tears it down before
     the window is released.
+  - **One submit per pass:** each `vkQueueSubmit` is an i915 execbuf, and
+    ringing the GuC costs ~0.13 ms of CPU. So a pass records every dirty
+    window into its own command buffer (composited frames, and direct
+    mode's caption readbacks), then submits them all as one batch: it waits
+    for each frame's acquire and signals each frame's render semaphore, one
+    serial (all windows' bookkeeping uses it) and one exported fence. One
+    batch is one execbuf, so every frame in it waits for every acquire. An
+    image is only acquired once it is free, so that wait costs nothing in
+    practice. Each frame is then presented with its own
+    `vkQueuePresentKHR`. Android's loader gives every swapchain in a
+    present all of its wait semaphores, and Mesa consumes them on the
+    first, so the second would wait forever. On ANV a present is a syncobj
+    transfer, not an execbuf, so separate presents cost little. Present
+    results stay per window (out of date marks only that swapchain stale).
+  - **Teardown during a pass:** a window's slot stays locked from recording
+    until its frame is submitted and presented, so the UI thread cannot
+    destroy a swapchain, or the command buffer recorded for it, in between.
+    `surfaceDestroyed` then waits for the pass, as it already waited for
+    one frame. Only the compositor thread holds more than one slot lock at
+    a time, and while holding them it waits only for the GPU (bounded),
+    oneway binder calls and channel sends, so there is no lock cycle. A
+    Target's `last_serial` is set only once the submit succeeded. If the
+    submit fails, nothing counts as drawn and swapchains with an acquired
+    image are recreated.
   - **Pacing:** acquire never blocks the compositor thread. With
     `VK_GOOGLE_display_timing` (presents carry ids; past timings say which
     the display has shown), a window with 2 frames queued is not drawn until
