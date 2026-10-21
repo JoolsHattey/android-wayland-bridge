@@ -318,12 +318,24 @@ an integer-scale client on a fractional display (vkcube at scale 2 on
     8888) and the usage (GPU sampled, framebuffer, composer overlay).
   - The mapper then imports the client's buffer object like any gralloc
     buffer. Each dmabuf is wrapped once, on first direct use.
+  - Ids must not clash with real gralloc buffers. minigbm caches imports
+    per process by the handle's id, and every process that sets a buffer
+    on a layer caches it by GraphicBuffer's id (pid << 32 | a count),
+    which also keys SurfaceFlinger's `ClientCache`. Both ours carry bit 30
+    (`ID_TAG`), above any pid or gralloc count. Small ids from a counter
+    starting at 1 clashed in a window without a stub app, which runs in
+    the compositor's process: its swapchain's buffers had the same ids,
+    so the window sent cache ids instead of buffers and SurfaceFlinger
+    logged `ClientCache::getBuffer - invalid buffer id` (vkcube, black).
 * **Pacing.** One transaction in flight per window. Its `OnComplete` (on a
   binder thread) becomes `Cmd::DirectDone`, and the window's next frame
   waits for it. Frame callbacks go out as a transaction is applied, so
   the client renders its next frame while SurfaceFlinger latches this
   one, which keeps a frame of slack: the window process's `presented`
-  comes only after the present fence.
+  comes only after the present fence. A transaction still incomplete
+  after a second is given up (`never completed` in the log), and the
+  buffer it replaced goes back to the client, which would otherwise wait
+  on it for ever.
 * **Buffer release.** `OnComplete` also carries the previous buffer's
   release fence. A dmabuf counts its SurfaceFlinger holds, and is released
   (wl_buffer and syncobj point) only when both the GPU and every hold are
@@ -340,7 +352,9 @@ an integer-scale client on a fractional display (vkcube at scale 2 on
   the band's rows and columns in buffer px, resampled (nearest, per window
   px centre) to window px on the CPU when read. The analysis then runs as
   for a composited frame; exclusion works in direct mode.
-* `direct=0` in `files/awb.properties` turns it off.
+* `direct=0` in `files/awb.properties` turns it off. Buffers that need
+  scaling go direct only with `direct_scaled=1` until verified on the
+  device.
 
 Verified on the device:
 

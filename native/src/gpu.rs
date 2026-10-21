@@ -2220,8 +2220,14 @@ impl Renderer {
         if let Some(state) = self.direct.get_mut(&id).filter(|s| s.in_flight.is_some()) {
             if state.in_flight_since.is_some_and(|t| t.elapsed() > DIRECT_WATCHDOG) {
                 log::warn!("toplevel {id}: direct transaction {:?} never completed", state.in_flight);
+                // Give its replaced buffer back regardless: the client would
+                // otherwise wait on it for ever (at worst it draws into a
+                // buffer still on screen).
                 if let Some(token) = state.in_flight.take() {
                     discard(state.feedback.remove(&token).unwrap_or_default());
+                    if let Some(Some(d)) = state.replaced.remove(&token) {
+                        d.sf_holds.set(d.sf_holds.get().saturating_sub(1));
+                    }
                 }
             } else {
                 // `Cmd::DirectDone` wakes us; this only runs the watchdog.
