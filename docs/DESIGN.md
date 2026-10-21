@@ -352,9 +352,8 @@ an integer-scale client on a fractional display (vkcube at scale 2 on
   the band's rows and columns in buffer px, resampled (nearest, per window
   px centre) to window px on the CPU when read. The analysis then runs as
   for a composited frame; exclusion works in direct mode.
-* `direct=0` in `files/awb.properties` turns it off. Buffers that need
-  scaling go direct only with `direct_scaled=1` until verified on the
-  device.
+* `direct=0` in `files/awb.properties` turns it off; `direct_scaled=0`
+  keeps only buffers that need scaling composited.
 
 Verified on the device:
 
@@ -363,6 +362,9 @@ Verified on the device:
 * Opening the menu popover switches it to composited, and closing the
   popover switches it back to direct.
 * vkcube at `scale=1` is direct with explicit sync and keeps animating.
+* vkcube at 1.5× is direct with a 500×500 buffer scaled to 750×750 by
+  SurfaceFlinger, at 90 FPS, and costs the compositor less than half the
+  CPU it did composited.
 
 ### Presentation time
 

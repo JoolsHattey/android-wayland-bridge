@@ -75,9 +75,9 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
     } else {
         // `direct=0` keeps every window composited (no zero-copy layers).
         let direct = setting(&cfg.socket_path, "direct").as_deref() != Some("0");
-        // `direct_scaled=1` also lets SurfaceFlinger scale buffers that are
-        // not drawn 1:1 (off for now: such buffers stall on this device).
-        let scaled = setting(&cfg.socket_path, "direct_scaled").as_deref() == Some("1");
+        // `direct_scaled=0` keeps buffers that SurfaceFlinger would have to
+        // scale (not drawn 1:1) composited.
+        let scaled = setting(&cfg.socket_path, "direct_scaled").as_deref() != Some("0");
         match crate::gpu::Renderer::new(shared.clone(), direct, scaled) {
             Ok(r) => {
                 log::info!("renderer: vulkan");
