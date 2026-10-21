@@ -1,0 +1,2 @@
+# LF everywhere, whatever core.autocrlf says (tools on Windows write CRLF).
+* text=auto eol=lf
