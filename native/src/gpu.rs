@@ -11,7 +11,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -109,6 +109,9 @@ pub struct Gpu {
     qfi: u32,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     timeline: vk::Semaphore,
+    /// A binary semaphore every submit also signals, exported right after
+    /// as a sync_file (see `fence`), with VK_KHR_external_semaphore_fd.
+    export: Option<(ash::khr::external_semaphore_fd::Device, vk::Semaphore)>,
     dsl: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     vert: vk::ShaderModule,
@@ -158,12 +161,16 @@ impl Gpu {
                     .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS));
                 if let Some(qfi) = qfi {
                     log::info!("gpu: {:?}", props.device_name_as_c_str().unwrap_or_default());
-                    let optional = (has(ash::ext::physical_device_drm::NAME), has(ash::google::display_timing::NAME));
+                    let optional = (
+                        has(ash::ext::physical_device_drm::NAME),
+                        has(ash::google::display_timing::NAME),
+                        has(ash::khr::external_semaphore_fd::NAME) && Self::sync_fd_exportable(&instance, pd),
+                    );
                     chosen = Some((pd, qfi as u32, optional));
                     break;
                 }
             }
-            let Some((pd, qfi, (has_drm, has_timing))) = chosen else {
+            let Some((pd, qfi, (has_drm, has_timing, has_export))) = chosen else {
                 return Err("no Vulkan device can import dmabufs".into());
             };
 
@@ -172,6 +179,9 @@ impl Gpu {
             let mut names: Vec<_> = required.iter().map(|n| n.as_ptr()).collect();
             if has_timing {
                 names.push(ash::google::display_timing::NAME.as_ptr());
+            }
+            if has_export {
+                names.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
             }
             let mut v12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
             let info = vk::DeviceCreateInfo::default()
@@ -200,6 +210,19 @@ impl Gpu {
             let mut tl = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
             let timeline =
                 err("timeline", device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tl), None))?;
+            let export = if has_export {
+                let mut ex = vk::ExportSemaphoreCreateInfo::default().handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                match device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ex), None) {
+                    Ok(sem) => Some((ash::khr::external_semaphore_fd::Device::new(&instance, &device), sem)),
+                    Err(e) => {
+                        log::warn!("gpu: exportable semaphore: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            log::info!("gpu: sync_file fences {}", if export.is_some() { "on" } else { "off" });
             let sampler = err(
                 "sampler",
                 device.create_sampler(
@@ -252,6 +275,7 @@ impl Gpu {
                 queue,
                 qfi,
                 timeline,
+                export,
                 dsl,
                 layout,
                 vert,
@@ -322,6 +346,35 @@ impl Gpu {
         let mut props = vk::ImageFormatProperties2::default().push_next(&mut eprops);
         let ok = unsafe { self.instance.get_physical_device_image_format_properties2(self.pd, &info, &mut props) }.is_ok();
         ok && eprops.external_memory_properties.external_memory_features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    }
+
+    /// Whether binary semaphores can be exported as sync_files.
+    unsafe fn sync_fd_exportable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> bool {
+        let info = vk::PhysicalDeviceExternalSemaphoreInfo::default().handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let mut props = vk::ExternalSemaphoreProperties::default();
+        unsafe { instance.get_physical_device_external_semaphore_properties(pd, &info, &mut props) };
+        props.external_semaphore_features.contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE)
+    }
+
+    /// The semaphore a submit should also signal, for `fence`.
+    fn export_semaphore(&self) -> Option<vk::Semaphore> {
+        self.export.as_ref().map(|(_, s)| *s)
+    }
+
+    /// A sync_file for the submit that just signalled `export_semaphore`
+    /// (exporting resets the semaphore for the next one).
+    fn fence(&self) -> Option<OwnedFd> {
+        let (f, sem) = self.export.as_ref()?;
+        let info = vk::SemaphoreGetFdInfoKHR::default().semaphore(*sem).handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        match unsafe { f.get_semaphore_fd(&info) } {
+            // -1: already signalled.
+            Ok(fd) if fd >= 0 => Some(unsafe { OwnedFd::from_raw_fd(fd) }),
+            Ok(_) => None,
+            Err(e) => {
+                log::warn!("gpu: exporting a fence: {e}");
+                None
+            }
+        }
     }
 
     /// The highest serial the GPU has finished.
@@ -754,11 +807,18 @@ pub struct Target {
     band: (i32, i32, i32, bool),
     band_serial: u64,
     last_serial: u64,
+    /// The last submit's sync_file, for the Renderer to take.
+    fence: Option<OwnedFd>,
     /// The swapchain must be recreated before the next frame.
     stale: bool,
     /// Present ids: the last one queued, and the last the display showed.
     presented: u32,
     shown: u32,
+    /// The display's refresh period and when it last showed one of our
+    /// frames (CLOCK_MONOTONIC ns; 0 if unknown), to wait for its next
+    /// vsync instead of polling.
+    refresh_ns: u64,
+    last_shown_ns: u64,
     /// The child layer for direct mode, created when first needed.
     layer: Option<Layer>,
     /// Unique per Target, so direct-mode bookkeeping notices a new one.
@@ -826,9 +886,12 @@ impl Target {
                 band: (0, 0, 0, false),
                 band_serial: 0,
                 last_serial: 0,
+                fence: None,
                 stale: true,
                 presented: 0,
                 shown: 0,
+                refresh_ns: 0,
+                last_shown_ns: 0,
                 layer: None,
                 generation: TARGETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             })
@@ -881,6 +944,9 @@ impl Target {
             let swapchain = err("swapchain", gpu.swapchain_fn.create_swapchain(&info, None))?;
             self.destroy_swapchain();
             self.swapchain = swapchain;
+            if let Some(timing) = &gpu.timing_fn {
+                self.refresh_ns = timing.get_refresh_cycle_duration(swapchain).map_or(0, |r| r.refresh_duration);
+            }
             self.format = pick.format;
             self.extent = (extent.width as i32, extent.height as i32);
             self.readable = readable;
@@ -972,13 +1038,16 @@ impl Target {
         }
         unsafe {
             // Never block: a window waiting for its display must not hold up
-            // the others. It is retried shortly (Renderer::busy). With
-            // display timing we know how many frames are still queued and
-            // don't even ask; Android logs every acquire that would block.
+            // the others. It is retried after the next vsync (`retry_ms`).
+            // With display timing we know how many frames are still queued
+            // and don't even ask; Android logs every acquire that would block.
             if let Some(timing) = &gpu.timing_fn {
                 if let Ok(past) = timing.get_past_presentation_timing(self.swapchain) {
                     if let Some(id) = past.iter().map(|t| t.present_id).max() {
                         self.shown = self.shown.max(id);
+                    }
+                    if let Some(t) = past.iter().map(|t| t.actual_present_time).max() {
+                        self.last_shown_ns = self.last_shown_ns.max(t);
                     }
                 }
                 if self.presented.wrapping_sub(self.shown) >= MAX_QUEUED {
@@ -1146,8 +1215,12 @@ impl Target {
 
             let waits = [self.acquired];
             let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER];
-            let signals = [self.rendered[idx], gpu.timeline];
-            let values = [0, serial];
+            let mut signals = vec![self.rendered[idx], gpu.timeline];
+            let mut values = vec![0, serial];
+            if let Some(sem) = gpu.export_semaphore() {
+                signals.push(sem);
+                values.push(0);
+            }
             let mut tl = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&[0]).signal_semaphore_values(&values);
             let cmds = [cmd];
             let submit = vk::SubmitInfo::default()
@@ -1157,6 +1230,7 @@ impl Target {
                 .signal_semaphores(&signals)
                 .push_next(&mut tl);
             err("submit", d.queue_submit(gpu.queue, &[submit], vk::Fence::null()))?;
+            self.fence = gpu.fence();
             self.last_serial = serial;
             if read {
                 self.band = (y0, rows, ew, self.format == vk::Format::B8G8R8A8_UNORM);
@@ -1185,6 +1259,26 @@ impl Target {
 }
 
 impl Target {
+    /// When to try again after `frame` found no image free: just after the
+    /// display's next vsync, when it may have shown a frame. Shortly after
+    /// a vsync the timing may still lag, so then it polls (as without
+    /// timing).
+    fn retry_ms(&self) -> i32 {
+        const MS: u64 = 1_000_000;
+        let (refresh, last) = (self.refresh_ns, self.last_shown_ns);
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+        let now = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64;
+        if refresh < 4 * MS || last == 0 || now < last {
+            return 2;
+        }
+        let since = (now - last) % refresh;
+        if since < 3 * MS {
+            return 1;
+        }
+        ((refresh - since + MS).div_ceil(MS) as i32).min(50)
+    }
+
     fn layer(&mut self, win: *mut ANativeWindow) -> Option<&Layer> {
         if self.layer.is_none() {
             self.layer = Layer::new(win);
@@ -1256,12 +1350,17 @@ impl Target {
                 &[],
             );
             err("end", dev.end_command_buffer(cmd))?;
-            let signals = [gpu.timeline];
-            let values = [serial];
+            let mut signals = vec![gpu.timeline];
+            let mut values = vec![serial];
+            if let Some(sem) = gpu.export_semaphore() {
+                signals.push(sem);
+                values.push(0);
+            }
             let mut tl = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
             let cmds = [cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds).signal_semaphores(&signals).push_next(&mut tl);
             err("submit", dev.queue_submit(gpu.queue, &[submit], vk::Fence::null()))?;
+            self.fence = gpu.fence();
         }
         self.last_serial = serial;
         self.band = (y0, rows, width, d.bgra);
@@ -1379,8 +1478,17 @@ pub struct Renderer {
     /// Client buffers and release points to give back once the GPU and
     /// SurfaceFlinger are done with them (a `Release` signals when dropped).
     releases: Vec<(Rc<Dmabuf>, Option<WlBuffer>, Option<Release>)>,
-    /// A window was skipped because a client buffer was still being drawn.
-    deferred: bool,
+    /// A window was skipped and should be retried within this many ms
+    /// (nothing will wake the event loop for it).
+    retry: Option<i32>,
+    /// sync_files of submitted frames not yet known to be complete.
+    fences: Vec<(u64, OwnedFd)>,
+    /// Acquire points a window waits for: an eventfd per point.
+    acquire_waits: HashMap<(usize, u64), OwnedFd>,
+    /// Points waited for in this pass (the others are dropped after it).
+    acquire_wanted: Vec<(usize, u64)>,
+    /// Dmabufs a window waits for (implicit sync: readable when done).
+    implicit_waits: Vec<Rc<Dmabuf>>,
     /// Direct mode (see `direct.rs`): off with `direct=0`.
     direct_enabled: bool,
     shared: Arc<Shared>,
@@ -1430,7 +1538,11 @@ impl Renderer {
             frames: Vec::new(),
             bands: HashMap::new(),
             releases: Vec::new(),
-            deferred: false,
+            retry: None,
+            fences: Vec::new(),
+            acquire_waits: HashMap::new(),
+            acquire_wanted: Vec::new(),
+            implicit_waits: Vec::new(),
             direct_enabled,
             shared,
             direct: HashMap::new(),
@@ -1446,10 +1558,33 @@ impl Renderer {
         self.direct_enabled
     }
 
-    /// Whether the event loop should wake up again soon (frames in flight,
-    /// buffers to give back, or a window waiting for a client's buffer).
-    pub fn busy(&self) -> bool {
-        self.deferred || !self.frames.is_empty() || !self.releases.is_empty() || !self.sf_fences.is_empty()
+    /// What the event loop should also wait for: fds that become readable
+    /// when something here can move on (the GPU finishing the last submit,
+    /// SurfaceFlinger releasing a buffer, a client's buffer becoming ready),
+    /// and a timeout in ms (-1: none) for what has no fd.
+    pub fn waits(&self) -> (Vec<RawFd>, i32) {
+        let mut fds: Vec<RawFd> = self.sf_fences.iter().map(|(f, _)| f.as_raw_fd()).collect();
+        fds.extend(self.acquire_waits.values().map(|f| f.as_raw_fd()));
+        fds.extend(self.implicit_waits.iter().map(|d| d.poll_fd.as_raw_fd()));
+        let mut timeout = self.retry.unwrap_or(-1);
+        if self.serial > self.gpu.completed() {
+            // The queue runs in order: the last submit finishing means all did.
+            match self.fences.last().filter(|(s, _)| *s == self.serial) {
+                Some((_, f)) => fds.push(f.as_raw_fd()),
+                None => timeout = if timeout < 0 { 2 } else { timeout.min(2) },
+            }
+        }
+        (fds, timeout)
+    }
+
+    /// Wake again within `ms` for a window that was skipped.
+    fn retry_in(&mut self, ms: i32) {
+        self.retry = Some(self.retry.map_or(ms, |r| r.min(ms)));
+    }
+
+    /// The fence of the first submit at or after `serial`, if any.
+    fn fence_for(&self, serial: u64) -> Option<&OwnedFd> {
+        self.fences.iter().find(|(s, _)| *s >= serial).map(|(_, f)| f)
     }
 
     /// A window is gone; its layer went with its Target.
@@ -1492,9 +1627,15 @@ impl Renderer {
             if let Some(b) = buffer {
                 b.release();
             }
-        } else {
-            self.releases.push((d.clone(), buffer, release));
+            return;
         }
+        // Only the GPU still reads it: the release point signals with the
+        // GPU's fence for its last frame, without waiting for us.
+        let release = match (release, self.fence_for(d.last_use.get())) {
+            (Some(r), Some(f)) if d.sf_holds.get() == 0 => r.signal_after(f.as_fd()),
+            (r, _) => r,
+        };
+        self.releases.push((d.clone(), buffer, release));
     }
 
     /// The GPU image for a surface's shm texture, staged for upload if it
@@ -1587,6 +1728,7 @@ impl Renderer {
     fn collect(&mut self, st: &mut State) {
         self.gpu.collect();
         let done = self.gpu.completed();
+        self.fences.retain(|(s, _)| *s > done);
         self.sf_fences.retain(|(fence, d)| {
             let mut p = libc::pollfd { fd: fence.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             let signalled = unsafe { libc::poll(&mut p, 1, 0) } == 1;
@@ -1649,7 +1791,7 @@ impl Renderer {
                         }
                     }
                 }
-                self.deferred = true;
+                self.retry_in(5);
                 return;
             }
             _ => {}
@@ -1657,16 +1799,33 @@ impl Renderer {
         // Latch only finished client frames, so a slow client cannot stall
         // the queue that every window shares: the acquire point with explicit
         // sync, else the dmabuf's implicit fences.
-        let busy = list.iter().any(|(sid, _, _)| {
-            let Some(t) = st.surfaces.get(sid).and_then(|s| s.texture.as_ref()) else { return false };
+        // The event loop wakes when they are: an eventfd per acquire point,
+        // the dmabuf itself for implicit sync.
+        let mut busy = false;
+        for (sid, _, _) in &list {
+            let Some(t) = st.surfaces.get(sid).and_then(|s| s.texture.as_ref()) else { continue };
             match (&t.sync, &t.dmabuf) {
-                (Some(sync), _) => !sync.acquire.signalled(),
-                (None, Some((_, d))) => !d.ready(),
-                _ => false,
+                (Some(sync), _) if !sync.acquire.signalled() => {
+                    busy = true;
+                    let key = sync.acquire.key();
+                    self.acquire_wanted.push(key);
+                    if !self.acquire_waits.contains_key(&key) {
+                        match sync.acquire.eventfd() {
+                            Some(fd) => {
+                                self.acquire_waits.insert(key, fd);
+                            }
+                            None => self.retry_in(2),
+                        }
+                    }
+                }
+                (None, Some((_, d))) if !d.ready() => {
+                    busy = true;
+                    self.implicit_waits.push(d.clone());
+                }
+                _ => {}
             }
-        });
+        }
         if busy {
-            self.deferred = true;
             return;
         }
         let scale = st.window_scale(id);
@@ -1720,7 +1879,7 @@ impl Renderer {
 
         let serial = self.serial + 1;
         let gpu = self.gpu.clone();
-        let result = slot.with_target(|win, target| -> Result<(bool, u64), String> {
+        let result = slot.with_target(|win, target| -> Result<Result<(u64, Option<OwnedFd>), i32>, String> {
             if target.is_none() {
                 *target = Some(Target::new(gpu.clone(), win)?);
             }
@@ -1729,12 +1888,21 @@ impl Renderer {
             if t.stale || t.extent != (pw, ph) {
                 t.configure(pw, ph)?;
             }
-            Ok((t.frame(&draws, if read { band } else { (0, 0) }, serial)?, t.generation))
+            if !t.frame(&draws, if read { band } else { (0, 0) }, serial)? {
+                return Ok(Err(t.retry_ms()));
+            }
+            Ok(Ok((t.generation, t.fence.take())))
         });
         let generation = match result {
-            Some(Ok((true, g))) => g,
-            Some(Ok((false, _))) => {
-                self.deferred = true;
+            Some(Ok(Ok((g, fence)))) => {
+                if let Some(f) = fence {
+                    self.fences.push((serial, f));
+                }
+                g
+            }
+            Some(Ok(Err(retry))) => {
+                // No swapchain image free yet: try again around the next vsync.
+                self.retry_in(retry);
                 return;
             }
             Some(Err(e)) => {
@@ -1879,7 +2047,8 @@ impl Renderer {
                 log::warn!("toplevel {id}: direct transaction {:?} never completed", state.in_flight);
                 state.in_flight = None;
             } else {
-                self.deferred = true;
+                // `Cmd::DirectDone` wakes us; this only runs the watchdog.
+                self.retry_in(100);
                 return;
             }
         }
@@ -1892,7 +2061,7 @@ impl Renderer {
         let window_layer = st.windows.get(&id).is_some_and(|w| w.window_layer);
         // The window's part of the buffer (buffer px), and where it goes.
         let (src, dst) = ([-at[0], top - at[1], pw - at[0], ph - at[1]], [0, top, pw, ph]);
-        let result = slot.with_target(|win, target| -> Result<(u64, bool), String> {
+        let result = slot.with_target(|win, target| -> Result<(u64, bool, Option<OwnedFd>), String> {
             if target.is_none() {
                 *target = Some(Target::new(gpu.clone(), win)?);
             }
@@ -1907,10 +2076,15 @@ impl Renderer {
                     log::warn!("gpu: caption readback: {e}");
                     false
                 });
-            Ok((t.generation, read))
+            Ok((t.generation, read, t.fence.take().filter(|_| read)))
         });
         let (generation, read) = match result {
-            Some(Ok(r)) => r,
+            Some(Ok((g, read, fence))) => {
+                if let Some(f) = fence {
+                    self.fences.push((serial, f));
+                }
+                (g, read)
+            }
             Some(Err(e)) => {
                 log::warn!("gpu: toplevel {id}: {e}");
                 return;
@@ -1978,10 +2152,13 @@ fn answer_sync(st: &mut State, id: u32, t: Option<crate::WindowFrame>, what: &st
 pub fn render_dirty(st: &mut State) {
     let Some(mut r) = st.gpu.take() else { return };
     r.collect(st);
-    r.deferred = false;
+    r.retry = None;
+    r.implicit_waits.clear();
     let dirty: Vec<u32> = st.windows.values().filter(|w| w.dirty && w.mapped && w.px.0 > 0).map(|w| w.id).collect();
     for id in dirty {
         r.render_window(st, id);
     }
+    let wanted = std::mem::take(&mut r.acquire_wanted);
+    r.acquire_waits.retain(|k, _| wanted.contains(k));
     st.gpu = Some(r);
 }

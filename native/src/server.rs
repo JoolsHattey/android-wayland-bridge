@@ -108,13 +108,15 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
     st.drm = drm;
 
     loop {
-        let mut fds = [
+        let mut fds = vec![
             libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: display.backend().poll_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: shared.wake_fd, events: libc::POLLIN, revents: 0 },
         ];
-        // While frames are in flight, check back for their completion.
-        let timeout = if st.gpu.as_ref().is_some_and(|g| g.busy()) { 2 } else { -1 };
+        // Also wake when the GPU or a client's buffer is done, or after the
+        // renderer's timeout.
+        let (waits, timeout) = st.gpu.as_ref().map_or((Vec::new(), -1), |g| g.waits());
+        fds.extend(waits.into_iter().map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }));
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
         if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             log::error!("poll failed: {}", std::io::Error::last_os_error());

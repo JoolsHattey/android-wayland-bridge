@@ -4,9 +4,13 @@
 //! reads the buffer), both on DRM syncobj timelines it shares with us. We
 //! check and signal them with the render node's syncobj ioctls; the frame
 //! is only drawn once the acquire point has signalled, as with implicit
-//! sync (see `Renderer::render_window`).
+//! sync (see `Renderer::render_window`). A pending acquire point wakes the
+//! event loop through an eventfd. A release point due while the GPU still
+//! reads the buffer gets the GPU's fence for that frame, so it signals when
+//! the GPU is done, without the compositor.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::mem::ManuallyDrop;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
@@ -42,6 +46,31 @@ struct Destroy {
 }
 
 #[repr(C)]
+struct Create {
+    handle: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+struct Transfer {
+    src_handle: u32,
+    dst_handle: u32,
+    src_point: u64,
+    dst_point: u64,
+    flags: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+struct EventFd {
+    handle: u32,
+    flags: u32,
+    point: u64,
+    fd: i32,
+    pad: u32,
+}
+
+#[repr(C)]
 struct TimelineArray {
     handles: u64,
     points: u64,
@@ -54,10 +83,14 @@ const fn iowr<T>(nr: u32) -> libc::c_ulong {
 }
 
 const DRM_IOCTL_GET_CAP: libc::c_ulong = iowr::<GetCap>(0x0c);
+const DRM_IOCTL_SYNCOBJ_CREATE: libc::c_ulong = iowr::<Create>(0xbf);
 const DRM_IOCTL_SYNCOBJ_DESTROY: libc::c_ulong = iowr::<Destroy>(0xc0);
 const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: libc::c_ulong = iowr::<Handle>(0xc2);
 const DRM_IOCTL_SYNCOBJ_QUERY: libc::c_ulong = iowr::<TimelineArray>(0xcb);
+const DRM_IOCTL_SYNCOBJ_TRANSFER: libc::c_ulong = iowr::<Transfer>(0xcc);
 const DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: libc::c_ulong = iowr::<TimelineArray>(0xcd);
+const DRM_IOCTL_SYNCOBJ_EVENTFD: libc::c_ulong = iowr::<EventFd>(0xcf);
+const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1;
 const DRM_CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
 
 /// The GPU's render node, opened for syncobj ioctls.
@@ -124,6 +157,35 @@ impl Timeline {
         self.drm.ioctl(DRM_IOCTL_SYNCOBJ_QUERY, &mut q) && value >= point
     }
 
+    /// Makes `point` signal with `fence` (a sync_file): imported into a
+    /// temporary binary syncobj, then transferred to the point.
+    pub fn signal_after(&self, point: u64, fence: BorrowedFd) -> bool {
+        let mut c = Create { handle: 0, flags: 0 };
+        if !self.drm.ioctl(DRM_IOCTL_SYNCOBJ_CREATE, &mut c) {
+            return false;
+        }
+        let mut h = Handle { handle: c.handle, flags: DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE, fd: fence.as_raw_fd(), pad: 0 };
+        let mut t = Transfer { src_handle: c.handle, dst_handle: self.handle, src_point: 0, dst_point: point, flags: 0, pad: 0 };
+        let ok = self.drm.ioctl(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut h) && self.drm.ioctl(DRM_IOCTL_SYNCOBJ_TRANSFER, &mut t);
+        if !ok {
+            log::warn!("syncobj: cannot hand point {point} to a fence: {}", std::io::Error::last_os_error());
+        }
+        let mut d = Destroy { handle: c.handle, pad: 0 };
+        self.drm.ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &mut d);
+        ok
+    }
+
+    /// An eventfd that becomes readable when `point` signals.
+    pub fn eventfd(&self, point: u64) -> Option<OwnedFd> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return None;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut e = EventFd { handle: self.handle, flags: 0, point, fd: fd.as_raw_fd(), pad: 0 };
+        self.drm.ioctl(DRM_IOCTL_SYNCOBJ_EVENTFD, &mut e).then_some(fd)
+    }
+
     pub fn signal(&self, point: u64) {
         let handle = self.handle;
         let mut s = TimelineArray {
@@ -157,12 +219,35 @@ impl Point {
     pub fn signal(&self) {
         self.0.signal(self.1)
     }
+
+    pub fn eventfd(&self) -> Option<OwnedFd> {
+        self.0.eventfd(self.1)
+    }
+
+    /// Identifies the point (its timeline and value).
+    pub fn key(&self) -> (usize, u64) {
+        (Arc::as_ptr(&self.0) as usize, self.1)
+    }
 }
 
 /// Signals the release point of a commit when dropped, so every path that
 /// lets go of a commit's buffer (replaced, surface gone, cached state
 /// superseded) gives it back to the client.
 pub struct Release(pub Point);
+
+impl Release {
+    /// Hands the point to the GPU: it signals with `fence`. Returns the
+    /// release back (still to be signalled) if that fails.
+    pub fn signal_after(self, fence: BorrowedFd) -> Option<Release> {
+        if !self.0.0.signal_after(self.0.1, fence) {
+            return Some(self);
+        }
+        // Done: drop the point without signalling it again.
+        let this = ManuallyDrop::new(self);
+        drop(unsafe { std::ptr::read(&this.0) });
+        None
+    }
+}
 
 impl Drop for Release {
     fn drop(&mut self) {

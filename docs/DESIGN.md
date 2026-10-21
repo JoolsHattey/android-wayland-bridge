@@ -160,7 +160,11 @@ through its `/dev` bind mount.
     one is shown. The zero-timeout acquire stays as a backstop. Android logs
     every acquire that would block, so asking only when an image is free
     matters. A window whose display is slow then waits by itself; others keep
-    their rate (two es2gears and a vkcube all hold 120 FPS).
+    their rate (two es2gears and a vkcube all hold 120 FPS). A window that
+    waits is retried just after the display's next vsync, predicted from
+    the refresh period and when the display last showed one of its frames
+    (polling every 1–2 ms only shortly after a vsync, when the timing may
+    still lag, or without display timing).
   - **Per surface:** one quad, blended as premultiplied alpha, with a
     bilinear sampler. A quad that lands 1:1 on pixel centres samples
     exactly, so fractional-scale clients stay pixel-exact.
@@ -171,13 +175,20 @@ through its `/dev` bind mount.
 * **Latching.** A window is drawn only once every buffer it shows is
   finished. A slow client then only delays its own window, instead of
   stalling the queue all windows share.
-  - **Implicit sync:** the dmabuf polls readable.
+  - **Implicit sync:** the dmabuf polls readable. A window waiting for one
+    adds the dmabuf to the event loop's poll set.
   - **Explicit sync** (`syncobj.rs`, `wp_linux_drm_syncobj_v1`, offered
     when the render node has timeline syncobjs): each commit carries an
     acquire and a release point. Timelines are imported into our own DRM
-    fd. The acquire point is checked with `SYNCOBJ_QUERY`; the release point
-    is signalled from the CPU (`SYNCOBJ_TIMELINE_SIGNAL`) when the buffer
-    would be released. A commit's release is a value that signals when
+    fd. The acquire point is checked with `SYNCOBJ_QUERY`. A window waiting
+    for one gets an eventfd for it (`SYNCOBJ_EVENTFD`), which wakes the
+    event loop when the point signals. A buffer released while only the GPU
+    still reads it has its release point handed to the GPU: the sync_file of
+    its last frame is imported into a temporary syncobj and transferred to
+    the point (`SYNCOBJ_TRANSFER`), so it signals when the GPU is done,
+    without the compositor. Otherwise (SurfaceFlinger still holds it, or no
+    fence) the point is signalled from the CPU (`SYNCOBJ_TIMELINE_SIGNAL`)
+    once it is free. A commit's release is a value that signals when
     dropped, so every path that lets go of a buffer gives it back, cached
     subsurface state included. Mesa's Vulkan WSI uses it (vkcube, vkgears
     at 120 FPS); GL clients stay on implicit sync. The protocol errors
@@ -186,8 +197,13 @@ through its `/dev` bind mount.
 * **Buffer lifetime.** A dmabuf stays held while it is the surface's
   buffer. It is released when replaced, once the last frame that sampled it
   has completed. Images, staging buffers and readbacks are destroyed the
-  same way. While frames are in flight, the event loop polls with a 2 ms
-  timeout to collect them.
+  same way.
+* **Fences.** With `VK_KHR_external_semaphore_fd`, every submit also
+  signals a binary semaphore that is exported right after as a sync_file.
+  While frames are in flight, the event loop polls the last one (the queue
+  runs in order) instead of waking every 2 ms; it also polls
+  SurfaceFlinger's release fences. Without the extension it falls back to
+  the 2 ms timeout.
 * **Shm uploads.** Each shm surface has a staging buffer that mirrors its
   texture. A commit copies only its damage since the staged commit into the
   staging buffer, and the next frame uploads only the part not yet in the
@@ -725,9 +741,14 @@ es2gears_wayland.
   multi-surface windows (libdecor decorations, popups) still composite.
   SurfaceFlinger could scale them, but the header analysis needs window
   px.
-* **Explicit sync** is CPU-side: the acquire point is polled, and release
-  points are signalled after the GPU or SurfaceFlinger is done, not by a
-  GPU-side signal.
+* **Explicit sync.** Acquire points are still waited for on the CPU (by
+  eventfd), as the latching wants: a GPU-side wait in the shared queue
+  would let a slow client stall every window. Release points of buffers
+  SurfaceFlinger holds (direct mode) are still signalled from the CPU once
+  its release fence signals; merging that fence with the GPU's would hand
+  those to the kernel too.
+* **Pacing wakeups.** A window waiting for its display wakes the
+  compositor around each vsync. A Choreographer callback would be exact.
 
 ## Roadmap
 
