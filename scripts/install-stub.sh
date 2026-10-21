@@ -3,69 +3,50 @@
 # gets a launcher icon, its windows open as that app's tasks, and links in its
 # URL schemes (the desktop file's x-scheme-handler types) open in it:
 #   scripts/install-stub.sh org.gnome.Adwaita1.Demo
-# Name and icon come from the chroot's desktop file. SVG icons are rendered
-# with rsvg-convert or cairosvg, else a headless Chrome or Edge. ADB_SERIAL
-# selects the device.
+# Name and icon come from the chroot's desktop file (SVG icons become vector
+# drawables in the build). ADB_SERIAL selects the device.
+#
+# Stubs run dev.awb's window code (see stub/build.gradle.kts), so there is
+# no need to rerun this after changing dev.awb: scripts/sync-stubs.sh (run
+# by deploy.sh) rebuilds a stub only when its desktop file or icon changed or
+# its manifest format is outdated, and adds stubs for the apps used.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 ID=${1:?usage: install-stub.sh <desktop file id>}
 A=(adb -s "${ADB_SERIAL:-192.168.0.40:5555}")
-R=/data/debian
 OUT=build/stub-icons
 mkdir -p "$OUT"
-# Native paths for Windows tools (Gradle, the browser) under Git Bash.
+# Native paths for Windows tools (Gradle) under Git Bash.
 path() { if command -v cygpath >/dev/null; then cygpath -m "$1"; else echo "$1"; fi; }
 
-DESKTOP=$("${A[@]}" shell cat "$R/usr/share/applications/$ID.desktop" | tr -d '\r')
-# First [Desktop Entry] keys, untranslated.
-key() { printf '%s\n' "$DESKTOP" | sed -n '/^\[Desktop Entry\]/,/^\[/p' | grep -m1 "^$1=" | cut -d= -f2-; }
-NAME=$(key Name)
-ICON=$(key Icon)
+# The desktop file's name, icon, schemes and stamp, worked out on the device.
+"${A[@]}" push scripts/awb-stubs.sh /data/local/tmp/awb-stubs.sh >/dev/null
+"${A[@]}" shell chmod 755 /data/local/tmp/awb-stubs.sh
+INFO=$("${A[@]}" shell /data/local/tmp/awb-stubs.sh info "$ID" | tr -d '\r')
+get() { printf '%s\n' "$INFO" | sed -n "s/^$1=//p"; }
+NAME=$(get name)
+SRC=$(get icon)
+SCHEMES=$(get schemes)
+STAMP=$(get stamp)
 [ -n "$NAME" ] || { echo "no Name in $ID.desktop" >&2; exit 1; }
-SCHEMES=$( (key MimeType || true) | tr ';' '\n' | sed -n 's|^x-scheme-handler/||p' | paste -sd, -)
 
-# The largest PNG in hicolor, else the scalable SVG.
-SRC=
-if [[ "$ICON" == /* ]]; then
-    SRC=$R$ICON
-else
-    for size in 512x512 256x256 192x192 128x128 96x96 64x64 48x48; do
-        f=$R/usr/share/icons/hicolor/$size/apps/$ICON.png
-        if "${A[@]}" shell "[ -f '$f' ]"; then SRC=$f; break; fi
-    done
-    [ -n "$SRC" ] || SRC=$R/usr/share/icons/hicolor/scalable/apps/$ICON.svg
-fi
-PNG=$OUT/$ID.png
+# No usable icon: the stub keeps its default one.
+ICONARG=()
+ICONFILE=$OUT/$ID.${SRC##*.}
 case "$SRC" in
-    *.png) "${A[@]}" pull "$SRC" "$PNG" >/dev/null ;;
-    *.svg)
-        "${A[@]}" pull "$SRC" "$OUT/$ID.svg" >/dev/null
-        # A plain SVG renderer if there is one (Linux hosts), else a browser.
-        if command -v rsvg-convert >/dev/null; then
-            rsvg-convert -w 256 -h 256 -o "$PNG" "$OUT/$ID.svg"
-        elif command -v cairosvg >/dev/null; then
-            cairosvg -W 256 -H 256 -o "$PNG" "$OUT/$ID.svg"
+    *.png|*.svg)
+        rm -f "$ICONFILE"
+        if "${A[@]}" pull "$SRC" "$ICONFILE" >/dev/null 2>&1 && [ -s "$ICONFILE" ]; then
+            ICONARG=("-Pstub.icon=$(path "$PWD/$ICONFILE")")
         else
-            printf '<html><body style="margin:0"><img src="%s.svg" style="width:256px;height:256px;display:block"></body></html>' \
-                "$ID" > "$OUT/$ID.html"
-            BROWSER=
-            for b in "/c/Program Files/Google/Chrome/Application/chrome.exe" \
-                     "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" \
-                     "$(command -v chromium || true)" "$(command -v google-chrome || true)"; do
-                [ -n "$b" ] && [ -x "$b" ] && { BROWSER=$b; break; }
-            done
-            [ -n "$BROWSER" ] || { echo "no rsvg-convert, cairosvg or Chrome/Edge to render $SRC" >&2; exit 1; }
-            "$BROWSER" --headless --disable-gpu --hide-scrollbars --window-size=256,256 \
-                --default-background-color=00000000 --screenshot="$(path "$PWD/$PNG")" \
-                "file:///$(path "$PWD/$OUT/$ID.html")" >/dev/null 2>&1
+            echo "no icon at $SRC, using the default" >&2
         fi
         ;;
-    *) echo "unsupported icon $SRC" >&2; exit 1 ;;
+    *) echo "unsupported icon $SRC, using the default" >&2 ;;
 esac
-[ -s "$PNG" ] || { echo "no icon rendered from $SRC" >&2; exit 1; }
 
 echo "$ID: '$NAME', icon $SRC${SCHEMES:+, links $SCHEMES}"
 ./gradlew :stub:assembleDebug --console=plain -q \
-    "-Pstub.appId=$ID" "-Pstub.label=$NAME" "-Pstub.icon=$(path "$PWD/$PNG")" "-Pstub.schemes=$SCHEMES"
+    "-Pstub.appId=$ID" "-Pstub.label=$NAME" ${ICONARG[@]+"${ICONARG[@]}"} "-Pstub.schemes=$SCHEMES" "-Pstub.stamp=$STAMP"
 "${A[@]}" install -r stub/build/outputs/apk/debug/stub-debug.apk

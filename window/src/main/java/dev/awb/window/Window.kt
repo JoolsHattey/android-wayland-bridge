@@ -18,6 +18,16 @@ object Window {
     /** Activity meta-data: the desktop file id of a stub's Linux app. */
     const val META_APP_ID = "dev.awb.app_id"
 
+    /** Application meta-data: the stub manifest's format ([STUB_FORMAT]); absent before 2. */
+    const val META_STUB_FORMAT = "dev.awb.stub_format"
+
+    /**
+     * The stub manifest this code expects (stub/build.gradle.kts). From 2 on,
+     * stubs run this code from dev.awb's APK instead of their own copy, so
+     * only changes to what a stub's manifest declares need a new format.
+     */
+    const val STUB_FORMAT = 2
+
     const val EXTRA_WIN = "win"
     const val EXTRA_TITLE = "title"
 

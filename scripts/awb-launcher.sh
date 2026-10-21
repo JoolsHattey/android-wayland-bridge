@@ -8,6 +8,7 @@
 #           awb-run.sh as their browser), opened by Android (Chrome).
 #   task:   window moves and resizes the apps asked for, carried out by
 #           dev.awb.TaskHelper from the app's APK (apps can't move tasks).
+# It also uninstalls the stub apps of Linux apps removed from the chroot.
 APPDIR=/data/user/10/dev.awb/files
 FIFO=$APPDIR/launch
 OPEN=$APPDIR/open
@@ -37,7 +38,15 @@ OPENER=$!
     done
 ) &
 MOVER=$!
-trap 'kill $OPENER $MOVER; pkill -f "dev.awb.[T]askHelper"; exit' TERM INT
+# Stubs whose desktop file is gone (apt remove): their icons go too.
+(
+    while :; do
+        /data/local/tmp/awb-stubs.sh prune >/dev/null 2>&1
+        sleep 120
+    done
+) &
+PRUNER=$!
+trap 'kill $OPENER $MOVER $PRUNER; pkill -f "dev.awb.[T]askHelper"; exit' TERM INT
 
 while :; do
     # The app creates the fifo; wait for it (first start, reinstall).

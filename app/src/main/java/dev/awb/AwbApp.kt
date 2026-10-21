@@ -150,7 +150,10 @@ class AwbApp : Application(), NativeCallbacks {
         val options = ActivityOptions.makeBasic()
             .setLaunchDisplayId(target.displayId)
             .setLaunchBounds(Rect(left, top, left + w, top + h))
-        val activity = stubFor(appId) ?: ComponentName(this, ToplevelActivity::class.java)
+        val activity = stubFor(appId) ?: run {
+            requestStub(appId)
+            ComponentName(this, ToplevelActivity::class.java)
+        }
         val intent = Intent().setComponent(activity)
             .putExtra(Window.EXTRA_WIN, win)
             .putExtra(Window.EXTRA_TITLE, title.ifEmpty { appId })
@@ -172,6 +175,32 @@ class AwbApp : Application(), NativeCallbacks {
             .map { it.activityInfo }
             .firstOrNull { it.metaData?.getString(Window.META_APP_ID) == appId }
             ?.let { ComponentName(it.packageName, it.name) }
+    }
+
+    /**
+     * The installed stub apps: Linux app id, package and manifest format
+     * (1 for stubs that carry their own copy of the window code).
+     */
+    fun stubs(): List<Triple<String, String, Int>> {
+        val flags = PackageManager.ResolveInfoFlags.of(PackageManager.GET_META_DATA.toLong())
+        return packageManager.queryIntentActivities(Intent(Window.ACTION_TOPLEVEL), flags)
+            .map { it.activityInfo }
+            .mapNotNull { a ->
+                val id = a.metaData?.getString(Window.META_APP_ID) ?: return@mapNotNull null
+                Triple(id, a.packageName, a.applicationInfo.metaData?.getInt(Window.META_STUB_FORMAT, 1) ?: 1)
+            }
+    }
+
+    /**
+     * Notes a Linux app whose window opened without a stub app, in
+     * files/stub-requests: scripts/sync-stubs.sh (run by deploy.sh) builds
+     * stubs for the ones with a desktop file.
+     */
+    private fun requestStub(appId: String) {
+        if (appId.isEmpty() || !appId.matches(Regex("[A-Za-z0-9._-]+"))) return
+        val file = File(filesDir, "stub-requests")
+        val known = runCatching { file.readLines() }.getOrDefault(emptyList())
+        if (appId !in known) runCatching { file.appendText("$appId\n") }
     }
 
     override fun onUnmap(win: Int) = main.post {
