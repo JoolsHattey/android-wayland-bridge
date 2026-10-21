@@ -20,7 +20,7 @@ use wayland_server::Resource;
 use wayland_server::backend::ObjectId;
 use wayland_server::protocol::wl_buffer::WlBuffer;
 
-use crate::android::ANativeWindow;
+use crate::android::{ANativeWindow, NativeSlot, TargetLock};
 use crate::direct::{AHardwareBuffer, Layer};
 use crate::output::to_px;
 use crate::render::Band;
@@ -817,8 +817,6 @@ pub struct Target {
     band_scratch: Vec<u32>,
     band_serial: u64,
     last_serial: u64,
-    /// The last submit's sync_file, for the Renderer to take.
-    fence: Option<OwnedFd>,
     /// The swapchain must be recreated before the next frame.
     stale: bool,
     /// Present ids: the last one queued, and the last the display showed.
@@ -898,7 +896,6 @@ impl Target {
                 band_scratch: Vec::new(),
                 band_serial: 0,
                 last_serial: 0,
-                fence: None,
                 stale: true,
                 presented: 0,
                 shown: 0,
@@ -1043,11 +1040,12 @@ impl Target {
         Some(crate::render::caption_analysis(&band, caption))
     }
 
-    /// Draws one frame: uploads, the quads, then the caption readback
-    /// (none if `band` has no rows).
-    /// Returns false if nothing was drawn: no image is free yet (the
+    /// Records one frame into `cmd`: uploads, the quads, then the caption
+    /// readback (none if `band` has no rows). Returns the image acquired,
+    /// to submit (`Renderer::flush`) and then `present`, and the rows read
+    /// back; None if nothing was recorded: no image is free yet (the
     /// display still holds them) or the swapchain is out of date.
-    fn frame(&mut self, draws: &[Draw], band: (i32, i32), serial: u64) -> Result<bool, String> {
+    fn record(&mut self, draws: &[Draw], band: (i32, i32)) -> Result<Option<(usize, Option<BandRows>)>, String> {
         let gpu = self.gpu.clone();
         let d = &gpu.device;
         let (ew, eh) = self.extent;
@@ -1072,15 +1070,15 @@ impl Target {
                     }
                 }
                 if self.presented.wrapping_sub(self.shown) >= MAX_QUEUED {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
             let idx = match gpu.swapchain_fn.acquire_next_image(self.swapchain, 0, self.acquired, vk::Fence::null()) {
                 Ok((i, _)) => i as usize,
-                Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => return Ok(false),
+                Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => return Ok(None),
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.stale = true;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(e) => return Err(format!("acquire: {e}")),
             };
@@ -1233,55 +1231,44 @@ impl Target {
                 );
             }
             err("end", d.end_command_buffer(cmd))?;
-
-            let waits = [self.acquired];
-            let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER];
-            let mut signals = vec![self.rendered[idx], gpu.timeline];
-            let mut values = vec![0, serial];
-            if let Some(sem) = gpu.export_semaphore() {
-                signals.push(sem);
-                values.push(0);
-            }
-            let mut tl = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&[0]).signal_semaphore_values(&values);
-            let cmds = [cmd];
-            let submit = vk::SubmitInfo::default()
-                .wait_semaphores(&waits)
-                .wait_dst_stage_mask(&stages)
-                .command_buffers(&cmds)
-                .signal_semaphores(&signals)
-                .push_next(&mut tl);
-            err("submit", d.queue_submit(gpu.queue, &[submit], vk::Fence::null()))?;
-            self.fence = gpu.fence();
-            self.last_serial = serial;
-            if read {
-                self.band = (y0, rows, ew, self.format == vk::Format::B8G8R8A8_UNORM);
-                self.band_resample = None;
-                self.band_serial = serial;
-            }
-
-            let present_waits = [self.rendered[idx]];
-            let swapchains = [self.swapchain];
-            let indices = [idx as u32];
-            self.presented = self.presented.wrapping_add(1);
-            let times = [vk::PresentTimeGOOGLE { present_id: self.presented, desired_present_time: 0 }];
-            let mut times = vk::PresentTimesInfoGOOGLE::default().times(&times);
-            let mut present =
-                vk::PresentInfoKHR::default().wait_semaphores(&present_waits).swapchains(&swapchains).image_indices(&indices);
-            if gpu.timing_fn.is_some() {
-                present = present.push_next(&mut times);
-            }
-            match gpu.swapchain_fn.queue_present(gpu.queue, &present) {
-                Ok(false) => {}
-                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.stale = true,
-                Err(e) => log::warn!("gpu: present: {e}"),
-            }
+            let bgra = self.format == vk::Format::B8G8R8A8_UNORM;
+            Ok(Some((idx, read.then_some(BandRows { band: (y0, rows, ew, bgra), resample: None }))))
         }
-        Ok(true)
+    }
+
+    /// Queues image `idx`, once its frame is submitted. One present per
+    /// swapchain: Android's loader hands every swapchain of a present all
+    /// of its wait semaphores, and the first consumes them.
+    fn present(&mut self, idx: usize) {
+        let gpu = &self.gpu;
+        let present_waits = [self.rendered[idx]];
+        let swapchains = [self.swapchain];
+        let indices = [idx as u32];
+        self.presented = self.presented.wrapping_add(1);
+        let times = [vk::PresentTimeGOOGLE { present_id: self.presented, desired_present_time: 0 }];
+        let mut times = vk::PresentTimesInfoGOOGLE::default().times(&times);
+        let mut present =
+            vk::PresentInfoKHR::default().wait_semaphores(&present_waits).swapchains(&swapchains).image_indices(&indices);
+        if gpu.timing_fn.is_some() {
+            present = present.push_next(&mut times);
+        }
+        match unsafe { gpu.swapchain_fn.queue_present(gpu.queue, &present) } {
+            Ok(false) => {}
+            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.stale = true,
+            Err(e) => log::warn!("gpu: present: {e}"),
+        }
     }
 }
 
+/// Caption rows a recorded frame reads back, for its Target once it is
+/// submitted: `band`, and `band_resample` for a scaled direct buffer.
+struct BandRows {
+    band: (i32, i32, i32, bool),
+    resample: Option<(usize, Vec<usize>, Vec<usize>)>,
+}
+
 impl Target {
-    /// When to try again after `frame` found no image free: just after the
+    /// When to try again after `record` found no image free: just after the
     /// display's next vsync, when it may have shown a frame. Shortly after
     /// a vsync the timing may still lag, so then it polls (as without
     /// timing).
@@ -1311,13 +1298,15 @@ impl Target {
     /// Direct mode's stand-in for the composited caption: copies the
     /// client's buffer px under the band's window rows (`band`: first row,
     /// rows) in a window of `size` px, placed by `map`. A scaled buffer's
-    /// part is resampled to window px when read (`analyse_band`). Callers
-    /// have waited for the last frame.
-    fn read_direct(&mut self, d: &Dmabuf, map: BufferMap, size: (i32, i32), band: (i32, i32), serial: u64) -> Result<bool, String> {
+    /// part is resampled to window px when read (`analyse_band`). Records
+    /// the copy into `cmd` for `Renderer::flush` and returns the rows, or
+    /// None if there is nothing to copy. Callers have waited for the last
+    /// frame.
+    fn read_direct(&mut self, d: &Dmabuf, map: BufferMap, size: (i32, i32), band: (i32, i32)) -> Result<Option<BandRows>, String> {
         let (width, y0) = (size.0, band.0.clamp(0, size.1));
         let rows = band.1.clamp(0, size.1 - y0);
         if rows <= 0 || width <= 0 || d.width <= 0 || d.height <= 0 || !d.format.transfer {
-            return Ok(false);
+            return Ok(None);
         }
         // The buffer px under each band px's centre: one run of columns
         // and one of rows, read whole.
@@ -1383,23 +1372,8 @@ impl Target {
                 &[],
             );
             err("end", dev.end_command_buffer(cmd))?;
-            let mut signals = vec![gpu.timeline];
-            let mut values = vec![serial];
-            if let Some(sem) = gpu.export_semaphore() {
-                signals.push(sem);
-                values.push(0);
-            }
-            let mut tl = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
-            let cmds = [cmd];
-            let submit = vk::SubmitInfo::default().command_buffers(&cmds).signal_semaphores(&signals).push_next(&mut tl);
-            err("submit", dev.queue_submit(gpu.queue, &[submit], vk::Fence::null()))?;
-            self.fence = gpu.fence();
         }
-        self.last_serial = serial;
-        self.band = (y0, rows, width, d.bgra);
-        self.band_resample = resample;
-        self.band_serial = serial;
-        Ok(true)
+        Ok(Some(BandRows { band: (y0, rows, width, d.bgra), resample }))
     }
 }
 
@@ -1507,6 +1481,30 @@ struct BandKey {
     caption: crate::Caption,
     /// Per surface drawn over the band: surface, destination, uv, commit.
     draws: Vec<(ObjectId, [i32; 4], [f32; 4], u64)>,
+}
+
+/// A window's work recorded in this pass, for `Renderer::flush` to submit
+/// with the other windows'.
+struct Recorded<'a> {
+    id: u32,
+    /// The window's slot, locked from recording until the work is
+    /// submitted and presented: the UI thread cannot destroy the swapchain
+    /// (and the recorded command buffer) in between.
+    lock: TargetLock<'a>,
+    /// The swapchain image drawn; None for a direct-mode readback.
+    image: Option<usize>,
+    /// The caption rows read back, if any.
+    band: Option<BandRows>,
+    then: Then,
+}
+
+/// What a recorded window still does once its work is submitted.
+enum Then {
+    /// A composited frame: whether its band is analysed, the band key, and
+    /// the surfaces drawn.
+    Frame { read: bool, key: BandKey, list: Vec<(ObjectId, i32, i32)> },
+    /// Direct mode's caption readback from this buffer.
+    Direct { d: Rc<Dmabuf>, key: BandKey },
 }
 
 /// A wl_shm texture on the GPU, per surface.
@@ -1826,9 +1824,9 @@ impl Renderer {
         }
     }
 
-    fn render_window(&mut self, st: &mut State, id: u32) {
+    /// Records a window's frame into `batch` (or shows it directly).
+    fn render_window<'a>(&mut self, st: &mut State, id: u32, slot: &'a Arc<NativeSlot>, batch: &mut Vec<Recorded<'a>>) {
         let Some(w) = st.windows.get(&id) else { return };
-        let slot = st.shared.slot(id);
         if !slot.is_attached() {
             return;
         }
@@ -1936,14 +1934,16 @@ impl Renderer {
         let generation = slot.with_target(|_, t| t.as_ref().map(|t| t.generation)).flatten();
         self.sync_layer(id, generation);
         if let Some((d, map)) = self.direct_candidate(st, &list, &draws, (pw, ph), top) {
-            return self.render_direct(st, id, &slot, &list, d, map, (pw, ph), top, band, (read, key));
+            return self.render_direct(st, id, slot, batch, &list, d, map, (pw, ph), top, band, (read, key));
         }
         // Composited frames go through the swapchain, outside Android's sync.
         answer_sync(st, id, None, "not direct");
 
-        let serial = self.serial + 1;
         let gpu = self.gpu.clone();
-        let result = slot.with_target(|win, target| -> Result<Result<(u64, Option<OwnedFd>), i32>, String> {
+        let Some(mut lock) = slot.lock_target() else { return };
+        let win = lock.window();
+        let target = lock.target();
+        let result = (|| -> Result<Option<(usize, Option<BandRows>)>, String> {
             if target.is_none() {
                 *target = Some(Target::new(gpu.clone(), win)?);
             }
@@ -1952,54 +1952,54 @@ impl Renderer {
             if t.stale || t.extent != (pw, ph) {
                 t.configure(pw, ph)?;
             }
-            if !t.frame(&draws, if read { band } else { (0, 0) }, serial)? {
-                return Ok(Err(t.retry_ms()));
+            t.record(&draws, if read { band } else { (0, 0) })
+        })();
+        match result {
+            // Submitted and presented with the pass (`flush`), still locked.
+            Ok(Some((image, rows))) => {
+                batch.push(Recorded { id, lock, image: Some(image), band: rows, then: Then::Frame { read, key, list } });
             }
-            Ok(Ok((t.generation, t.fence.take())))
-        });
-        let generation = match result {
-            Some(Ok(Ok((g, fence)))) => {
-                if let Some(f) = fence {
-                    self.fences.push((serial, f));
-                }
-                g
-            }
-            Some(Ok(Err(retry))) => {
+            Ok(None) => {
                 // No swapchain image free yet: try again around the next vsync.
+                let retry = lock.target().as_ref().map_or(2, |t| t.retry_ms());
                 self.retry_in(retry);
-                return;
             }
-            Some(Err(e)) => {
-                log::warn!("gpu: toplevel {id}: {e}");
-                return;
-            }
-            None => return,
-        };
-        self.serial = serial;
+            Err(e) => log::warn!("gpu: toplevel {id}: {e}"),
+        }
+    }
+
+    /// A composited frame went out as `serial`: the window's bookkeeping.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_frame(
+        &mut self,
+        st: &mut State,
+        id: u32,
+        lock: &mut TargetLock,
+        serial: u64,
+        read: bool,
+        key: BandKey,
+        list: &[(ObjectId, i32, i32)],
+    ) {
         if read {
             self.frames.push((serial, id));
         }
         self.bands.insert(id, key);
         // Composited again: take the client's buffer off the direct layer.
-        self.sync_layer(id, Some(generation));
+        let generation = lock.target().as_ref().map(|t| t.generation);
+        self.sync_layer(id, generation);
         if let Some(state) = self.direct.get_mut(&id).filter(|s| s.shown.is_some()) {
             let token = self.next_token;
             self.next_token += 1;
-            let (shared, placeholder) = (self.shared.clone(), self.placeholder);
             if st.windows.get(&id).is_some_and(|w| w.window_layer) {
                 st.host.present(id, None, [0; 4], token);
-            } else {
-                slot.with_target(|_, t| {
-                    if let Some(layer) = t.as_ref().and_then(|t| t.layer.as_ref()) {
-                        layer.present(None, placeholder, [0; 4], &shared, id, token);
-                    }
-                });
+            } else if let Some(layer) = lock.target().as_ref().and_then(|t| t.layer.as_ref()) {
+                layer.present(None, self.placeholder, [0; 4], &self.shared, id, token);
             }
             state.replaced.insert(token, state.shown.take());
             log::info!("toplevel {id}: composited");
         }
         let now = st.now_ms();
-        for (sid, _, _) in &list {
+        for (sid, _, _) in list {
             if let Some(t) = self.shm.get_mut(sid) {
                 if t.dirty.take().is_some() {
                     t.written = true;
@@ -2101,11 +2101,12 @@ impl Renderer {
 
     /// Shows the buffer on the window's layer, one transaction at a time.
     #[allow(clippy::too_many_arguments)]
-    fn render_direct(
+    fn render_direct<'a>(
         &mut self,
         st: &mut State,
         id: u32,
-        slot: &Arc<crate::android::NativeSlot>,
+        slot: &'a Arc<NativeSlot>,
+        batch: &mut Vec<Recorded<'a>>,
         list: &[(ObjectId, i32, i32)],
         d: Rc<Dmabuf>,
         map: BufferMap,
@@ -2125,7 +2126,6 @@ impl Renderer {
             }
         }
         let Some(ahb) = d.hardware_buffer() else { return };
-        let serial = self.serial + 1;
         let token = self.next_token;
         self.next_token += 1;
         let (gpu, shared, placeholder) = (self.gpu.clone(), self.shared.clone(), self.placeholder);
@@ -2135,7 +2135,10 @@ impl Renderer {
         // SurfaceFlinger scales one to the other.
         let dst = [0, top, pw, ph];
         let src = map.crop(dst, (d.width, d.height));
-        let result = slot.with_target(|win, target| -> Result<(u64, bool, Option<OwnedFd>), String> {
+        let Some(mut lock) = slot.lock_target() else { return };
+        let win = lock.window();
+        let target = lock.target();
+        let result = (|| -> Result<(u64, Option<BandRows>), String> {
             if target.is_none() {
                 *target = Some(Target::new(gpu.clone(), win)?);
             }
@@ -2145,26 +2148,24 @@ impl Renderer {
                 let layer = t.layer(win).ok_or("cannot create the direct layer")?;
                 layer.present(Some((ahb, src, d.opaque)), placeholder, dst, &shared, id, token);
             }
-            let read = want_read
-                && t.read_direct(&d, map, (pw, ph), band, serial).unwrap_or_else(|e| {
-                    log::warn!("gpu: caption readback: {e}");
-                    false
-                });
-            Ok((t.generation, read, t.fence.take().filter(|_| read)))
-        });
-        let (generation, read) = match result {
-            Some(Ok((g, read, fence))) => {
-                if let Some(f) = fence {
-                    self.fences.push((serial, f));
-                }
-                (g, read)
+            if !want_read {
+                return Ok((t.generation, None));
             }
-            Some(Err(e)) => {
+            let rows = t.read_direct(&d, map, (pw, ph), band).unwrap_or_else(|e| {
+                log::warn!("gpu: caption readback: {e}");
+                None
+            });
+            Ok((t.generation, rows))
+        })();
+        let (generation, rows) = match result {
+            Ok(r) => r,
+            Err(e) => {
                 log::warn!("gpu: toplevel {id}: {e}");
                 return;
             }
-            None => return,
         };
+        // Only a recorded readback keeps the slot locked (until `flush`).
+        let lock = rows.is_some().then_some(lock);
         self.sync_layer(id, Some(generation));
         let state = self.direct.get_mut(&id).unwrap();
         d.sf_holds.set(d.sf_holds.get() + 1);
@@ -2191,14 +2192,6 @@ impl Renderer {
                 st.host.present(id, Some((ahb, src, d.opaque)), dst, token);
             }
         }
-        if read {
-            self.serial = serial;
-            self.frames.push((serial, id));
-            d.last_use.set(serial);
-        }
-        if read || !want_read {
-            self.bands.insert(id, key);
-        }
         let now = st.now_ms();
         for (sid, _, _) in list {
             if let Some(s) = st.surfaces.get_mut(sid) {
@@ -2209,6 +2202,93 @@ impl Renderer {
         }
         if let Some(w) = st.windows.get_mut(&id) {
             w.dirty = false;
+        }
+        match (lock, rows) {
+            // The readback goes out with the pass, which records its frame.
+            (Some(lock), Some(rows)) => {
+                batch.push(Recorded { id, lock, image: None, band: Some(rows), then: Then::Direct { d, key } });
+            }
+            _ if !want_read => {
+                self.bands.insert(id, key);
+            }
+            _ => {}
+        }
+    }
+
+    /// Submits the pass's recorded work with one vkQueueSubmit: one batch,
+    /// so one execbuf (each costs ~0.13 ms of CPU in i915/GuC), signalling
+    /// one serial and one fence for all windows. Then presents each frame
+    /// and finishes each window, releasing its slot.
+    fn flush(&mut self, st: &mut State, mut batch: Vec<Recorded>) {
+        if batch.is_empty() {
+            return;
+        }
+        let gpu = self.gpu.clone();
+        let serial = self.serial + 1;
+        let (mut cmds, mut waits, mut signals, mut values) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for r in &mut batch {
+            let t = r.lock.target().as_ref().expect("recorded under the lock");
+            cmds.push(t.cmd);
+            if let Some(idx) = r.image {
+                waits.push(t.acquired);
+                signals.push(t.rendered[idx]);
+                values.push(0);
+            }
+        }
+        signals.push(gpu.timeline);
+        values.push(serial);
+        if let Some(sem) = gpu.export_semaphore() {
+            signals.push(sem);
+            values.push(0);
+        }
+        // Every frame waits for every acquire in the batch; the images are
+        // free by the time they are acquired without blocking.
+        let stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER; waits.len()];
+        let wait_values = vec![0; waits.len()];
+        let mut tl = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_values).signal_semaphore_values(&values);
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&waits)
+            .wait_dst_stage_mask(&stages)
+            .command_buffers(&cmds)
+            .signal_semaphores(&signals)
+            .push_next(&mut tl);
+        let submitted = match unsafe { gpu.device.queue_submit(gpu.queue, &[submit], vk::Fence::null()) } {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("gpu: submit ({} windows): {e}", batch.len());
+                false
+            }
+        };
+        if submitted {
+            self.serial = serial;
+            if let Some(f) = gpu.fence() {
+                self.fences.push((serial, f));
+            }
+        }
+        for Recorded { id, mut lock, image, band, then } in batch {
+            let t = lock.target().as_mut().expect("recorded under the lock");
+            if !submitted {
+                // An image was acquired but never drawn: start the swapchain over.
+                t.stale |= image.is_some();
+                continue;
+            }
+            t.last_serial = serial;
+            if let Some(b) = band {
+                t.band = b.band;
+                t.band_resample = b.resample;
+                t.band_serial = serial;
+            }
+            if let Some(idx) = image {
+                t.present(idx);
+            }
+            match then {
+                Then::Frame { read, key, list } => self.finish_frame(st, id, &mut lock, serial, read, key, &list),
+                Then::Direct { d, key } => {
+                    self.frames.push((serial, id));
+                    d.last_use.set(serial);
+                    self.bands.insert(id, key);
+                }
+            }
         }
     }
 }
@@ -2231,9 +2311,14 @@ pub fn render_dirty(st: &mut State) {
     r.retry = None;
     r.implicit_waits.clear();
     let dirty: Vec<u32> = st.windows.values().filter(|w| w.dirty && w.mapped && w.px.0 > 0).map(|w| w.id).collect();
-    for id in dirty {
-        r.render_window(st, id);
+    // Every window is recorded first, then all go out in one submit. Each
+    // recorded window's slot stays locked until then (see `Recorded`).
+    let slots: Vec<_> = dirty.iter().map(|&id| st.shared.slot(id)).collect();
+    let mut batch = Vec::new();
+    for (&id, slot) in dirty.iter().zip(&slots) {
+        r.render_window(st, id, slot, &mut batch);
     }
+    r.flush(st, batch);
     let wanted = std::mem::take(&mut r.acquire_wanted);
     r.acquire_waits.retain(|k, _| wanted.contains(k));
     st.gpu = Some(r);

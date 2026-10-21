@@ -2,7 +2,7 @@
 //! into (CPU locking, or a Vulkan swapchain).
 
 use std::ffi::{CString, c_char, c_int, c_void};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use jni::JNIEnv;
 use jni::objects::JObject;
@@ -129,9 +129,17 @@ impl NativeSlot {
     /// Runs `f` on the attached window and its swapchain slot, under the
     /// lock. None if no surface is attached.
     pub fn with_target<R>(&self, f: impl FnOnce(*mut ANativeWindow, &mut Option<crate::gpu::Target>) -> R) -> Option<R> {
-        let mut g = self.win.lock().unwrap_or_else(|e| e.into_inner());
-        let win = g.as_mut()?;
-        Some(f(win.ptr, &mut win.target))
+        let mut lock = self.lock_target()?;
+        let win = lock.window();
+        Some(f(win, lock.target()))
+    }
+
+    /// The attached window and its swapchain slot, locked until the result
+    /// is dropped (the UI thread cannot detach meanwhile). None if no
+    /// surface is attached.
+    pub fn lock_target(&self) -> Option<TargetLock<'_>> {
+        let g = self.win.lock().unwrap_or_else(|e| e.into_inner());
+        g.is_some().then_some(TargetLock(g))
     }
 
     pub fn is_attached(&self) -> bool {
@@ -165,6 +173,19 @@ impl NativeSlot {
             ANativeWindow_unlockAndPost(win.ptr);
         }
         true
+    }
+}
+
+/// A slot's attached window and swapchain, held under its lock.
+pub struct TargetLock<'a>(MutexGuard<'a, Option<Win>>);
+
+impl TargetLock<'_> {
+    pub fn window(&self) -> *mut ANativeWindow {
+        self.0.as_ref().map_or(std::ptr::null_mut(), |w| w.ptr)
+    }
+
+    pub fn target(&mut self) -> &mut Option<crate::gpu::Target> {
+        &mut self.0.as_mut().expect("locked while attached").target
     }
 }
 
