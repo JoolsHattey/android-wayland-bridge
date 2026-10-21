@@ -1541,6 +1541,8 @@ pub struct Renderer {
     implicit_waits: Vec<Rc<Dmabuf>>,
     /// Direct mode (see `direct.rs`): off with `direct=0`.
     direct_enabled: bool,
+    /// Direct mode for buffers SurfaceFlinger must scale: `direct_scaled=1`.
+    direct_scaled: bool,
     shared: Arc<Shared>,
     direct: HashMap<u32, Direct>,
     /// SurfaceFlinger release fences, each for one hold of a buffer.
@@ -1578,7 +1580,7 @@ impl Direct {
 }
 
 impl Renderer {
-    pub fn new(shared: Arc<Shared>, direct_enabled: bool) -> Result<Renderer, String> {
+    pub fn new(shared: Arc<Shared>, direct_enabled: bool, direct_scaled: bool) -> Result<Renderer, String> {
         let gpu = Gpu::new()?;
         let serial = gpu.completed();
         Ok(Renderer {
@@ -1594,6 +1596,7 @@ impl Renderer {
             acquire_wanted: Vec::new(),
             implicit_waits: Vec::new(),
             direct_enabled,
+            direct_scaled,
             shared,
             direct: HashMap::new(),
             sf_fences: Vec::new(),
@@ -2080,7 +2083,8 @@ impl Renderer {
         let (kx, ky) = (sw / (x1 - x0) as f64, sh / (y1 - y0) as f64);
         let map = BufferMap { x: (sx - x0 as f64 * kx, kx), y: (sy - y0 as f64 * ky, ky) };
         let [cx0, cy0, cx1, cy1] = map.crop([0, top, pw, ph], (d.width, d.height));
-        let fits = d.format.direct() && !d.y_invert && cx1 > cx0 && cy1 > cy0;
+        let one_to_one = (cx1 - cx0, cy1 - cy0) == (pw, ph - top);
+        let fits = d.format.direct() && !d.y_invert && cx1 > cx0 && cy1 > cy0 && (one_to_one || self.direct_scaled);
         (fits && d.hardware_buffer().is_some()).then(|| (d.clone(), map))
     }
 
