@@ -438,14 +438,19 @@ impl Gpu {
         })
     }
 
-    /// A host-visible, coherent buffer, mapped.
+    /// A host-visible, coherent buffer, mapped. Readback buffers (`usage`
+    /// TRANSFER_DST) prefer cached memory, which the CPU reads at full speed;
+    /// uploads keep the first match, usually write-combined.
     fn host_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
         unsafe {
             let d = &self.device;
             let buffer = err("buffer", d.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None))?;
             let req = d.get_buffer_memory_requirements(buffer);
             let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let Some(ti) = self.memory_type(req.memory_type_bits, host) else {
+            let cached = usage.contains(vk::BufferUsageFlags::TRANSFER_DST)
+                .then(|| self.memory_type(req.memory_type_bits, host | vk::MemoryPropertyFlags::HOST_CACHED))
+                .flatten();
+            let Some(ti) = cached.or_else(|| self.memory_type(req.memory_type_bits, host)) else {
                 d.destroy_buffer(buffer, None);
                 return Err("no host-visible memory".into());
             };
@@ -808,6 +813,8 @@ pub struct Target {
     /// For a scaled buffer read in direct mode: the readback's width, then
     /// per band column and row the readback px it shows (nearest).
     band_resample: Option<(usize, Vec<usize>, Vec<usize>)>,
+    /// The resampled band, kept to reuse its allocation.
+    band_scratch: Vec<u32>,
     band_serial: u64,
     last_serial: u64,
     /// The last submit's sync_file, for the Renderer to take.
@@ -888,6 +895,7 @@ impl Target {
                 readback: None,
                 band: (0, 0, 0, false),
                 band_resample: None,
+                band_scratch: Vec::new(),
                 band_serial: 0,
                 last_serial: 0,
                 fence: None,
@@ -1009,27 +1017,30 @@ impl Target {
         Ok(())
     }
 
-    /// The caption rows of frame `serial`, as RGBA (0xAABBGGRR) pixels.
-    fn band_pixels(&self, serial: u64) -> Option<(Vec<u32>, i32, i32, i32)> {
+    /// Runs the header analysis on the caption rows of frame `serial`, in
+    /// place in the mapped readback (no copy, no swizzle) unless a scaled
+    /// direct buffer needs resampling to window px.
+    fn analyse_band(&mut self, serial: u64, caption: &crate::Caption) -> Option<crate::render::CaptionInfo> {
         let (y0, rows, width, bgra) = self.band;
         let (_, _, ptr, _) = self.readback?;
         if self.band_serial != serial || rows <= 0 || width <= 0 {
             return None;
         }
-        let mut px = match &self.band_resample {
-            None => unsafe { std::slice::from_raw_parts(ptr as *const u32, (rows * width) as usize) }.to_vec(),
+        // The frame has completed and no later one was recorded (serial), so
+        // the GPU is not writing these rows; the lock keeps the buffer alive.
+        let px = match &self.band_resample {
+            None => unsafe { std::slice::from_raw_parts(ptr as *const u32, (rows * width) as usize) },
             Some((stride, cols, lines)) => {
                 let n = lines.last().map_or(0, |l| (l + 1) * stride);
                 let read = unsafe { std::slice::from_raw_parts(ptr as *const u32, n) };
-                lines.iter().flat_map(|l| cols.iter().map(move |c| read[l * stride + c])).collect()
+                // Resampled into a buffer kept across frames.
+                self.band_scratch.clear();
+                self.band_scratch.extend(lines.iter().flat_map(|l| cols.iter().map(move |c| read[l * stride + c])));
+                &self.band_scratch[..]
             }
         };
-        if bgra {
-            for v in &mut px {
-                *v = (*v & 0xff00ff00) | ((*v >> 16) & 0xff) | ((*v & 0xff) << 16);
-            }
-        }
-        Some((px, width, y0, rows))
+        let band = Band { rows: px, width, stride: width as usize, y0, y1: y0 + rows, bgra };
+        Some(crate::render::caption_analysis(&band, caption))
     }
 
     /// Draws one frame: uploads, the quads, then the caption readback
@@ -1300,7 +1311,7 @@ impl Target {
     /// Direct mode's stand-in for the composited caption: copies the
     /// client's buffer px under the band's window rows (`band`: first row,
     /// rows) in a window of `size` px, placed by `map`. A scaled buffer's
-    /// part is resampled to window px when read (`band_pixels`). Callers
+    /// part is resampled to window px when read (`analyse_band`). Callers
     /// have waited for the last frame.
     fn read_direct(&mut self, d: &Dmabuf, map: BufferMap, size: (i32, i32), band: (i32, i32), serial: u64) -> Result<bool, String> {
         let (width, y0) = (size.0, band.0.clamp(0, size.1));
@@ -1804,10 +1815,10 @@ impl Renderer {
         for &(serial, win) in &finished {
             let slot = st.shared.slots.lock().ok().and_then(|s| s.get(&win).cloned());
             let Some(slot) = slot else { continue };
-            let band = slot.with_target(|_, t| t.as_ref().and_then(|t| t.band_pixels(serial))).flatten();
-            if let Some((rows, width, y0, n)) = band {
-                let band = Band { rows: &rows, width, stride: width as usize, y0, y1: y0 + n };
-                crate::render::caption_feedback(st, win, &band);
+            let Some(caption) = st.windows.get(&win).map(|w| &w.caption) else { continue };
+            let info = slot.with_target(|_, t| t.as_mut().and_then(|t| t.analyse_band(serial, caption))).flatten();
+            if let Some(info) = info {
+                crate::render::caption_feedback(st, win, info);
             } else if !self.frames.iter().chain(&finished).any(|&(s, w)| w == win && s > serial) {
                 // The window's latest readback is lost: read the next frame.
                 self.bands.remove(&win);

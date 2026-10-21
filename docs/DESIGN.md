@@ -209,12 +209,16 @@ through its `/dev` bind mount.
   staging buffer, and the next frame uploads only the part not yet in the
   image.
 * **Header analysis.** After the render pass, the caption band is copied to
-  a host buffer. When the frame completes, the same code as on the CPU path
-  derives the control colour and gesture exclusion from it. A frame skips
-  the readback when its band can't look different from the last one read:
-  the same window size and caption, the same surfaces at the same places
-  over the band, and none of their damage since then reaching the band's
-  rows. Direct mode skips its readback the same way.
+  a host buffer (cached memory where the device offers it). When the frame
+  completes, the same code as on the CPU path derives the control colour
+  and gesture exclusion from it, in place in the mapped buffer: no copy,
+  and BGRA swapchains need no swizzle pass (only the luma reads channels).
+  A scaled direct-mode band is first resampled to window px into a buffer
+  kept across frames. A frame skips the readback when its band can't look
+  different from the last one read: the same window size and caption, the
+  same surfaces at the same places over the band, and none of their damage
+  since then reaching the band's rows. Direct mode skips its readback the
+  same way.
 * **Fallback.** Without a usable Vulkan device, or with `renderer=cpu` in
   `files/awb.properties`, the CPU compositor runs and no dmabuf global is
   offered. Mesa then falls back to llvmpipe and GTK to cairo.
@@ -489,6 +493,17 @@ change. Results on the device with Adwaita Demo:
 * A drag on empty header space moved the window natively, from (1216,432) to
   (1016,672).
 
+**Cost.** The scan reads the band row by row: every other row is compared
+with the first, column flags are OR-ed, and spans come from the flags. So
+memory is read once and in order (it may be an uncached readback), and the
+compare vectorises. The control colour is the mean luma of every 4th pixel
+of one row under the system controls. On a 2560×40 band (0.4 MB) this is
+about 13 µs on a desktop CPU, against ~105 µs (~135 µs with BGRA) for the
+earlier copy, swizzle and column-by-column scan, with identical results.
+Nothing is subsampled further: exclusion edges must be exact next to
+buttons, and the columns under the system controls are scanned too, since
+a span that runs into them must keep its edge.
+
 It needs no client co-operation, so it also covers Qt and Chromium tab
 strips. Headers with gradients or images become fully excluded, i.e.
 click-only.
@@ -747,7 +762,9 @@ es2gears_wayland.
 * **Readback.** The caption band (about 0.4 MB) is read back only when it
   may have changed. A client that redraws its header every frame (an
   animated header, or one that damages its whole buffer) still costs one
-  readback per frame.
+  readback per frame; its CPU side is one in-order pass over half the
+  band's rows, with no copy (see
+  [The drag question](#the-drag-question-answered)).
 * **Direct mode** depends on minigbm's private handle layout and the
   GraphicBuffer wire format. A gralloc update could change either; the
   mapper then rejects the buffer (logged) and the window stays composited.
