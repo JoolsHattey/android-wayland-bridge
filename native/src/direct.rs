@@ -121,7 +121,26 @@ pub fn tiling(modifier: u64) -> Option<u32> {
     }
 }
 
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Marks our ids apart from gralloc's: above any pid (pid_max is at most
+/// 2^22) and above any count gralloc's allocator will reach.
+const ID_TAG: u32 = 0x4000_0000;
+
+/// Ids for a wrapped buffer that no real gralloc buffer has, in any
+/// process: minigbm's handle id (its per-process import cache is keyed by
+/// it, so a clash with a live buffer imports that buffer instead) and the
+/// high word of GraphicBuffer's id (pid << 32 | a per-process count; it
+/// keys the client-side buffer cache of every process that sets the
+/// buffer on a layer, and SurfaceFlinger's ClientCache behind it, so a
+/// clash with a buffer of the window's process, such as its swapchain's
+/// when the window runs in our process, sends a cache id for the wrong
+/// buffer or one SurfaceFlinger has dropped).
+fn new_ids() -> (u32, u32) {
+    let pid = unsafe { libc::getpid() } as u32;
+    let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    (ID_TAG | (pid & 0x3ff) << 20 | (n & 0xf_ffff), ID_TAG | pid)
+}
 
 /// Ints of GraphicBuffer's flattened header, before the handle's ints.
 const HEADER_INTS: usize = 13;
@@ -221,7 +240,7 @@ pub struct Plane<'a> {
 pub fn wrap(plane: &Plane, width: i32, height: i32, fourcc_code: u32, modifier: u64) -> Option<*mut AHardwareBuffer> {
     let hal = hal_format(fourcc_code)?;
     let tiling = tiling(modifier)?;
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let (id, id_high) = new_ids();
     let metadata = metadata_template().and_then(metadata_region);
     let reserved = metadata.as_ref().map_or(0, |_| metadata_template().unwrap().len() as u64);
     let mut fds = vec![plane.fd.as_raw_fd()];
@@ -252,7 +271,6 @@ pub fn wrap(plane: &Plane, width: i32, height: i32, fourcc_code: u32, modifier: 
     ]);
     // GraphicBuffer::flatten: magic 'GB01', size, stride (px), format,
     // layers, usage (low), id, generation, fds, ints, usage (high).
-    let pid = unsafe { libc::getpid() } as i32;
     let mut msg: Vec<i32> = vec![
         0x4742_3031,
         width,
@@ -261,7 +279,7 @@ pub fn wrap(plane: &Plane, width: i32, height: i32, fourcc_code: u32, modifier: 
         hal,
         1,
         lo(USAGE),
-        pid,
+        id_high as i32,
         id as i32,
         0,
         fds.len() as i32,
