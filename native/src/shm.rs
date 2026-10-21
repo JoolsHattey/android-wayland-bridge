@@ -3,6 +3,8 @@
 //! that, map zero pages over the pool and disconnect the client instead of
 //! dying. Buffers are copied once at commit time (into a `Texture`) and
 //! released immediately, so client memory is never touched afterwards.
+//! Only the damaged part is copied: the rest of the surface's previous
+//! pixels is kept.
 
 use std::cell::RefCell;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -81,6 +83,61 @@ pub struct Texture {
     pub sync: Option<crate::syncobj::CommitSync>,
     /// Unique per commit, so the GPU path uploads each shm texture once.
     pub serial: u64,
+    /// The latest commits, oldest first: serial, and the part (buffer px
+    /// `[x0, y0, x1, y1]`) that changed since the commit before it.
+    pub history: Vec<(u64, Rect)>,
+}
+
+/// A rectangle in buffer px: x0, y0, x1, y1 (empty when x0 >= x1 or y0 >= y1).
+pub type Rect = [i32; 4];
+
+/// How many commits a texture remembers the damage of.
+const HISTORY: usize = 8;
+
+pub fn rect_empty(r: Rect) -> bool {
+    r[0] >= r[2] || r[1] >= r[3]
+}
+
+pub fn rect_union(a: Rect, b: Rect) -> Rect {
+    if rect_empty(a) {
+        return b;
+    }
+    if rect_empty(b) {
+        return a;
+    }
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+
+pub fn rect_clamp(r: Rect, w: i32, h: i32) -> Rect {
+    [r[0].clamp(0, w), r[1].clamp(0, h), r[2].clamp(0, w), r[3].clamp(0, h)]
+}
+
+impl Texture {
+    /// The part that changed since commit `serial` (empty if this is it),
+    /// or None if that commit is too old to know.
+    pub fn damage_since(&self, serial: u64) -> Option<Rect> {
+        if serial == self.serial {
+            return Some([0; 4]);
+        }
+        let i = self.history.iter().position(|(s, _)| *s == serial)?;
+        Some(self.history[i + 1..].iter().fold([0; 4], |acc, (_, r)| rect_union(acc, *r)))
+    }
+
+    /// The history of a commit that follows `prev` with `damage`: it
+    /// continues `prev`'s when the two are comparable (same size and kind),
+    /// else it starts afresh with the whole buffer.
+    pub fn history_after(prev: Option<&Texture>, serial: u64, size: (i32, i32), shm: bool, damage: Rect) -> Vec<(u64, Rect)> {
+        let full = [0, 0, size.0, size.1];
+        match prev.filter(|p| (p.width, p.height) == size && p.dmabuf.is_none() == shm) {
+            Some(p) => {
+                let skip = (p.history.len() + 1).saturating_sub(HISTORY);
+                let mut h: Vec<_> = p.history[skip..].to_vec();
+                h.push((serial, rect_clamp(damage, size.0, size.1)));
+                h
+            }
+            None => vec![(serial, full)],
+        }
+    }
 }
 
 static TEXTURE_SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -152,23 +209,32 @@ fn install_sigbus_handler() {
 }
 
 impl BufferInfo {
-    /// Copies the buffer out of client memory. Returns None if the client's
-    /// memory went away underneath us (the client is then misbehaving).
-    pub fn read(&self) -> Option<Texture> {
+    pub fn opaque(&self) -> bool {
+        matches!(self.format, wl_shm::Format::Xrgb8888)
+    }
+
+    /// Copies the buffer out of client memory: only `damage` into `prev`
+    /// (the surface's previous pixels, same size and format), else all of
+    /// it. Returns None if the client's memory went away underneath us (the
+    /// client is then misbehaving).
+    pub fn read(&self, prev: Option<Vec<u32>>, damage: Rect) -> Option<Texture> {
         let pool = self.pool.borrow();
         let (w, h) = (self.width as usize, self.height as usize);
         let end = self.offset.checked_add(self.stride.checked_mul(h)?)?;
         if end > pool.size {
             return None;
         }
-        let opaque = matches!(self.format, wl_shm::Format::Xrgb8888);
-        let mut data = vec![0u32; w * h];
+        let opaque = self.opaque();
+        let (mut data, [x0, y0, x1, y1]) = match prev.filter(|p| p.len() == w * h) {
+            Some(p) => (p, rect_clamp(damage, self.width, self.height).map(|v| v as usize)),
+            None => (vec![0u32; w * h], [0, 0, w, h]),
+        };
         GUARD_START.store(pool.ptr as usize, Ordering::SeqCst);
         GUARD_LEN.store(pool.size, Ordering::SeqCst);
         FAULTED.store(false, Ordering::SeqCst);
-        for y in 0..h {
-            let row = unsafe { pool.ptr.add(self.offset + y * self.stride) as *const u32 };
-            let out = &mut data[y * w..(y + 1) * w];
+        for y in y0..y1.max(y0) {
+            let row = unsafe { pool.ptr.add(self.offset + y * self.stride + x0 * 4) as *const u32 };
+            let out = &mut data[y * w + x0..y * w + x1.max(x0)];
             for (x, px) in out.iter_mut().enumerate() {
                 // wl_shm ARGB8888 is 0xAARRGGBB in a little-endian u32; the
                 // Android buffer wants bytes R,G,B,A, i.e. 0xAABBGGRR.
@@ -182,7 +248,16 @@ impl BufferInfo {
         if FAULTED.swap(false, Ordering::SeqCst) {
             return None;
         }
-        Some(Texture { width: self.width, height: self.height, data, opaque, dmabuf: None, sync: None, serial: next_texture_serial() })
+        Some(Texture {
+            width: self.width,
+            height: self.height,
+            data,
+            opaque,
+            dmabuf: None,
+            sync: None,
+            serial: next_texture_serial(),
+            history: Vec::new(),
+        })
     }
 }
 

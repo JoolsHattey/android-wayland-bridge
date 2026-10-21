@@ -9,7 +9,7 @@ use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1;
 use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
-use crate::shm::{Texture, next_texture_serial};
+use crate::shm::{Rect, Texture, next_texture_serial, rect_empty, rect_union};
 use crate::syncobj::{CommitSync, Point, Release};
 use crate::state::{Buffer, State, guard};
 
@@ -48,6 +48,9 @@ pub struct SurfState {
     /// Explicit sync points for the attached buffer.
     pub acquire: Option<Point>,
     pub release: Option<Point>,
+    /// Damage in buffer px, and in surface px (mapped at commit).
+    pub damage: Rect,
+    pub surface_damage: Rect,
 }
 
 impl SurfState {
@@ -79,7 +82,37 @@ impl SurfState {
             self.vp_dst = newer.vp_dst;
         }
         self.frame_cbs.extend(newer.frame_cbs);
+        self.damage = rect_union(self.damage, newer.damage);
+        self.surface_damage = rect_union(self.surface_damage, newer.surface_damage);
     }
+}
+
+/// x, y, w, h as a rect, saturating (clients damage "everything" with
+/// INT32_MAX sizes).
+fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
+    [x, y, x.saturating_add(w.max(0)), y.saturating_add(h.max(0))]
+}
+
+/// A commit's damage in buffer px: its buffer damage plus its surface
+/// damage mapped through the scale and viewport, rounded outwards. A commit
+/// that attaches a buffer without damaging it counts as all damaged.
+fn commit_damage(state: &SurfState, (bw, bh): (i32, i32), scale: i32, vp_src: Option<[f64; 4]>, vp_dst: Option<(i32, i32)>) -> Rect {
+    let r = state.surface_damage;
+    let mapped = if rect_empty(r) {
+        [0; 4]
+    } else {
+        let s = scale.max(1) as f64;
+        // Surface px to source px (surface units of the buffer): origin and factors.
+        let src = vp_src.unwrap_or([0.0, 0.0, bw as f64 / s, bh as f64 / s]);
+        let (dw, dh) = vp_dst.map_or((src[2], src[3]), |(w, h)| (w as f64, h as f64));
+        let (fx, fy) = (src[2] / dw.max(1.0), src[3] / dh.max(1.0));
+        let x = |v: i32| (src[0] + v as f64 * fx) * s;
+        let y = |v: i32| (src[1] + v as f64 * fy) * s;
+        let (lo, hi) = (|v: f64| (v.floor() as i32).saturating_sub(1), |v: f64| (v.ceil() as i32).saturating_add(1));
+        [lo(x(r[0])), lo(y(r[1])), hi(x(r[2])), hi(y(r[3]))]
+    };
+    let damage = rect_union(state.damage, mapped);
+    if rect_empty(damage) { [0, 0, bw, bh] } else { damage }
 }
 
 pub struct SubInfo {
@@ -277,6 +310,12 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
                                 s.pending.scale = Some(scale);
                             }
                         }
+                        wl_surface::Request::Damage { x, y, width, height } => {
+                            s.pending.surface_damage = rect_union(s.pending.surface_damage, rect(x, y, width, height));
+                        }
+                        wl_surface::Request::DamageBuffer { x, y, width, height } => {
+                            s.pending.damage = rect_union(s.pending.damage, rect(x, y, width, height));
+                        }
                         wl_surface::Request::SetInputRegion { region } => {
                             let ops = region.and_then(|r| st.regions.get(&r.id()).cloned());
                             s.pending.input = Some(ops);
@@ -371,10 +410,27 @@ fn apply(st: &mut State, sid: &ObjectId, mut state: SurfState) {
     if let Some(buffer) = &state.buffer {
         new_texture = Some(match buffer {
             Some(b) => {
-                let (tex, copied) = match st.buffers.get(&b.id()) {
-                    Some(Buffer::Shm(info)) => (info.read(), true),
-                    Some(Buffer::Dmabuf(d)) => (
-                        Some(Texture {
+                let Some(s) = st.surfaces.get_mut(sid) else { return };
+                let scale = state.scale.unwrap_or(s.buffer_scale);
+                let (vp_src, vp_dst) = (state.vp_src.unwrap_or(s.vp_src), state.vp_dst.unwrap_or(s.vp_dst));
+                let (mut tex, copied) = match st.buffers.get(&b.id()) {
+                    Some(Buffer::Shm(info)) => {
+                        let size = (info.width, info.height);
+                        let mut damage = commit_damage(&state, size, scale, vp_src, vp_dst);
+                        // Only the damage is copied, over the previous pixels.
+                        let prev = s
+                            .texture
+                            .as_mut()
+                            .filter(|t| t.dmabuf.is_none() && (t.width, t.height) == size && t.opaque == info.opaque())
+                            .map(|t| std::mem::take(&mut t.data));
+                        if prev.is_none() {
+                            damage = [0, 0, size.0, size.1];
+                        }
+                        (info.read(prev, damage).map(|t| (t, damage)), true)
+                    }
+                    Some(Buffer::Dmabuf(d)) => {
+                        let damage = commit_damage(&state, (d.width, d.height), scale, vp_src, vp_dst);
+                        let t = Texture {
                             width: d.width,
                             height: d.height,
                             data: Vec::new(),
@@ -382,11 +438,17 @@ fn apply(st: &mut State, sid: &ObjectId, mut state: SurfState) {
                             dmabuf: Some((b.clone(), d.clone())),
                             sync,
                             serial: next_texture_serial(),
-                        }),
-                        false,
-                    ),
+                            history: Vec::new(),
+                        };
+                        (Some((t, damage)), false)
+                    }
                     None => (None, false),
                 };
+                if let Some((t, damage)) = &mut tex {
+                    let prev = st.surfaces.get(sid).and_then(|s| s.texture.as_ref());
+                    t.history = Texture::history_after(prev, t.serial, (t.width, t.height), t.dmabuf.is_none(), *damage);
+                }
+                let tex = tex.map(|(t, _)| t);
                 if tex.is_none() {
                     log::warn!("client buffer unreadable; disconnecting client");
                     if let Ok(client) = st.dh.get_client(b.id()) {

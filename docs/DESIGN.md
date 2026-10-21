@@ -102,6 +102,12 @@ disconnect itself.
   compositor-owned texture (swizzled ARGB to RGBA) and released immediately.
   Client memory is never touched after the commit. That's the opposite of
   the failure mode in Google's bridge, where release bookkeeping crashed.
+* **Damage.** Each commit's damage (`damage_buffer`, and `damage` mapped
+  through the scale and viewport, rounded outwards) is kept as one bounding
+  rect. Only that part is copied, over the surface's previous pixels. A
+  commit that attaches a buffer without damage counts as all damaged, as
+  does a new size or format. Textures remember the damage of their last 8
+  commits, so the GPU path can catch up from any of them.
 * Shrinking a pool under the compositor (SIGBUS) is caught the way
   libwayland does it: a SIGBUS handler, chained to ART's, maps zero pages
   over the pool and the client is disconnected.
@@ -182,9 +188,17 @@ through its `/dev` bind mount.
   has completed. Images, staging buffers and readbacks are destroyed the
   same way. While frames are in flight, the event loop polls with a 2 ms
   timeout to collect them.
+* **Shm uploads.** Each shm surface has a staging buffer that mirrors its
+  texture. A commit copies only its damage since the staged commit into the
+  staging buffer, and the next frame uploads only the part not yet in the
+  image.
 * **Header analysis.** After the render pass, the caption band is copied to
   a host buffer. When the frame completes, the same code as on the CPU path
-  derives the control colour and gesture exclusion from it.
+  derives the control colour and gesture exclusion from it. A frame skips
+  the readback when its band can't look different from the last one read:
+  the same window size and caption, the same surfaces at the same places
+  over the band, and none of their damage since then reaching the band's
+  rows. Direct mode skips its readback the same way.
 * **Fallback.** Without a usable Vulkan device, or with `renderer=cpu` in
   `files/awb.properties`, the CPU compositor runs and no dmabuf global is
   offered. Mesa then falls back to llvmpipe and GTK to cairo.
@@ -697,11 +711,13 @@ es2gears_wayland.
   fullscreen (`desktop-first-but-fullscreen-cross-app-launch`). Avoid
   showing `MainActivity` while windows open; starting the service with
   `am start-foreground-service` sidesteps it.
-* **Copies.** `wl_shm` clients pay two CPU copies per commit (client to
-  texture, texture to staging). Composited windows are one GPU blit per
-  frame.
-* **Readback.** The caption band (about 0.4 MB) is read back every frame
-  for the header analysis, in direct mode too.
+* **Copies.** `wl_shm` clients still pay two CPU copies (client to texture,
+  texture to staging), but only of their damage. Composited windows are one
+  GPU blit per frame.
+* **Readback.** The caption band (about 0.4 MB) is read back only when it
+  may have changed. A client that redraws its header every frame (an
+  animated header, or one that damages its whole buffer) still costs one
+  readback per frame.
 * **Direct mode** depends on minigbm's private handle layout and the
   GraphicBuffer wire format. A gralloc update could change either; the
   mapper then rejects the buffer (logged) and the window stays composited.

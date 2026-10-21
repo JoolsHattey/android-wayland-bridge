@@ -24,7 +24,7 @@ use crate::android::ANativeWindow;
 use crate::direct::{AHardwareBuffer, Layer};
 use crate::output::to_px;
 use crate::render::Band;
-use crate::shm::Texture;
+use crate::shm::{Rect, Texture, rect_clamp, rect_empty, rect_union};
 use crate::state::{SYNC_TIMEOUT, State};
 use crate::Shared;
 use crate::syncobj::Release;
@@ -749,9 +749,10 @@ pub struct Target {
     pipeline: vk::Pipeline,
     readable: bool,
     readback: Option<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)>,
-    /// Caption rows copied by the last frame: first row, rows, width, and
-    /// whether they are BGRA.
+    /// Caption rows copied by the last frame that read them back: first
+    /// row, rows, width, and whether they are BGRA; and that frame.
     band: (i32, i32, i32, bool),
+    band_serial: u64,
     last_serial: u64,
     /// The swapchain must be recreated before the next frame.
     stale: bool,
@@ -823,6 +824,7 @@ impl Target {
                 readable: false,
                 readback: None,
                 band: (0, 0, 0, false),
+                band_serial: 0,
                 last_serial: 0,
                 stale: true,
                 presented: 0,
@@ -941,7 +943,7 @@ impl Target {
     fn band_pixels(&self, serial: u64) -> Option<(Vec<u32>, i32, i32, i32)> {
         let (y0, rows, width, bgra) = self.band;
         let (_, _, ptr, _) = self.readback?;
-        if self.last_serial != serial || rows <= 0 || width <= 0 {
+        if self.band_serial != serial || rows <= 0 || width <= 0 {
             return None;
         }
         let n = (rows * width) as usize;
@@ -954,7 +956,8 @@ impl Target {
         Some((px, width, y0, rows))
     }
 
-    /// Draws one frame: uploads, the quads, then the caption readback.
+    /// Draws one frame: uploads, the quads, then the caption readback
+    /// (none if `band` has no rows).
     /// Returns false if nothing was drawn: no image is free yet (the
     /// display still holds them) or the swapchain is out of date.
     fn frame(&mut self, draws: &[Draw], band: (i32, i32), serial: u64) -> Result<bool, String> {
@@ -1004,19 +1007,24 @@ impl Target {
 
             // Uploads of changed shm textures.
             for draw in draws {
-                if let Source::Shm { image, staging, width, height, upload: true, .. } = draw.source {
+                if let Source::Shm { image, staging, width, upload: Some(r), fresh, .. } = draw.source {
+                    // Only the changed part; the rest of the image is kept.
+                    let old = if fresh { vk::ImageLayout::UNDEFINED } else { vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
                     barrier(
                         d,
                         cmd,
                         image,
-                        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                        (old, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
                         (vk::PipelineStageFlags::FRAGMENT_SHADER, vk::PipelineStageFlags::TRANSFER),
                         (vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
                         None,
                     );
                     let region = vk::BufferImageCopy::default()
+                        .buffer_offset((r[1] as u64 * width as u64 + r[0] as u64) * 4)
+                        .buffer_row_length(width as u32)
                         .image_subresource(LAYER)
-                        .image_extent(vk::Extent3D { width: width as u32, height: height as u32, depth: 1 });
+                        .image_offset(vk::Offset3D { x: r[0], y: r[1], z: 0 })
+                        .image_extent(vk::Extent3D { width: (r[2] - r[0]) as u32, height: (r[3] - r[1]) as u32, depth: 1 });
                     d.cmd_copy_buffer_to_image(cmd, staging, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
                     barrier(
                         d,
@@ -1150,7 +1158,10 @@ impl Target {
                 .push_next(&mut tl);
             err("submit", d.queue_submit(gpu.queue, &[submit], vk::Fence::null()))?;
             self.last_serial = serial;
-            self.band = if read { (y0, rows, ew, self.format == vk::Format::B8G8R8A8_UNORM) } else { (0, 0, 0, false) };
+            if read {
+                self.band = (y0, rows, ew, self.format == vk::Format::B8G8R8A8_UNORM);
+                self.band_serial = serial;
+            }
 
             let present_waits = [self.rendered[idx]];
             let swapchains = [self.swapchain];
@@ -1254,6 +1265,7 @@ impl Target {
         }
         self.last_serial = serial;
         self.band = (y0, rows, width, d.bgra);
+        self.band_serial = serial;
         Ok(true)
     }
 }
@@ -1308,7 +1320,9 @@ unsafe fn barrier(
 #[derive(Clone, Copy)]
 enum Source {
     Dmabuf { image: vk::Image, view: vk::ImageView },
-    Shm { image: vk::Image, view: vk::ImageView, staging: vk::Buffer, width: i32, height: i32, upload: bool },
+    /// `upload`: the part of `staging` (a whole texture, `width` px wide)
+    /// to copy into the image first; `fresh`: the image has no contents yet.
+    Shm { image: vk::Image, view: vk::ImageView, staging: vk::Buffer, width: i32, upload: Option<Rect>, fresh: bool },
 }
 
 impl Source {
@@ -1326,6 +1340,15 @@ struct Draw {
     uv: [f32; 4],
 }
 
+/// What a window's caption band was drawn from. A frame that draws it from
+/// the same looks the same there, so it needs no new readback.
+struct BandKey {
+    size: (i32, i32),
+    caption: crate::Caption,
+    /// Per surface drawn over the band: surface, destination, uv, commit.
+    draws: Vec<(ObjectId, [i32; 4], [f32; 4], u64)>,
+}
+
 /// A wl_shm texture on the GPU, per surface.
 struct ShmTex {
     image: vk::Image,
@@ -1335,9 +1358,12 @@ struct ShmTex {
     staging_mem: vk::DeviceMemory,
     ptr: *mut u8,
     size: (i32, i32),
-    /// Texture serial in the staging buffer, and in the image.
+    /// Texture serial in the staging buffer, which mirrors the texture.
     staged: u64,
-    uploaded: u64,
+    /// The part of the staging buffer not yet copied to the image.
+    dirty: Option<Rect>,
+    /// The image has been written (else its contents are undefined).
+    written: bool,
     last_use: u64,
 }
 
@@ -1348,6 +1374,8 @@ pub struct Renderer {
     serial: u64,
     /// Submitted frames whose caption readback is still to be read.
     frames: Vec<(u64, u32)>,
+    /// Per window, what its caption band was last read back from.
+    bands: HashMap<u32, BandKey>,
     /// Client buffers and release points to give back once the GPU and
     /// SurfaceFlinger are done with them (a `Release` signals when dropped).
     releases: Vec<(Rc<Dmabuf>, Option<WlBuffer>, Option<Release>)>,
@@ -1400,6 +1428,7 @@ impl Renderer {
             shm: HashMap::new(),
             serial,
             frames: Vec::new(),
+            bands: HashMap::new(),
             releases: Vec::new(),
             deferred: false,
             direct_enabled,
@@ -1425,6 +1454,7 @@ impl Renderer {
 
     /// A window is gone; its layer went with its Target.
     pub fn forget_window(&mut self, win: u32) {
+        self.bands.remove(&win);
         if let Some(mut d) = self.direct.remove(&win) {
             d.reset();
         }
@@ -1484,14 +1514,24 @@ impl Renderer {
         }
         let s = self.shm.get_mut(sid).unwrap();
         if s.staged != t.serial {
-            // The staging buffer may still feed the previous upload.
-            self.gpu.wait(s.last_use);
-            unsafe { std::ptr::copy_nonoverlapping(t.data.as_ptr() as *const u8, s.ptr, (w * h * 4) as usize) };
+            // What changed since the staged commit, or all of it.
+            let r = Some(s.staged).filter(|&v| v != 0).and_then(|v| t.damage_since(v)).unwrap_or([0, 0, w, h]);
+            let r = rect_clamp(r, w, h);
+            if !rect_empty(r) {
+                // The staging buffer may still feed the previous upload.
+                self.gpu.wait(s.last_use);
+                let (x0, x1) = (r[0] as usize, r[2] as usize);
+                for y in r[1] as usize..r[3] as usize {
+                    let row = y * w as usize;
+                    let src = &t.data[row + x0..row + x1];
+                    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), (s.ptr as *mut u32).add(row + x0), x1 - x0) };
+                }
+                s.dirty = Some(s.dirty.map_or(r, |d| rect_union(d, r)));
+            }
             s.staged = t.serial;
         }
         // Counts as uploaded once a frame recording the copy is submitted.
-        let upload = s.uploaded != t.serial;
-        Ok(Source::Shm { image: s.image, view: s.view, staging: s.staging, width: w, height: h, upload })
+        Ok(Source::Shm { image: s.image, view: s.view, staging: s.staging, width: w, upload: s.dirty, fresh: !s.written })
     }
 
     fn create_shm(&self, w: i32, h: i32) -> Result<ShmTex, String> {
@@ -1538,7 +1578,7 @@ impl Renderer {
                     return Err(e);
                 }
             };
-            Ok(ShmTex { image, memory, view, staging, staging_mem, ptr, size: (w, h), staged: 0, uploaded: 0, last_use: 0 })
+            Ok(ShmTex { image, memory, view, staging, staging_mem, ptr, size: (w, h), staged: 0, dirty: None, written: false, last_use: 0 })
         }
     }
 
@@ -1566,13 +1606,16 @@ impl Renderer {
         });
         let (finished, pending): (Vec<_>, Vec<_>) = self.frames.drain(..).partition(|(s, _)| *s <= done);
         self.frames = pending;
-        for (serial, win) in finished {
+        for &(serial, win) in &finished {
             let slot = st.shared.slots.lock().ok().and_then(|s| s.get(&win).cloned());
             let Some(slot) = slot else { continue };
             let band = slot.with_target(|_, t| t.as_ref().and_then(|t| t.band_pixels(serial))).flatten();
             if let Some((rows, width, y0, n)) = band {
                 let band = Band { rows: &rows, width, stride: width as usize, y0, y1: y0 + n };
                 crate::render::caption_feedback(st, win, &band);
+            } else if !self.frames.iter().chain(&finished).any(|&(s, w)| w == win && s > serial) {
+                // The window's latest readback is lost: read the next frame.
+                self.bands.remove(&win);
             }
         }
     }
@@ -1631,6 +1674,7 @@ impl Renderer {
         let (pw, ph) = w.px;
         let top = w.caption.top;
         let band = (w.caption.top, w.caption.height);
+        let mut key = BandKey { size: (pw, ph), caption: w.caption.clone(), draws: Vec::new() };
         let mut draws = Vec::new();
         for (sid, ox, oy) in &list {
             let Some(s) = st.surfaces.get(sid) else { continue };
@@ -1658,13 +1702,18 @@ impl Renderer {
                     }
                 },
             };
+            if y < band.0 + band.1 && y1 > band.0 {
+                key.draws.push((sid.clone(), [x, y, x1, y1], uv, t.serial));
+            }
             draws.push(Draw { source, dst: [x, y, x1, y1], uv });
         }
+        // Only a band that may look different is read back and analysed.
+        let read = self.band_changed(st, id, &key);
 
         let generation = slot.with_target(|_, t| t.as_ref().map(|t| t.generation)).flatten();
         self.sync_layer(id, generation);
         if let Some((d, at)) = self.direct_candidate(st, &list, &draws, (pw, ph), top) {
-            return self.render_direct(st, id, &slot, &list, d, at, (pw, ph), top, band);
+            return self.render_direct(st, id, &slot, &list, d, at, (pw, ph), top, band, (read, key));
         }
         // Composited frames go through the swapchain, outside Android's sync.
         answer_sync(st, id, None, "not direct");
@@ -1680,7 +1729,7 @@ impl Renderer {
             if t.stale || t.extent != (pw, ph) {
                 t.configure(pw, ph)?;
             }
-            Ok((t.frame(&draws, band, serial)?, t.generation))
+            Ok((t.frame(&draws, if read { band } else { (0, 0) }, serial)?, t.generation))
         });
         let generation = match result {
             Some(Ok((true, g))) => g,
@@ -1695,7 +1744,10 @@ impl Renderer {
             None => return,
         };
         self.serial = serial;
-        self.frames.push((serial, id));
+        if read {
+            self.frames.push((serial, id));
+        }
+        self.bands.insert(id, key);
         // Composited again: take the client's buffer off the direct layer.
         self.sync_layer(id, Some(generation));
         if let Some(state) = self.direct.get_mut(&id).filter(|s| s.shown.is_some()) {
@@ -1717,7 +1769,9 @@ impl Renderer {
         let now = st.now_ms();
         for (sid, _, _) in &list {
             if let Some(t) = self.shm.get_mut(sid) {
-                t.uploaded = t.staged;
+                if t.dirty.take().is_some() {
+                    t.written = true;
+                }
                 t.last_use = serial;
             }
             if let Some(s) = st.surfaces.get_mut(sid) {
@@ -1736,6 +1790,39 @@ impl Renderer {
 }
 
 impl Renderer {
+    /// Whether a frame drawn from `key` may show a different caption band
+    /// than the last one read back: anything moved, or a surface's damage
+    /// since then reaches the band.
+    fn band_changed(&self, st: &State, win: u32, key: &BandKey) -> bool {
+        let Some(old) = self.bands.get(&win) else { return true };
+        if old.size != key.size || old.caption != key.caption || old.draws.len() != key.draws.len() {
+            return true;
+        }
+        let (b0, b1) = (key.caption.top as f64, (key.caption.top + key.caption.height) as f64);
+        old.draws.iter().zip(&key.draws).any(|(o, n)| {
+            if o.0 != n.0 || o.1 != n.1 || o.2 != n.2 {
+                return true;
+            }
+            if o.3 == n.3 {
+                return false;
+            }
+            let Some(t) = st.surfaces.get(&n.0).and_then(|s| s.texture.as_ref()) else { return true };
+            let Some(r) = t.damage_since(o.3) else { return true };
+            if rect_empty(r) {
+                return false;
+            }
+            // The damaged rows in window px (uv may run upwards).
+            let ([_, y0, _, y1], v0, v1) = (n.1, n.2[1] as f64, n.2[3] as f64);
+            if v0 == v1 || t.height <= 0 {
+                return true;
+            }
+            let at = |row: i32| y0 as f64 + (row as f64 / t.height as f64 - v0) / (v1 - v0) * (y1 - y0) as f64;
+            let (a, b) = (at(r[1]), at(r[3]));
+            // A pixel's neighbours bleed into it when scaled.
+            a.min(b) - 1.0 < b1 && a.max(b) + 1.0 > b0
+        })
+    }
+
     /// Resets a window's direct-mode state if its Target (and so its
     /// layer) is not the one the state describes.
     fn sync_layer(&mut self, id: u32, generation: Option<u64>) {
@@ -1785,6 +1872,7 @@ impl Renderer {
         (pw, ph): (i32, i32),
         top: i32,
         band: (i32, i32),
+        (want_read, key): (bool, BandKey),
     ) {
         if let Some(state) = self.direct.get_mut(&id).filter(|s| s.in_flight.is_some()) {
             if state.in_flight_since.is_some_and(|t| t.elapsed() > DIRECT_WATCHDOG) {
@@ -1814,10 +1902,11 @@ impl Renderer {
                 let layer = t.layer(win).ok_or("cannot create the direct layer")?;
                 layer.present(Some((ahb, src, d.opaque)), placeholder, dst, &shared, id, token);
             }
-            let read = t.read_direct(&d, (at[0], at[1]), pw, band, serial).unwrap_or_else(|e| {
-                log::warn!("gpu: caption readback: {e}");
-                false
-            });
+            let read = want_read
+                && t.read_direct(&d, (at[0], at[1]), pw, band, serial).unwrap_or_else(|e| {
+                    log::warn!("gpu: caption readback: {e}");
+                    false
+                });
             Ok((t.generation, read))
         });
         let (generation, read) = match result {
@@ -1856,6 +1945,9 @@ impl Renderer {
             self.serial = serial;
             self.frames.push((serial, id));
             d.last_use.set(serial);
+        }
+        if read || !want_read {
+            self.bands.insert(id, key);
         }
         let now = st.now_ms();
         for (sid, _, _) in list {

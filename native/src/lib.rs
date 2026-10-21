@@ -118,7 +118,7 @@ pub struct DisplayInfo {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Caption {
     /// Rows at the top that belong to the system (status bar when maximised).
     pub top: i32,
