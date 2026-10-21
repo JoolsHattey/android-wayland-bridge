@@ -794,6 +794,79 @@ hardware keyboard is attached.
   It comes before `/usr/bin` in the PATH, so the desktop file's `Exec` uses
   it.
 
+## Stub apps
+
+A Linux app gets its own launcher icon, taskbar entry and recents group
+through a stub app, `dev.awb.app.<desktop id>`: its manifest declares a
+launcher `LaunchActivity`, the `ToplevelActivity` that the compositor
+starts per window (found by the `dev.awb.action.TOPLEVEL` action and the
+`dev.awb.app_id` meta-data), and the app's URL schemes. Name and icon come
+from the chroot's desktop file. Windows of apps without a stub open in
+dev.awb itself.
+
+**Stubs carry no window code.** Until format 2, each stub compiled
+`window/` in, so every change to it (or to the AIDL) left the stubs on the
+old code until each was rebuilt with `install-stub.sh`. Now a stub is a
+manifest, resources and one Java class, `StubComponentFactory`
+(`android:appComponentFactory`, about 40 KB per APK). When Android
+instantiates one of the stub's `dev.awb.window.*` activities, the factory
+loads that class from dev.awb's installed APK, through
+`createPackageContext("dev.awb", CONTEXT_INCLUDE_CODE |
+CONTEXT_IGNORE_SECURITY)`. So:
+
+* Updating dev.awb updates the window side of every stub, with nothing to
+  rebuild. Stub and compositor always run the same `window/` code, so the
+  binder interfaces no longer need to stay compatible with older stubs.
+* `createPackageContext` registers dev.awb as a package the stub's process
+  depends on (as with WebView), and Android kills dependent processes when
+  that package is replaced: no stub keeps old window code in memory.
+* It is public API, and the code it loads is an installed, read-only APK,
+  so Android 14's rule against loading writable dex does not apply. Both
+  apps share the signing key anyway (the `dev.awb.permission.WINDOWS`
+  signature permission), so the stub trusts only code that its own key
+  could have produced. Checked on Android 17 (SDK 37).
+* The activity's context, theme and resources are the stub's, the code is
+  dev.awb's. So `window/` must not use its own resources (`R`); the stub
+  has copies of the two styles its manifest names.
+* If dev.awb is missing, or lacks the class, the factory makes a
+  `MissingHostActivity` that says so and finishes.
+* Written in Java, with Kotlin's stdlib excluded: nothing else to carry.
+
+**Format.** What still lives in a stub is its manifest: activity
+attributes (`configChanges`, `documentLaunchMode`, themes), intent filters
+and permissions. A change there bumps `stubFormat` in
+`stub/build.gradle.kts` and `Window.STUB_FORMAT`. The stub's versionCode is
+its format, also kept in the application meta-data `dev.awb.stub_format`;
+its versionName is `<format>-<stamp>`, the stamp being a hash of the desktop
+file and the icon it was built from. dev.awb's status page flags outdated
+stubs.
+
+**Compatibility.** A format-1 stub (built before this) still runs its own
+copy of `window/`. That keeps working as long as the AIDL only grows by
+appending methods, but it lacks whatever came later; `sync-stubs.sh`
+replaces it the next time it runs (the first deploy migrated the test
+device's three). A format-2 stub with an older dev.awb runs that dev.awb's
+window code, which has always lived in `dev.awb.window`. From format 2 on,
+a stub of an older format than dev.awb's runs today's code under its older
+manifest; a format bump is for changes where that would break.
+
+**Keeping them in line** is automatic where it can be:
+
+* `scripts/awb-stubs.sh` (on the device, as root) is the one place that
+  maps desktop files to stub packages: `info` (name, icon, schemes, stamp),
+  `list` (installed stubs, their versions and desktop ids) and `prune`.
+* `scripts/sync-stubs.sh` (host, run by `deploy.sh`) removes stubs whose
+  desktop file is gone, rebuilds those of an older format or a changed
+  desktop file or icon (an app update), and builds stubs for the apps that
+  opened windows without one: dev.awb notes their app ids in
+  `files/stub-requests` when it maps such a window. Only apps with a
+  desktop file get one, so helpers and portals don't.
+* `awb-launcher.sh` (root, always running) prunes every two minutes, so
+  `apt remove` takes the icon away without the host.
+* Building still needs the host (aapt2, d8, the signing key).
+  SVG icons become vector drawables with Android Studio's converter
+  (`Svg2Vector`, on AGP's classpath), so no SVG renderer is needed.
+
 ## Robustness
 
 * Every request handler runs in `guard()` (`catch_unwind`). A panic logs and
