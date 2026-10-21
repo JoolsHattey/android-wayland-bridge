@@ -60,6 +60,11 @@ BUS=unix:path=/run/awb/bus
         rm -f /run/awb/bus
         dbus-daemon --config-file=/etc/dbus-1/awb-session.conf --fork --nopidfile --nosyslog >/dev/null
     fi
+    # Apps the bus starts (DBusActivatable desktop files, such as GNOME
+    # Console) get its environment, which /data/debian/enter pointed at the
+    # Terminal app'"'"'s compositor.
+    DBUS_SESSION_BUS_ADDRESS=$BUS dbus-update-activation-environment WAYLAND_DISPLAY=/run/awb/wayland-0 GDK_BACKEND=wayland \
+        DBUS_SESSION_BUS_ADDRESS=$BUS GTK_A11Y=none >/dev/null 2>&1
     for i in 1 2 3 4 5 6 7 8 9 10; do
         dbus-send --bus=$BUS --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.NameHasOwner \
             string:org.freedesktop.portal.Desktop 2>/dev/null | grep -q true && break
