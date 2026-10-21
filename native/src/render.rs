@@ -90,43 +90,49 @@ fn blit(frame: &mut Frame, t: &Texture, src: [f64; 4], dst: [i32; 4], opaque_cop
     }
 }
 
-/// Composited rows `y0..y1` of a window (RGBA, 0xAABBGGRR): the whole CPU
-/// frame, or the caption band the GPU path reads back.
+/// Composited rows `y0..y1` of a window: the whole CPU frame, or the caption
+/// band the GPU path reads back (analysed in place in the mapped buffer).
+/// Pixels are 0xAABBGGRR, or 0xAARRGGBB when `bgra`.
 pub struct Band<'a> {
     pub rows: &'a [u32],
     pub width: i32,
     pub stride: usize,
     pub y0: i32,
     pub y1: i32,
+    pub bgra: bool,
 }
 
 impl Band<'_> {
     #[inline]
-    fn at(&self, x: i32, y: i32) -> u32 {
-        self.rows[(y - self.y0) as usize * self.stride + x as usize]
+    fn row(&self, y: i32) -> &[u32] {
+        let start = (y - self.y0) as usize * self.stride;
+        &self.rows[start..start + self.width as usize]
     }
 }
 
-/// Mean luma of the caption strip under the system controls.
+/// Mean luma of the caption strip under the system controls: one row,
+/// every 4th pixel, so a few hundred reads at most.
 fn caption_is_light(band: &Band, c: &Caption) -> Option<bool> {
     if c.height <= 0 || band.y1 <= band.y0 {
         return None;
     }
-    let rects = &c.controls;
+    let row = band.row((c.top + c.height / 2).clamp(band.y0, band.y1 - 1));
+    // Red and blue trade places in BGRA; luma is all the swizzle was for.
+    let (rs, bs) = if band.bgra { (16, 0) } else { (0, 16) };
     let (mut sum, mut n) = (0u64, 0u64);
-    let y = (c.top + c.height / 2).clamp(band.y0, band.y1 - 1);
-    let spans: Vec<(i32, i32)> = if rects.is_empty() {
-        vec![(band.width * 3 / 4, band.width)]
-    } else {
-        rects.iter().map(|r| (r[0], r[0] + r[2])).collect()
-    };
-    for (a, b) in spans {
+    let mut add = |a: i32, b: i32| {
         for x in (a.max(0)..b.min(band.width)).step_by(4) {
-            let v = band.at(x, y);
-            let (r, g, b) = (v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff);
+            let v = row[x as usize];
+            let (r, g, b) = ((v >> rs) & 0xff, (v >> 8) & 0xff, (v >> bs) & 0xff);
             sum += (r * 299 + g * 587 + b * 114) as u64 / 1000;
             n += 1;
         }
+    };
+    if c.controls.is_empty() {
+        add(band.width * 3 / 4, band.width);
+    }
+    for r in &c.controls {
+        add(r[0], r[0] + r[2]);
     }
     (n > 0).then(|| sum / n > 140)
 }
@@ -134,27 +140,37 @@ fn caption_is_light(band: &Band, c: &Caption) -> Option<bool> {
 /// Splits the caption band into what the app must receive (anything drawn:
 /// icons, labels, entries, hovered buttons) and empty header the system may
 /// drag the window by. A column is empty if it is one uniform colour from
-/// top to bottom of the band. Returns exclusion rects in px.
+/// top to bottom of the band (every other row checked). Returns exclusion
+/// rects in px.
+///
+/// The band is scanned row by row against its first row, so memory is read
+/// once and in order (the readback may be uncached) and the comparison
+/// vectorises. Only equality is tested, so BGRA needs no swizzle. Columns
+/// under `caption.controls` are scanned too: a span running into a control
+/// keeps its exact edge.
 fn header_exclusion(band: &Band, c: &Caption) -> Vec<[i32; 4]> {
     const MARGIN: i32 = 6;
     let (y0, y1) = (c.top.max(band.y0), (c.top + c.height).min(band.y1));
     if y1 - y0 < 4 {
         return Vec::new();
     }
-    let busy = |x: i32| {
-        let first = band.at(x, y0);
-        (y0 + 1..y1).step_by(2).any(|y| band.at(x, y) != first)
-    };
+    let first = band.row(y0);
+    let mut busy = vec![false; first.len()];
+    for y in (y0 + 1..y1).step_by(2) {
+        for ((b, &p), &f) in busy.iter_mut().zip(band.row(y)).zip(first) {
+            *b |= p != f;
+        }
+    }
     let width = band.width;
     let mut spans: Vec<(i32, i32)> = Vec::new();
     let mut x = 0;
     while x < width {
-        if !busy(x) {
+        if !busy[x as usize] {
             x += 1;
             continue;
         }
         let start = x;
-        while x < width && busy(x) {
+        while x < width && busy[x as usize] {
             x += 1;
         }
         let (a, b) = ((start - MARGIN).max(0), (x + MARGIN).min(width));
@@ -167,21 +183,31 @@ fn header_exclusion(band: &Band, c: &Caption) -> Vec<[i32; 4]> {
     spans.into_iter().map(|(a, b)| [a, y0, b - a, y1 - y0]).collect()
 }
 
-/// Updates a window's control colour and gesture exclusion from its
-/// composited caption.
-pub fn caption_feedback(st: &mut State, id: u32, band: &Band) {
+/// What the header analysis found in a frame's caption band.
+pub struct CaptionInfo {
+    light: Option<bool>,
+    /// None unless the window derives its exclusion from the header.
+    exclusion: Option<Vec<[i32; 4]>>,
+}
+
+/// Analyses a window's composited caption. Touches no state, so it runs
+/// while the band's memory is locked or mapped; `caption_feedback` applies
+/// the result afterwards.
+pub fn caption_analysis(band: &Band, c: &Caption) -> CaptionInfo {
+    CaptionInfo { light: caption_is_light(band, c), exclusion: c.auto_exclusion.then(|| header_exclusion(band, c)) }
+}
+
+/// Updates a window's control colour and gesture exclusion from the
+/// analysis of its composited caption.
+pub fn caption_feedback(st: &mut State, id: u32, info: CaptionInfo) {
     let Some(w) = st.windows.get_mut(&id) else { return };
-    let light = caption_is_light(band, &w.caption);
-    if light.is_some() && light != w.caption_light {
-        w.caption_light = light;
-        st.host.caption_light(id, light.unwrap());
+    if let Some(light) = info.light.filter(|&l| Some(l) != w.caption_light) {
+        w.caption_light = Some(light);
+        st.host.caption_light(id, light);
     }
-    if w.caption.auto_exclusion {
-        let ex = header_exclusion(band, &w.caption);
-        if ex != w.exclusion {
-            w.exclusion = ex.clone();
-            st.host.exclusion(id, &ex);
-        }
+    if let Some(ex) = info.exclusion.filter(|ex| *ex != w.exclusion) {
+        w.exclusion = ex.clone();
+        st.host.exclusion(id, &ex);
     }
 }
 
@@ -211,10 +237,10 @@ fn render_window(st: &mut State, id: u32) {
     let Some(w) = st.windows.get(&id) else { return };
     let (pw, ph) = w.px;
     let top = w.caption.top;
-    let caption_rows = (top, top + w.caption.height);
-    // The caption rows, kept for the analysis after posting: pixels, width,
-    // stride, first row, end row.
-    let mut band = (Vec::new(), 0, 0, 0, 0);
+    let caption = &w.caption;
+    // The caption rows are analysed in the locked buffer, and the result
+    // applied after posting.
+    let mut info = None;
     let drawn = slot.draw(pw, ph, |frame| {
         let mut first = true;
         for (sid, ox, oy) in &list {
@@ -243,10 +269,10 @@ fn render_window(st: &mut State, id: u32) {
                 row.fill(BACKGROUND);
             }
         }
-        let (y0, y1) = (caption_rows.0.clamp(0, frame.height), caption_rows.1.clamp(0, frame.height));
+        let (y0, y1) = (top.clamp(0, frame.height), (top + caption.height).clamp(0, frame.height));
         let stride = frame.stride as usize;
-        let rows = frame.pixels[y0 as usize * stride..y1 as usize * stride].to_vec();
-        band = (rows, frame.width, stride, y0, y1);
+        let rows = &frame.pixels[y0 as usize * stride..y1 as usize * stride];
+        info = Some(caption_analysis(&Band { rows, width: frame.width, stride, y0, y1, bgra: false }, caption));
     });
     if !drawn {
         return;
@@ -261,6 +287,7 @@ fn render_window(st: &mut State, id: u32) {
     }
     let Some(w) = st.windows.get_mut(&id) else { return };
     w.dirty = false;
-    let (rows, width, stride, y0, y1) = band;
-    caption_feedback(st, id, &Band { rows: &rows, width, stride, y0, y1 });
+    if let Some(info) = info {
+        caption_feedback(st, id, info);
+    }
 }
