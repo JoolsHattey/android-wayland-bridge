@@ -94,6 +94,7 @@ pub enum Role {
     Xdg,
     Sub,
     Cursor,
+    DndIcon,
 }
 
 pub struct Surface {

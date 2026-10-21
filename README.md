@@ -31,7 +31,8 @@ To give a Linux app its own launcher icon, build and install its stub app
 ```
 
 The icon starts the app through `awb-launcher.sh` (the root side, started by
-`deploy.sh`). The app's windows then open as the stub's tasks, so the
+`deploy.sh`, which also runs the helper that moves windows when an app asks
+to, as on a title-label drag). The app's windows then open as the stub's tasks, so the
 taskbar and recents show them under that app.
 
 Links cross over both ways. Web links that a Linux app opens (`xdg-open`,
@@ -44,6 +45,11 @@ For GPU rendering in the apps, the chroot needs Mesa's drivers
 (`apt install mesa-vulkan-drivers libgl1-mesa-dri`). The compositor itself
 composites with Vulkan; `renderer=cpu` in the app's `files/awb.properties`
 switches back to the CPU compositor.
+
+Electron apps lay their title bar out around Electron's own buttons, not
+Android's. For Claude Desktop, `./scripts/patch-claude-desktop.sh` patches
+its `app.asar` to keep clear of Android's caption controls; rerun it after
+Claude Desktop updates.
 
 ## Layout
 

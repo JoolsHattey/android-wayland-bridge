@@ -32,8 +32,33 @@ interface IToplevelSession {
     /**
      * Caption geometry in px (see Native.caption): [rects] are the system's
      * rects in the band, flattened x, y, w, h; [width] is the window's.
+     * [maximized]: the window spans the display.
      */
-    oneway void caption(int win, int top, int height, in int[] rects, int width);
+    oneway void caption(int win, int top, int height, in int[] rects, int width, boolean maximized);
+
+    /** Android's clipboard text, read by the focused window (only it may read it). */
+    oneway void clipboard(String text);
+
+    /**
+     * An Android drag event on [win]'s view (DragEvent action, view px).
+     * [local]: the drag is a Linux app's own; [result]: an ENDED drag was
+     * dropped somewhere; [text]: a dropped foreign clip's text.
+     */
+    oneway void drag(int win, int action, float x, float y, boolean local, boolean result, in String[] mimes, @nullable String text);
+
+    /**
+     * An IME edit for [win]'s text field: [kind] 0 = commit [text], 1 =
+     * composing [text] with the cursor at [a], 2 = delete [a] units before
+     * the cursor and [b] after, 3 = the [a] units before the cursor become
+     * composing [text] again.
+     */
+    oneway void ime(int win, int kind, @nullable String text, int a, int b);
+
+    /** Whether tasks can be moved (the root helper is running, see awb-launcher.sh). */
+    boolean canMoveTasks();
+
+    /** Moves or resizes task [taskId] to these display px (through the root helper). */
+    oneway void moveTask(int taskId, int left, int top, int right, int bottom);
 
     /** The user closed the window. */
     oneway void close(int win);

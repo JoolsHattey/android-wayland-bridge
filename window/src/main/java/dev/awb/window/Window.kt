@@ -21,7 +21,19 @@ object Window {
     const val EXTRA_WIN = "win"
     const val EXTRA_TITLE = "title"
 
+    /** The window wants server-side decorations: an opaque caption. */
+    const val EXTRA_SSD = "ssd"
+
     const val TAG = "awb"
+
+    /** Clip label of text a Linux app copied, so windows don't hand it back. */
+    const val CLIP_LABEL = "Linux app"
+
+    /** Clip label of a Linux app's drag: its data stays with the compositor. */
+    const val DRAG_LABEL = "dev.awb.drag"
+
+    /** A Linux app's drag with no text for Android apps. */
+    const val DRAG_MIME = "application/x-dev.awb-drag"
 
     fun bindSession(context: Context, connection: ServiceConnection): Boolean =
         context.bindService(

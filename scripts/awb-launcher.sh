@@ -6,6 +6,8 @@
 #           scheme; each one runs via awb-run.sh and gtk-launch.
 #   open:   a link per line from the chroot's apps (awb-open, set up by
 #           awb-run.sh as their browser), opened by Android (Chrome).
+#   task:   window moves and resizes the apps asked for, carried out by
+#           dev.awb.TaskHelper from the app's APK (apps can't move tasks).
 APPDIR=/data/user/10/dev.awb/files
 FIFO=$APPDIR/launch
 OPEN=$APPDIR/open
@@ -24,7 +26,18 @@ echo $$ > /data/local/tmp/awb-launcher.pid
     done
 ) &
 OPENER=$!
-trap 'kill $OPENER; exit' TERM INT
+
+# Interactive moves (xdg_toplevel.move/resize). Restarted after it exits,
+# with the APK's current path (it changes on reinstall).
+(
+    while :; do
+        APK=$(pm path --user 10 dev.awb | sed -n 's/^package://p' | head -n 1)
+        [ -n "$APK" ] && CLASSPATH=$APK app_process /system/bin dev.awb.TaskHelper $APPDIR/task >/dev/null 2>&1
+        sleep 2
+    done
+) &
+MOVER=$!
+trap 'kill $OPENER $MOVER; pkill -f "dev.awb.[T]askHelper"; exit' TERM INT
 
 while :; do
     # The app creates the fifo; wait for it (first start, reinstall).

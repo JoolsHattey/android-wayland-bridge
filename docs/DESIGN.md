@@ -326,6 +326,12 @@ the Android side. It bind-mounts that directory into the chroot at
    header bars therefore leave exactly the right room at the outer edges, and
    only there. This works because those positions are covered by the
    system's input region anyway.
+   A window spanning the display's width is configured `maximized` (Android
+   has no public "is maximised" API). GTK then styles it as
+   `window.maximized`, and `gtk.css` carries a second set of rules under
+   that selector from the last maximised caption, so each window matches
+   its caption without a private protocol. GTK reads the file at start-up,
+   so a geometry first seen later applies from the next app start.
 5. **Control colour.** After each frame the compositor samples the header
    (on the GPU path, from the caption band it reads back)
    under the controls and toggles `APPEARANCE_LIGHT_CAPTION_BARS` (dark icons
@@ -372,17 +378,22 @@ change. Results on the device with Adwaita Demo:
   (1016,672).
 
 It needs no client co-operation, so it also covers Qt and Chromium tab
-strips. Limits: a press on a label or title that GTK would treat as a drag
-goes to the app and is lost (the `move` request is logged and ignored).
-Headers with gradients or images become fully excluded, i.e. click-only.
+strips. Headers with gradients or images become fully excluded, i.e.
+click-only.
 
-Fallbacks for `xdg_toplevel.move` if needed, both privileged:
-
-* (a) A root helper started by `awb-run.sh` that calls
-  `IActivityTaskManager.resizeTask` as the pointer moves. This is an emulated
-  drag with no system snapping.
-* (b) An AccessibilityService that dispatches a gesture into the
-  now-unexcluded caption.
+**Moves the app asks for** (`xdg_toplevel.move`, e.g. a drag on GTK's title
+label, which the exclusion gives to the app) and `resize` go through a root
+helper. `awb-launcher.sh` runs `dev.awb.TaskHelper` from the app's APK with
+`app_process`. It reads `taskId left top right bottom` lines from the
+`task` fifo and calls `IActivityTaskManager.resizeTask` (mode
+`RESIZE_MODE_USER`). The window's own view drives it: on the request it
+records the window bounds and the pressed pointer (display px). Each later
+move of that pointer becomes new bounds sent through the session, and the
+release still goes to the app. Bursts are coalesced to the latest line.
+This is an emulated drag: no system snapping. Without the helper the
+request is logged and ignored. Verified on the device: dragging GTK Demo's
+title label and GNOME Console's (in its stub) moves the window with the
+pointer.
 
 Settings for experiments, in `files/awb.properties`:
 `exclusion=auto|caption|none`.
@@ -424,6 +435,70 @@ takes that role (`native/src/portal.rs`):
   - GTK3/Qt aren't covered yet.
 * With a session bus, GApplication apps also behave as on a desktop: they
   can be single-instance and are activatable.
+
+## Clipboard and drag and drop
+
+* **Clipboard.** `wl_data_device` is kept in step with Android's clipboard
+  (`native/src/data.rs`).
+  - A client's selection that offers text is read at once (off the
+    compositor thread, 8 MiB cap) and put on Android's clipboard under the
+    label "Linux app".
+  - Only the focused app may read Android's clipboard, and stub windows run
+    as other packages. So each window's activity hands the text over itself
+    (`IToplevelSession.clipboard`), on focus and on clip changes. It does so
+    once per clip (by timestamp) and never for our own label, since each
+    read shows Android's "pasted" notice.
+  - Android text is offered to Linux apps as the usual text types. Other
+    types (images, files) stay on their side for now.
+  - Verified: text copied in GTK Demo shows as dev.awb's clip; a URL copied
+    in Chrome pastes into GTK Demo.
+* **Drag and drop** runs as an Android drag, so it crosses windows (each its
+  own Android window) and apps.
+  - `start_drag` (only while a button is held on that window) reads the
+    source's text, then the window starts `View.startDragAndDrop` with
+    `DRAG_FLAG_GLOBAL`. The clip carries the text for Android apps, and
+    the icon surface (shm only) becomes the shadow.
+  - Every `WaylandView` forwards its drag events. Over our windows they
+    become `wl_data_device` enter/motion/leave/drop with an offer of the
+    Wayland source (clip label `dev.awb.drag`). Over Android apps they
+    deliver the text.
+  - Text dragged in from other apps is offered to the window under it and
+    handed over on drop.
+  - The source gets `dnd_drop_performed`/`dnd_finished`, or `cancelled`;
+    the pointer belongs to the drag until Android ends it.
+  - Verified: text dragged from GTK Demo's search field into GNOME Console
+    (another stub app) is inserted there.
+
+## IME
+
+`zwp_text_input_v3` (`native/src/text_input.rs`) follows keyboard focus.
+The enabled text input's content type, surrounding text (as UTF-16 offsets)
+and cursor rectangle (window px) go to the window's view. There it makes
+the view a text editor with a `TextInputConnection` (`window/.../TextInput.kt`).
+The IME sees a virtual editor: the app's surrounding text with the composing
+text at the cursor. Its edits come back as one `done` each:
+
+* `commitText` and `finishComposingText` become `commit_string`.
+* `setComposingText` becomes `preedit_string`.
+* `deleteSurroundingText` becomes `delete_surrounding_text` (UTF-16 units to
+  bytes through the surrounding text).
+* `setComposingRegion` ending at the cursor deletes that text and resends it
+  as preedit.
+* Cursor moves become arrow keys.
+* Editor actions become Enter.
+
+Content purposes map to input types (password, number, URL, terminal
+without suggestions, and so on), and the cursor rectangle is reported as
+`CursorAnchorInfo` for floating candidate windows.
+
+The window uses `SOFT_INPUT_ADJUST_NOTHING`. Apps place their own text
+fields, and the relayout Android does for the IME otherwise stalls a
+direct-mode window (frames stop, then it shows black).
+
+Verified with GTK Demo: Android serves the field (`TextInputConnection`, text
+input type, Done action) and keeps a direct-mode window updating. IME
+commits are untested from adb: Gboard shows no soft keyboard while a
+hardware keyboard is attached.
 
 ## Links
 
@@ -489,7 +564,10 @@ Working on the device:
   on top.
 * Light/dark control colour.
 * Pixel-derived exclusion: click in the header, drag the window from empty
-  header space.
+  header space; the app's own moves through the root helper.
+* Clipboard (text) both ways, drag and drop across windows and apps, and
+  the IME through `zwp_text_input_v3`.
+* Per-window caption geometry for GTK (maximised windows).
 
 Tested with adwaita-1-demo, gtk4-demo, foot, weston-simple-shm, vkcube and
 es2gears_wayland.
@@ -503,17 +581,46 @@ es2gears_wayland.
     arrangement (which isn't public).
   - `gtk.css` sizes are per scale, so they are slightly off on the other
     display until GTK restarts.
-* **SSD-preferring clients** (foot) still draw their own title bar, a thin
-  strip with an extra ✕. Planned: honour
-  `zxdg_toplevel_decoration_v1.set_mode(server_side)` by keeping Android's
-  caption opaque and placing the surface below it.
+* **Server-side decorations.** A client that asks for them
+  (`zxdg_toplevel_decoration_v1.set_mode(server_side)`) gets them: its
+  window keeps Android's caption opaque, Android lays the view out below
+  it, and the client gets the whole surface (no caption band, no header
+  analysis). Electron's framed windows ask for this because we offer
+  xdg-decoration, which is how Claude's detached DevTools gets a title bar.
+  Unset or client-side keeps the transparent caption.
 * **Header height.** The GTK header (47 logical px) is taller than Android's
   caption (28 dp), so the system controls sit high in the header.
   `gtk.css` sets `min-height` but can't shrink below GTK's widgets.
-* **Static CSS.** `gtk.css` is written per device and read at GTK start-up,
-  so it is wrong for maximised windows (narrower rects). A per-window
-  channel would fix it: a private protocol, or a GTK module that reads
-  `xdg_toplevel` configure hints.
+* **Static CSS.** `gtk.css` is read at GTK start-up, so geometry first seen
+  later (the first maximised window) applies from the next app start.
+* **Chromium/Electron caption.** Electron's Linux title bar overlay
+  (`titleBarOverlay`) draws its own caption buttons with fixed sizes and
+  gives the page `env(titlebar-area-*)` clear of those alone. It ignores
+  GTK's layout and theme on that path, and nothing tells it about Android's
+  controls. On GNOME this is fine (Electron's buttons are the only ones);
+  here the page's header runs under Android's controls. The proper fix is
+  an inset hook in Electron (a full Electron build). For now
+  `scripts/patch-claude-desktop.sh` patches Claude Desktop's `app.asar`
+  with `scripts/claude-desktop-insets.js`:
+  - it reads Android's caption insets from `/run/awb/caption.json` (logical
+    px, which are dp; normal and maximised, written next to `gtk.css`);
+  - it pads the page's title bar (`.dframe-chrome-bar`, whose inline
+    padding comes from `env(titlebar-area-*)`) by those insets less the
+    empty margin inside Android's rects (10 dp after the app chip, 52 dp
+    before the first control), divided by the page zoom. The end goes
+    through Claude's `--df-chrome-bar-end-gutter`;
+  - it draws Electron's own buttons transparent, since they sit under
+    Android's.
+
+  The CSS hook is Claude-specific, and the script must be rerun after a
+  Claude Desktop update (it keeps the original as `app.asar.awb-orig`).
+  Claude refuses debugging switches on its command line, so the patch also
+  opens DevTools itself when started with `AWB_DEVTOOLS=1`
+  (`awb-run.sh env AWB_DEVTOOLS=1 /usr/local/bin/claude-desktop`).
+  Verified on the device: the header's icons end before Android's controls
+  at both edges.
+* **Clipboard and drag types.** Text only; images and file lists stay on
+  their side. A drag icon from a dmabuf (GL-rendered) has no shadow.
 * **Popups** can't leave the window yet. Possible: a child window per popup,
   if freeform tasks allow it outside the task bounds (untested).
 * **Window state.** No public API to maximise or fullscreen a task from the
@@ -541,14 +648,19 @@ es2gears_wayland.
 ## Roadmap
 
 1. ~~Per-window scale, fractional scaling and viewporter.~~ Done.
-2. SSD mode (opaque system caption) per the client's decoration preference.
+2. ~~SSD mode (opaque system caption) per the client's decoration
+   preference.~~ Done.
 3. ~~`linux-dmabuf` with Vulkan import and compositing, per-window
    pacing, explicit sync, zero-copy direct mode.~~ Done.
 4. ~~Dark mode and accent colour via the settings portal.~~ Done.
-5. Clipboard: `wl_data_device` ↔ `ClipboardManager` (text first), then
-   drag and drop.
-6. IME: `zwp_text_input_v3` ↔ `InputConnection`.
-7. Window Controls Overlay hints for Chromium/Electron; a per-window
-   caption-geometry channel for GTK.
-8. Optional privileged drag helper for `xdg_toplevel.move` and
-   `resize`.
+5. ~~Clipboard: `wl_data_device` ↔ `ClipboardManager` (text first), then
+   drag and drop.~~ Done (text).
+6. ~~IME: `zwp_text_input_v3` ↔ `InputConnection`.~~ Done.
+7. ~~A per-window caption-geometry channel for GTK.~~ Done, through the
+   maximised state. Window Controls Overlay hints for Chromium/Electron
+   remain open (see Known gaps).
+8. ~~Optional privileged drag helper for `xdg_toplevel.move` and
+   `resize`.~~ Done.
+
+Out of scope for now: X11 and XWayland. The target is native Wayland apps,
+which covers GTK, Qt and Chromium/Electron (`--ozone-platform=wayland`).

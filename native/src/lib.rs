@@ -3,6 +3,7 @@
 //! thread, everything Wayland lives on one compositor thread (see `server`).
 
 mod android;
+mod data;
 mod direct;
 mod dmabuf;
 mod gpu;
@@ -17,19 +18,19 @@ mod shm;
 mod state;
 mod surface;
 mod syncobj;
+mod text_input;
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use jni::JNIEnv;
-use jni::objects::{JClass, JIntArray, JObject, JString};
+use jni::objects::{JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 
 use android::NativeSlot;
 
 /// Requests from the Android side, drained by the compositor thread.
-#[derive(Debug)]
 pub enum Cmd {
     /// A window's Android surface was attached; redraw it.
     Redraw(u32),
@@ -50,6 +51,38 @@ pub enum Cmd {
     /// SurfaceFlinger completed a direct-mode transaction (binder thread);
     /// `fence` releases the buffer it replaced (-1: already released).
     DirectDone { win: u32, token: u64, fence: i32 },
+    /// Android's clipboard text changed.
+    Clipboard(String),
+    Drag(DragEvent),
+    /// An edit from Android's IME in window `win`.
+    Ime(u32, text_input::ImeEdit),
+    /// A client's data source was read (None: failed or too large).
+    SourceRead { id: u64, text: Option<String> },
+}
+
+/// An Android drag event on one of our windows (`View.onDragEvent`).
+#[derive(Debug)]
+pub struct DragEvent {
+    pub win: u32,
+    pub action: i32,
+    /// View px.
+    pub x: f32,
+    pub y: f32,
+    /// Our own drag (a client's); its data stays on the Wayland side.
+    pub local: bool,
+    /// For ENDED: whether some window or app took the drop.
+    pub result: bool,
+    pub mimes: Vec<String>,
+    /// A drop's text, from another app.
+    pub text: Option<String>,
+}
+
+impl DragEvent {
+    // Android's DragEvent actions.
+    pub const LOCATION: i32 = 2;
+    pub const DROP: i32 = 3;
+    pub const ENDED: i32 = 4;
+    pub const EXITED: i32 = 6;
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +107,8 @@ pub struct Caption {
     pub controls: Vec<[i32; 4]>,
     /// Derive gesture-exclusion rects from the header's pixels.
     pub auto_exclusion: bool,
+    /// The window spans the display: the client is configured maximised.
+    pub maximized: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -265,6 +300,7 @@ pub extern "system" fn Java_dev_awb_Native_caption(
     height: jint,
     rects: JIntArray,
     auto_exclusion: jboolean,
+    maximized: jboolean,
 ) {
     ffi_guard("caption", (), || {
         let mut flat = Vec::new();
@@ -274,7 +310,7 @@ pub extern "system" fn Java_dev_awb_Native_caption(
             let _ = env.get_int_array_region(&rects, 0, &mut flat);
         }
         let controls = flat.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
-        push(Cmd::Caption(win as u32, Caption { top, height, controls, auto_exclusion: auto_exclusion != 0 }));
+        push(Cmd::Caption(win as u32, Caption { top, height, controls, auto_exclusion: auto_exclusion != 0, maximized: maximized != 0 }));
     })
 }
 
@@ -322,5 +358,61 @@ pub extern "system" fn Java_dev_awb_Native_appearance(_env: JNIEnv, _cls: JClass
         let channel = |shift: u32| ((accent as u32 >> shift) & 0xff) as f64 / 255.0;
         let accent = ((accent as u32) >> 24 != 0).then(|| (channel(16), channel(8), channel(0)));
         PORTAL.get_or_init(Default::default).set(portal::Appearance { dark: dark != 0, accent });
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_clipboard(mut env: JNIEnv, _cls: JClass, text: JString) {
+    ffi_guard("clipboard", (), || {
+        if let Ok(t) = env.get_string(&text) {
+            push(Cmd::Clipboard(t.into()));
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_drag(
+    mut env: JNIEnv,
+    _cls: JClass,
+    win: jint,
+    action: jint,
+    x: jfloat,
+    y: jfloat,
+    local: jboolean,
+    result: jboolean,
+    mimes: JObjectArray,
+    text: JString,
+) {
+    ffi_guard("drag", (), || {
+        let mut list = Vec::new();
+        if !mimes.is_null() {
+            let n = env.get_array_length(&mimes).unwrap_or(0).min(64);
+            for i in 0..n {
+                let Ok(m) = env.get_object_array_element(&mimes, i) else { continue };
+                if let Ok(m) = env.get_string(&JString::from(m)) {
+                    list.push(m.into());
+                }
+            }
+        }
+        let text = if text.is_null() { None } else { env.get_string(&text).ok().map(Into::into) };
+        push(Cmd::Drag(DragEvent { win: win as u32, action, x, y, local: local != 0, result: result != 0, mimes: list, text }));
+    })
+}
+
+/// An IME edit: `kind` 0 = commit `text`, 1 = composing `text` with the cursor
+/// at `a`, 2 = delete `a` units before and `b` after the cursor, 3 = the `a`
+/// units before the cursor become composing `text` again.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_ime(mut env: JNIEnv, _cls: JClass, win: jint, kind: jint, text: JString, a: jint, b: jint) {
+    ffi_guard("ime", (), || {
+        let text: String = if text.is_null() { String::new() } else { env.get_string(&text).map(Into::into).unwrap_or_default() };
+        let edit = match kind {
+            0 => text_input::ImeEdit::Commit(text),
+            1 => text_input::ImeEdit::Preedit(text, a),
+            2 => text_input::ImeEdit::Delete(a, b),
+            3 => text_input::ImeEdit::Recompose(text, a),
+            _ => return,
+        };
+        push(Cmd::Ime(win as u32, edit));
     })
 }

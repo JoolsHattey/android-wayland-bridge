@@ -239,6 +239,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
                             xdg_surface: res.clone(),
                             toplevel: tl,
                             decoration: None,
+                            ssd: false,
                             title: String::new(),
                             app_id: String::new(),
                             mapped: false,
@@ -359,9 +360,9 @@ pub fn xdg_committed(st: &mut State, xid: &ObjectId) {
                     .map(|g| (g.w, g.h))
                     .or_else(|| st.surfaces.get(&sid).and_then(|s| s.logical_size()))
                     .unwrap_or((640, 480));
-                let (title, app_id) = (w.title.clone(), w.app_id.clone());
-                log::info!("toplevel {win} mapped {}x{} '{title}' ({app_id})", size.0, size.1);
-                st.host.map(win, size.0, size.1, &title, &app_id);
+                let (title, app_id, ssd) = (w.title.clone(), w.app_id.clone(), w.ssd);
+                log::info!("toplevel {win} mapped {}x{} '{title}' ({app_id}){}", size.0, size.1, if ssd { " ssd" } else { "" });
+                st.host.map(win, size.0, size.1, &title, &app_id, ssd);
             } else if !has_buffer && w.mapped {
                 w.mapped = false;
                 if let Some(xs) = st.xdg_surfaces.get_mut(xid) {
@@ -420,10 +421,14 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ObjectId> for State {
                 }
                 xdg_toplevel::Request::Move { .. } => {
                     log::info!("toplevel {win}: move requested");
-                    st.host.move_request(win);
+                    st.host.move_request(win, 0);
                 }
                 xdg_toplevel::Request::Resize { edges, .. } => {
-                    log::info!("toplevel {win}: resize requested (edges {})", wenum(edges));
+                    let edges = wenum(edges);
+                    log::info!("toplevel {win}: resize requested (edges {edges})");
+                    if edges != 0 && edges <= 10 {
+                        st.host.move_request(win, edges);
+                    }
                 }
                 xdg_toplevel::Request::SetMinimized => st.host.minimize(win),
                 xdg_toplevel::Request::SetMaximized
@@ -586,17 +591,30 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ObjectId> f
         dh: &DisplayHandle,
         _: &mut DataInit<'_, State>,
     ) {
-        guard("zxdg_toplevel_decoration_v1", client, dh, || match req {
-            zxdg_toplevel_decoration_v1::Request::SetMode { .. } | zxdg_toplevel_decoration_v1::Request::UnsetMode => {
-                // We always answer client-side: the app draws its header
-                // into Android's transparent caption bar.
-                if let Some(XdgRole::Toplevel(win)) = st.xdg_surfaces.get(xid).map(|x| x.role) {
-                    if st.windows.get(&win).is_some_and(|w| w.configured.is_some()) {
-                        st.configure_window(win);
-                    }
+        guard("zxdg_toplevel_decoration_v1", client, dh, || {
+            // Client-side unless the client asks otherwise: the app draws its
+            // header into Android's transparent caption bar. Server-side means
+            // an opaque Android caption above the app (Electron's framed
+            // windows, such as DevTools, and SSD-preferring clients).
+            let ssd = match req {
+                zxdg_toplevel_decoration_v1::Request::SetMode { mode } => {
+                    mode == WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ServerSide)
+                }
+                zxdg_toplevel_decoration_v1::Request::UnsetMode => false,
+                _ => return,
+            };
+            let Some(XdgRole::Toplevel(win)) = st.xdg_surfaces.get(xid).map(|x| x.role) else { return };
+            let Some(w) = st.windows.get_mut(&win) else { return };
+            if w.ssd != ssd {
+                w.ssd = ssd;
+                log::info!("toplevel {win}: {} decorations", if ssd { "server-side" } else { "client-side" });
+                if w.mapped {
+                    st.host.decorations(win, ssd);
                 }
             }
-            _ => {}
+            if st.windows.get(&win).is_some_and(|w| w.configured.is_some()) {
+                st.configure_window(win);
+            }
         });
     }
 

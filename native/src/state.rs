@@ -60,6 +60,9 @@ pub struct Window {
     pub xdg_surface: xdg_surface::XdgSurface,
     pub toplevel: xdg_toplevel::XdgToplevel,
     pub decoration: Option<ZxdgToplevelDecorationV1>,
+    /// The client asked for server-side decorations: Android draws an
+    /// opaque caption above it instead of the app's header showing through.
+    pub ssd: bool,
     pub title: String,
     pub app_id: String,
     pub mapped: bool,
@@ -108,6 +111,8 @@ pub struct State {
     pub popups: HashMap<ObjectId, Popup>,
     pub next_window: u32,
     pub seat: Seat,
+    pub data: crate::data::Data,
+    pub text_inputs: crate::text_input::TextInputs,
     pub outputs: Outputs,
     /// The Vulkan renderer; None draws on the CPU (and offers no dmabuf).
     pub gpu: Option<crate::gpu::Renderer>,
@@ -150,6 +155,8 @@ impl State {
             popups: HashMap::new(),
             next_window: 1,
             seat: Seat::default(),
+            data: Default::default(),
+            text_inputs: Default::default(),
             outputs: Outputs::default(),
             gpu: None,
             drm: None,
@@ -286,6 +293,11 @@ impl State {
         if w.focused {
             states.push(xdg_toplevel::State::Activated as u32);
         }
+        // GTK styles it as `window.maximized`, which is how gtk.css gives
+        // maximised windows their own caption geometry.
+        if w.caption.maximized {
+            states.push(xdg_toplevel::State::Maximized as u32);
+        }
         if v >= 2 {
             // Tiled on all edges: GTK and friends then draw no shadows or
             // rounded corners, so the content fills the Android window.
@@ -298,7 +310,8 @@ impl State {
         }
         let bytes: Vec<u8> = states.iter().flat_map(|s| s.to_ne_bytes()).collect();
         if let Some(d) = &w.decoration {
-            d.configure(wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ClientSide);
+            use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+            d.configure(if w.ssd { Mode::ServerSide } else { Mode::ClientSide });
         }
         w.toplevel.configure(lw, lh, bytes);
         w.xdg_surface.configure(serial);

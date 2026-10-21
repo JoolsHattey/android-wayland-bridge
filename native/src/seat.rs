@@ -68,7 +68,7 @@ impl Seat {
 /// Android MotionEvent button bits -> Linux BTN_* codes.
 const BUTTONS: [(i32, u32); 5] = [(1, 0x110), (2, 0x111), (4, 0x112), (8, 0x113), (16, 0x114)];
 
-fn surface_origin(st: &State, win: u32, sid: &ObjectId) -> Option<(i32, i32)> {
+pub fn surface_origin(st: &State, win: u32, sid: &ObjectId) -> Option<(i32, i32)> {
     let w = st.windows.get(&win)?;
     st.paint_list(w).into_iter().find(|(s, _, _)| s == sid).map(|(_, x, y)| (x, y))
 }
@@ -116,11 +116,26 @@ fn in_popup(st: &State, sid: &ObjectId) -> bool {
     false
 }
 
-pub fn handle_pointer(st: &mut State, ev: PointerEvent) {
-    let win = ev.win;
+/// Android px in window `win` -> logical px in its Wayland window space.
+pub fn window_point(st: &State, win: u32, x: f32, y: f32) -> (f64, f64) {
     let scale = st.window_scale(win);
     let top = st.windows.get(&win).map_or(0, |w| w.caption.top) as f64;
-    let (x, y) = (to_logical(ev.x as f64, scale), to_logical(ev.y as f64 - top, scale));
+    (to_logical(x as f64, scale), to_logical(y as f64 - top, scale))
+}
+
+/// A drag took the pointer: the surface under it gets a leave.
+pub fn pointer_grabbed(st: &mut State) {
+    set_pointer_focus(st, None);
+}
+
+pub fn handle_pointer(st: &mut State, ev: PointerEvent) {
+    let win = ev.win;
+    let (x, y) = window_point(st, win, ev.x, ev.y);
+    if st.data.dragging() {
+        // Android runs the drag; the pointer comes back once it ends.
+        st.seat.buttons = ev.buttons;
+        return;
+    }
     if ev.action == 2 {
         if st.seat.buttons == 0 {
             set_pointer_focus(st, None);
@@ -295,6 +310,7 @@ pub fn refocus_keyboard(st: &mut State) {
     if target == st.seat.kb_focus {
         return;
     }
+    crate::text_input::focus_changed(st, target.as_ref());
     if let Some(old) = st.seat.kb_focus.take() {
         let serial = st.next_serial();
         if let Some(surf) = st.surfaces.get(&old).map(|s| s.res.clone()) {
@@ -312,6 +328,9 @@ pub fn refocus_keyboard(st: &mut State) {
             }
             st.seat.kb_focus = Some(sid.clone());
             send_modifiers(st, &sid);
+            if let Some(client) = surf.client() {
+                crate::data::offer_selection(st, &client.id());
+            }
         }
     }
 }
@@ -328,9 +347,7 @@ pub fn cursor_committed(st: &mut State, sid: &ObjectId) {
     }
     let Some((_, win)) = st.seat.ptr_focus.clone() else { return };
     let Some(s) = st.surfaces.get(sid) else { return };
-    // A dmabuf cursor has no CPU pixels for a PointerIcon.
     let Some(t) = s.texture.as_ref().filter(|t| t.dmabuf.is_none()) else { return };
-    let bs = s.buffer_scale.max(1);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (t.width, t.height, hx, hy, win).hash(&mut h);
     t.data.hash(&mut h);
@@ -339,8 +356,31 @@ pub fn cursor_committed(st: &mut State, sid: &ObjectId) {
         return;
     }
     st.seat.cursor_hash = hash;
+    let Some(mut image) = surface_image(st, sid, win) else { return };
+    let bs = st.surfaces.get(sid).map_or(1, |s| s.buffer_scale.max(1));
+    (image.hot_x, image.hot_y) = (hx * bs, hy * bs);
+    st.host.cursor(win, Some(&image));
+}
+
+/// A surface's pixels for an Android bitmap (cursor, drag shadow).
+pub struct Image {
+    /// Non-premultiplied 0xAARRGGBB, Android's layout.
+    pub argb: Vec<i32>,
+    pub width: i32,
+    pub height: i32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+    /// Image px to display px.
+    pub scale: f32,
+}
+
+/// The surface's current pixels, scaled for window `win`. A dmabuf has no
+/// CPU pixels, so it gives none.
+pub fn surface_image(st: &State, sid: &ObjectId, win: u32) -> Option<Image> {
+    let s = st.surfaces.get(sid)?;
+    let t = s.texture.as_ref().filter(|t| t.dmabuf.is_none())?;
     // RGBA premultiplied -> Android's non-premultiplied 0xAARRGGBB.
-    let argb: Vec<i32> = t
+    let argb = t
         .data
         .iter()
         .map(|&v| {
@@ -350,8 +390,8 @@ pub fn cursor_committed(st: &mut State, sid: &ObjectId) {
         })
         .collect();
     // Android shows the bitmap 1:1 in display px; scale it to the window.
-    let scale = st.window_scale(win) as f32 / 120.0 / bs as f32;
-    st.host.cursor(win, Some((&argb, t.width, t.height, hx * bs, hy * bs, scale)));
+    let scale = st.window_scale(win) as f32 / 120.0 / s.buffer_scale.max(1) as f32;
+    Some(Image { argb, width: t.width, height: t.height, hot_x: 0, hot_y: 0, scale })
 }
 
 fn keymap_fd() -> Option<(OwnedFd, u32)> {

@@ -10,13 +10,14 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_m
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+use wayland_protocols::wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1;
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use wayland_server::protocol::{
-    wl_compositor, wl_data_device, wl_data_device_manager, wl_data_source, wl_seat, wl_shm, wl_subcompositor,
+    wl_compositor, wl_data_device_manager, wl_seat, wl_shm, wl_subcompositor,
 };
-use wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, ListeningSocket, New};
+use wayland_server::{Display, ListeningSocket};
 
 use crate::host::Host;
 use crate::state::State;
@@ -58,6 +59,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
     dh.create_global::<State, wl_data_device_manager::WlDataDeviceManager, ()>(3, ());
     dh.create_global::<State, XdgWmBase, ()>(6, ());
     dh.create_global::<State, ZxdgDecorationManagerV1, ()>(1, ());
+    dh.create_global::<State, ZwpTextInputManagerV3, ()>(1, ());
 
     // `renderer=cpu` in awb.properties keeps the CPU compositor.
     let gpu = if setting(&cfg.socket_path, "renderer").as_deref() == Some("cpu") {
@@ -199,6 +201,10 @@ fn handle_cmd(st: &mut State, cmd: Cmd) {
             }
         }
         Cmd::Pointer(ev) => crate::seat::handle_pointer(st, ev),
+        Cmd::Clipboard(text) => crate::data::android_clipboard(st, text),
+        Cmd::Drag(ev) => crate::data::android_drag(st, ev),
+        Cmd::Ime(win, edit) => crate::text_input::edit(st, win, edit),
+        Cmd::SourceRead { id, text } => crate::data::source_read(st, id, text),
         Cmd::Key { win, code, down, time } => crate::seat::handle_key(st, win, code, down, time),
         Cmd::Close(win) => {
             if let Some(w) = st.windows.get_mut(&win) {
@@ -210,7 +216,7 @@ fn handle_cmd(st: &mut State, cmd: Cmd) {
         Cmd::Caption(win, caption) => {
             log::info!("toplevel {win}: {caption:?}");
             let Some(w) = st.windows.get_mut(&win) else { return };
-            let top_changed = w.caption.top != caption.top;
+            let top_changed = w.caption.top != caption.top || w.caption.maximized != caption.maximized;
             w.caption = caption;
             w.caption_light = None;
             w.exclusion.clear();
@@ -221,42 +227,3 @@ fn handle_cmd(st: &mut State, cmd: Cmd) {
         }
     }
 }
-
-// ---- data device (inert until clipboard support) ----------------------
-
-impl GlobalDispatch<wl_data_device_manager::WlDataDeviceManager, ()> for State {
-    fn bind(_: &mut State, _: &DisplayHandle, _: &Client, res: New<wl_data_device_manager::WlDataDeviceManager>, _: &(), init: &mut DataInit<'_, State>) {
-        init.init(res, ());
-    }
-}
-
-impl Dispatch<wl_data_device_manager::WlDataDeviceManager, ()> for State {
-    fn request(
-        _: &mut State,
-        _: &Client,
-        _: &wl_data_device_manager::WlDataDeviceManager,
-        req: wl_data_device_manager::Request,
-        _: &(),
-        _: &DisplayHandle,
-        init: &mut DataInit<'_, State>,
-    ) {
-        match req {
-            wl_data_device_manager::Request::CreateDataSource { id } => {
-                init.init(id, ());
-            }
-            wl_data_device_manager::Request::GetDataDevice { id, .. } => {
-                init.init(id, ());
-            }
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<wl_data_source::WlDataSource, ()> for State {
-    fn request(_: &mut State, _: &Client, _: &wl_data_source::WlDataSource, _: wl_data_source::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, State>) {}
-}
-
-impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
-    fn request(_: &mut State, _: &Client, _: &wl_data_device::WlDataDevice, _: wl_data_device::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, State>) {}
-}
-

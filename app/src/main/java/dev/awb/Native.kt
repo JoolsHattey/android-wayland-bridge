@@ -41,26 +41,45 @@ object Native {
 
     @JvmStatic external fun close(win: Int)
 
+    /** As [dev.awb.window.IToplevelSession.ime]. */
+    @JvmStatic external fun ime(win: Int, kind: Int, text: String?, a: Int, b: Int)
+
+    /** Android's clipboard text changed. */
+    @JvmStatic external fun clipboard(text: String)
+
+    /** As [dev.awb.window.IToplevelSession.drag]. */
+    @JvmStatic external fun drag(win: Int, action: Int, x: Float, y: Float, local: Boolean, result: Boolean, mimes: Array<String>, text: String?)
+
     /**
      * Caption geometry in px: [top] rows belong to the system (status bar when
      * maximised), then a band of [height] with the system's own rects (app
      * chip, window controls; x, y, w, h flattened, relative to the band).
      * With [autoExclusion] the compositor reports which header areas the app
-     * needs via [NativeCallbacks.onExclusion].
+     * needs via [NativeCallbacks.onExclusion]. [maximized]: the window spans
+     * the display (the client is told so).
      */
-    @JvmStatic external fun caption(win: Int, top: Int, height: Int, rects: IntArray, autoExclusion: Boolean)
+    @JvmStatic external fun caption(win: Int, top: Int, height: Int, rects: IntArray, autoExclusion: Boolean, maximized: Boolean)
 }
 
 /** Called on the compositor thread; implementations hop to the main thread. */
 interface NativeCallbacks {
     /** [width] x [height] are logical px; multiply by the target display's scale. */
-    fun onMap(win: Int, width: Int, height: Int, title: String, appId: String)
+    /** [ssd]: the client wants server-side decorations (an opaque caption). */
+    fun onMap(win: Int, width: Int, height: Int, title: String, appId: String, ssd: Boolean)
+    fun onDecorations(win: Int, ssd: Boolean)
     fun onUnmap(win: Int)
     fun onTitle(win: Int, title: String)
     fun onMinimize(win: Int)
-    fun onMoveRequest(win: Int)
+    /** [edges]: 0 = move, else xdg_toplevel resize edges. */
+    fun onMoveRequest(win: Int, edges: Int)
     fun onCaptionLight(win: Int, light: Boolean)
     fun onExclusion(win: Int, rects: IntArray)
     /** [scale] maps image px to display px. */
     fun onCursor(win: Int, argb: IntArray?, width: Int, height: Int, hotX: Int, hotY: Int, scale: Float)
+    /** As [dev.awb.window.IToplevelHost.setTextInput]. */
+    fun onTextInput(win: Int, enabled: Boolean, purpose: Int, hint: Int, text: String?, cursor: Int, anchor: Int, rect: IntArray?)
+    /** A Linux app copied [text]. */
+    fun onClipboard(text: String)
+    /** A Linux app started a drag in [win]; [argb] is its icon, if any (as [onCursor]). */
+    fun onStartDrag(win: Int, text: String?, argb: IntArray?, width: Int, height: Int, scale: Float)
 }
