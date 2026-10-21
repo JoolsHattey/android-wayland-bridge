@@ -8,8 +8,8 @@ use wayland_server::protocol::{
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
-use crate::shm::Texture;
-use crate::state::{State, guard};
+use crate::shm::{Texture, next_texture_serial};
+use crate::state::{Buffer, State, guard};
 
 #[derive(Debug, Clone, Copy)]
 pub enum RegionOp {
@@ -290,6 +290,23 @@ fn destroy_surface(st: &mut State, sid: &ObjectId) {
         }
     }
     st.seat.surface_gone(sid);
+    release_texture(st, s.texture, None);
+    if let Some(r) = &mut st.gpu {
+        r.forget_surface(sid);
+    }
+}
+
+/// Gives a replaced dmabuf back to its client once the GPU no longer reads
+/// it, unless it is still the current buffer (`current`).
+fn release_texture(st: &mut State, old: Option<Texture>, current: Option<&ObjectId>) {
+    let Some((buffer, d)) = old.and_then(|t| t.dmabuf) else { return };
+    if current == Some(&buffer.id()) || !buffer.is_alive() {
+        return;
+    }
+    match &mut st.gpu {
+        Some(r) => r.release(buffer, &d),
+        None => buffer.release(),
+    }
 }
 
 fn effectively_sync(st: &State, sid: &ObjectId) -> bool {
@@ -321,11 +338,25 @@ fn commit(st: &mut State, sid: &ObjectId) {
 /// Makes `state` current on the surface, then applies cached state of
 /// synchronized children and runs role-specific commit logic.
 fn apply(st: &mut State, sid: &ObjectId, state: SurfState) {
-    let mut new_texture: Option<Option<crate::shm::Texture>> = None;
+    let mut new_texture: Option<Option<Texture>> = None;
     if let Some(buffer) = &state.buffer {
         new_texture = Some(match buffer {
             Some(b) => {
-                let tex = st.buffers.get(&b.id()).and_then(|info| info.read());
+                let (tex, copied) = match st.buffers.get(&b.id()) {
+                    Some(Buffer::Shm(info)) => (info.read(), true),
+                    Some(Buffer::Dmabuf(d)) => (
+                        Some(Texture {
+                            width: d.width,
+                            height: d.height,
+                            data: Vec::new(),
+                            opaque: false,
+                            dmabuf: Some((b.clone(), d.clone())),
+                            serial: next_texture_serial(),
+                        }),
+                        false,
+                    ),
+                    None => (None, false),
+                };
                 if tex.is_none() {
                     log::warn!("client buffer unreadable; disconnecting client");
                     if let Ok(client) = st.dh.get_client(b.id()) {
@@ -341,17 +372,26 @@ fn apply(st: &mut State, sid: &ObjectId, state: SurfState) {
                     }
                     return;
                 }
-                // Contents are copied, so the client may reuse the buffer now.
-                b.release();
+                // Shm contents are copied, so the client may reuse the buffer
+                // now. A dmabuf is released once it is replaced and drawn.
+                if copied {
+                    b.release();
+                }
                 tex
             }
             None => None,
         });
     }
     let Some(s) = st.surfaces.get_mut(sid) else { return };
+    let mut replaced = None;
     if let Some(t) = new_texture {
-        s.texture = t;
+        replaced = std::mem::replace(&mut s.texture, t);
     }
+    let current = s.texture.as_ref().and_then(|t| t.dmabuf.as_ref()).map(|(b, _)| b.id());
+    let s = {
+        release_texture(st, replaced, current.as_ref());
+        st.surfaces.get_mut(sid).unwrap()
+    };
     if let Some(scale) = state.scale {
         s.buffer_scale = scale;
     }

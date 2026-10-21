@@ -27,7 +27,7 @@ disconnect itself.
  ─────────────────────               ───────────────────────────────────────────
  GTK / foot / Electron ──wayland──▶  compositor thread (Rust, libawb.so)
    WAYLAND_DISPLAY=                    wayland-server (pure-Rust backend)
-   /run/awb/wayland-0                  protocol state, CPU compositing
+   /run/awb/wayland-0                  protocol state, Vulkan compositing
  (bind mount of the app's                    │ JNI callbacks (map, title, …)
   files/ directory)                          ▼
                                      main thread (Kotlin)
@@ -97,22 +97,79 @@ disconnect itself.
 
 ### Buffers to screen
 
-* `wl_shm` only, for now. On commit the buffer is **copied once** into a
+* Two buffer types: `wl_shm`, and `zwp_linux_dmabuf_v1` GPU buffers (see
+  [GPU](#gpu)). A `wl_shm` buffer is **copied once** on commit into a
   compositor-owned texture (swizzled ARGB to RGBA) and released immediately.
   Client memory is never touched after the commit. That's the opposite of
   the failure mode in Google's bridge, where release bookkeeping crashed.
 * Shrinking a pool under the compositor (SIGBUS) is caught the way
   libwayland does it: a SIGBUS handler, chained to ART's, maps zero pages
   over the pool and the client is disconnected.
-* Each window is a `SurfaceView`. The compositor locks its `ANativeWindow`
-  (RGBA_8888, window-sized), composites the toplevel tree (subsurfaces with
-  sync/desync semantics, then popups) on the CPU, posts the frame, then sends
-  frame callbacks. `unlockAndPost` back-pressure paces the clients.
+* Each window is a `SurfaceView`. The compositor draws the toplevel tree
+  (subsurfaces with sync/desync semantics, then popups) into its
+  `ANativeWindow`, presents, then sends frame callbacks. Normally this runs
+  through a Vulkan swapchain. The CPU fallback locks the window instead
+  (RGBA_8888, window-sized) and posts it. Either way, swapchain or
+  `unlockAndPost` back-pressure paces the clients.
 * The renderer honours `wp_viewporter` (source crop and destination
   size). A buffer whose size matches its on-screen pixel rect is copied 1:1.
   That is what fractional-scale clients produce. Anything else, such as a
   2× or 1× buffer on a 1.5× window, is scaled bilinearly. Surface edges
   are rounded separately, so neighbouring surfaces meet without gaps.
+
+### GPU
+
+The compositor renders with Vulkan, and clients render on the GPU and pass
+dmabufs. Both sides use the same Intel Arc (Meteor Lake) and `i915` render
+node, `/dev/dri/renderD128`, which is mode 0666 and reaches the chroot
+through its `/dev` bind mount.
+
+* **Android side.** The vendor Vulkan driver is Mesa ANV (26.1). Android's
+  GL is ANGLE on top of it, so EGL can't import dmabufs; Vulkan can. A probe
+  on the device found `VK_EXT_external_memory_dma_buf`,
+  `VK_EXT_image_drm_format_modifier` and `VK_EXT_queue_family_foreign`.
+  ARGB/XRGB/ABGR/XBGR 8888 and 2101010 import with linear, X-tiled,
+  4-tiled and MTL CCS modifiers: 40 format/modifier pairs.
+* **Chroot side.** Debian's Mesa 25.0 needs `mesa-vulkan-drivers` and
+  `libgl1-mesa-dri`. GTK then picks `GskGLRenderer` on the Arc,
+  `es2gears_wayland` runs at the panel's 120 Hz, and `vkcube` uses ANV.
+* **`zwp_linux_dmabuf_v1` v4** (`dmabuf.rs`). Feedback has one tranche:
+  every pair, for the render node's `dev_t`. Version 3 clients get
+  `modifier` events. A buffer is imported into Vulkan when its `wl_buffer`
+  is created, so a bad buffer fails there (`failed`, or `invalid_wl_buffer`
+  for `create_immed`), never at draw time.
+  - All planes must share one buffer object (as Mesa allocates CCS aux
+    planes). The import uses the explicit plane layouts.
+  - `y_invert` is honoured; interlaced buffers are rejected.
+* **Renderer** (`gpu.rs`). One queue and one timeline semaphore; every
+  submission signals the next serial.
+  - **Per window:** a swapchain on the `ANativeWindow` (R8G8B8A8, FIFO). It
+    lives in the window's slot, so `surfaceDestroyed` tears it down before
+    the window is released.
+  - **Per surface:** one quad, blended as premultiplied alpha, with a
+    bilinear sampler. A quad that lands 1:1 on pixel centres samples
+    exactly, so fractional-scale clients stay pixel-exact.
+  - **Textures:** dmabuf images are acquired from and released back to
+    `VK_QUEUE_FAMILY_FOREIGN_EXT` each frame. `wl_shm` textures are uploaded
+    through a staging buffer when they change. An X-format swizzles alpha to
+    1 in the image view.
+* **Implicit sync.** A window is drawn only once every dmabuf it shows polls
+  readable, i.e. the client's rendering has finished. A slow client then
+  only delays its own window, instead of stalling the queue all windows
+  share.
+* **Buffer lifetime.** A dmabuf stays held while it is the surface's
+  buffer. It is released when replaced, once the last frame that sampled it
+  has completed. Images, staging buffers and readbacks are destroyed the
+  same way. While frames are in flight, the event loop polls with a 2 ms
+  timeout to collect them.
+* **Header analysis.** After the render pass, the caption band is copied to
+  a host buffer. When the frame completes, the same code as on the CPU path
+  derives the control colour and gesture exclusion from it.
+* **Fallback.** Without a usable Vulkan device, or with `renderer=cpu` in
+  `files/awb.properties`, the CPU compositor runs and no dmabuf global is
+  offered. Mesa then falls back to llvmpipe and GTK to cairo.
+* Shaders (`native/shaders/`) are compiled to SPIR-V by `build.rs` with the
+  NDK's `glslc`.
 
 ### Scale, per display
 
@@ -198,6 +255,7 @@ the Android side. It bind-mounts that directory into the chroot at
    only there. This works because those positions are covered by the
    system's input region anyway.
 5. **Control colour.** After each frame the compositor samples the header
+   (on the GPU path, from the caption band it reads back)
    under the controls and toggles `APPEARANCE_LIGHT_CAPTION_BARS` (dark icons
    on light headers).
 6. **Chromium/Electron** (not built yet): run with
@@ -307,6 +365,9 @@ takes that role (`native/src/portal.rs`):
   any order, so windows and popups are found by their own resource. The
   torture test found exactly this bug: windows leaked when the `xdg_surface`
   died before its `xdg_toplevel`.
+* With the GPU renderer, `torture abort`, `popup` and `churn 40` (42 windows),
+  plus `kill -9` of vkcube and es2gears mid-frame, also leave the app
+  running with no leftover windows.
 * `tools/torture` is a static musl client that misbehaves on purpose:
   `abort` (dies mid-frame with a commit in flight), `sigbus` (truncates its
   pool under an attached buffer), `popup` (exits with a popup open) and
@@ -320,7 +381,8 @@ Working on the device:
 
 * Each toplevel is its own freeform Android window, with title,
   resize→configure and close.
-* wl_shm rendering.
+* wl_shm and dmabuf rendering, composited with Vulkan (CPU fallback).
+* GPU clients: GTK's GL renderer, EGL/GLES and Vulkan on the Arc.
 * Popups and tooltips.
 * Keyboard and mouse input.
 * Client cursors.
@@ -330,7 +392,8 @@ Working on the device:
 * Pixel-derived exclusion: click in the header, drag the window from empty
   header space.
 
-Tested with adwaita-1-demo, gtk4-demo, foot and weston-simple-shm.
+Tested with adwaita-1-demo, gtk4-demo, foot, weston-simple-shm, vkcube and
+es2gears_wayland.
 
 ## Known gaps and open questions
 
@@ -360,17 +423,25 @@ Tested with adwaita-1-demo, gtk4-demo, foot and weston-simple-shm.
   fullscreen (`desktop-first-but-fullscreen-cross-app-launch`). Avoid
   showing `MainActivity` while windows open; starting the service with
   `am start-foreground-service` sidesteps it.
-* **CPU path.** About 20 MB copied per full-screen frame, and frame pacing
-  is by `unlockAndPost` back-pressure on the single compositor thread. A
-  slow window delays the others.
+* **Pacing.** The compositor still composites (one GPU blit per frame) and
+  presents every window from its single thread. Swapchain acquire blocks
+  with FIFO, so a window whose display is slow to take frames delays the
+  others. `wl_shm` clients also pay two CPU copies per commit (client to
+  texture, texture to staging).
+* **Sync.** Only implicit sync (dmabuf poll). `wp_linux_drm_syncobj_v1`
+  would let Vulkan clients use explicit sync.
+* **Readback.** The caption band (about 0.4 MB) is read back every frame
+  for the header analysis.
 
 ## Roadmap
 
 1. ~~Per-window scale, fractional scaling and viewporter.~~ Done.
 2. SSD mode (opaque system caption) per the client's decoration preference.
-3. `linux-dmabuf`: import client dmabufs as `AHardwareBuffer` and present
-   them through `ASurfaceTransaction` (`SurfaceControl`) without copies.
-   This also lets each window pace on its own transactions.
+3. ~~`linux-dmabuf` with Vulkan import and compositing.~~ Done. Next:
+   present single-surface windows' dmabufs straight through
+   `ASurfaceTransaction` (`SurfaceControl`), skipping the blit and letting
+   each window pace on its own transactions. That needs a private
+   `AHardwareBuffer_createFromHandle` and minigbm's handle layout.
 4. ~~Dark mode and accent colour via the settings portal.~~ Done.
 5. Clipboard: `wl_data_device` ↔ `ClipboardManager` (text first), then
    drag and drop.

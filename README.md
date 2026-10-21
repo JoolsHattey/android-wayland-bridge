@@ -23,6 +23,11 @@ On the device, as root, run any Wayland app from the Debian chroot:
 adb shell /data/local/tmp/awb-run.sh adwaita-1-demo
 ```
 
+For GPU rendering in the apps, the chroot needs Mesa's drivers
+(`apt install mesa-vulkan-drivers libgl1-mesa-dri`). The compositor itself
+composites with Vulkan; `renderer=cpu` in the app's `files/awb.properties`
+switches back to the CPU compositor.
+
 ## Layout
 
 - `native/`: the compositor (Rust, `wayland-server`), built as `libawb.so`.

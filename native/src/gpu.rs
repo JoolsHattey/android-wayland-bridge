@@ -1,0 +1,1399 @@
+//! GPU compositing with Vulkan (the device's Mesa ANV, through Android's
+//! loader). Client dmabufs are imported as images once, when their wl_buffer
+//! is created; wl_shm textures are uploaded when they change. Each window
+//! draws into a swapchain on its ANativeWindow, one textured quad per
+//! surface. The caption band is copied back afterwards, so the header
+//! analysis (control colour, gesture exclusion) works as on the CPU path.
+//!
+//! All work is ordered on one queue and tracked on one timeline semaphore:
+//! every submission signals the next serial. Client buffers are released,
+//! and images destroyed, once the last serial that used them completes.
+
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::{Arc, Mutex};
+
+use ash::vk;
+use wayland_server::Resource;
+use wayland_server::backend::ObjectId;
+use wayland_server::protocol::wl_buffer::WlBuffer;
+
+use crate::android::ANativeWindow;
+use crate::output::to_px;
+use crate::render::Band;
+use crate::shm::Texture;
+use crate::state::State;
+
+const fn fourcc(s: &[u8; 4]) -> u32 {
+    s[0] as u32 | (s[1] as u32) << 8 | (s[2] as u32) << 16 | (s[3] as u32) << 24
+}
+
+/// DRM formats we import: fourcc, Vulkan format, alpha ignored.
+const FORMATS: [(u32, vk::Format, bool); 8] = [
+    (fourcc(b"AR24"), vk::Format::B8G8R8A8_UNORM, false),
+    (fourcc(b"XR24"), vk::Format::B8G8R8A8_UNORM, true),
+    (fourcc(b"AB24"), vk::Format::R8G8B8A8_UNORM, false),
+    (fourcc(b"XB24"), vk::Format::R8G8B8A8_UNORM, true),
+    (fourcc(b"AR30"), vk::Format::A2R10G10B10_UNORM_PACK32, false),
+    (fourcc(b"XR30"), vk::Format::A2R10G10B10_UNORM_PACK32, true),
+    (fourcc(b"AB30"), vk::Format::A2B10G10R10_UNORM_PACK32, false),
+    (fourcc(b"XB30"), vk::Format::A2B10G10R10_UNORM_PACK32, true),
+];
+
+/// 0xff202020, as on the CPU path.
+const BACKGROUND: [f32; 4] = [0x20 as f32 / 255.0, 0x20 as f32 / 255.0, 0x20 as f32 / 255.0, 1.0];
+
+/// Descriptor sets per window frame, i.e. surfaces drawn per window.
+const MAX_DRAWS: u32 = 128;
+
+static VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.vert.spv"));
+static FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.frag.spv"));
+
+fn err<T>(what: &str, r: Result<T, vk::Result>) -> Result<T, String> {
+    r.map_err(|e| format!("{what}: {e}"))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DmabufFormat {
+    pub fourcc: u32,
+    pub modifier: u64,
+    /// Memory planes the modifier needs (CCS adds aux planes).
+    pub planes: u32,
+}
+
+enum Retired {
+    Image(vk::Image, vk::ImageView, vk::DeviceMemory),
+    Buffer(vk::Buffer, vk::DeviceMemory),
+}
+
+struct Pass {
+    format: vk::Format,
+    readback: bool,
+    render_pass: vk::RenderPass,
+    pipeline: vk::Pipeline,
+}
+
+/// The Vulkan device and everything shared by all windows. Used by the
+/// compositor thread, and by the UI thread only to tear down a window's
+/// swapchain (under its slot lock).
+pub struct Gpu {
+    _entry: ash::Entry,
+    instance: ash::Instance,
+    surface_fn: ash::khr::surface::Instance,
+    android_fn: ash::khr::android_surface::Instance,
+    pd: vk::PhysicalDevice,
+    device: ash::Device,
+    swapchain_fn: ash::khr::swapchain::Device,
+    memfd_fn: ash::khr::external_memory_fd::Device,
+    queue: vk::Queue,
+    qfi: u32,
+    mem_props: vk::PhysicalDeviceMemoryProperties,
+    timeline: vk::Semaphore,
+    dsl: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    vert: vk::ShaderModule,
+    frag: vk::ShaderModule,
+    passes: Mutex<Vec<Pass>>,
+    retired: Mutex<Vec<(u64, Retired)>>,
+    /// What clients may allocate, for zwp_linux_dmabuf_v1.
+    pub formats: Vec<DmabufFormat>,
+    /// dev_t of the GPU's render node.
+    pub render_node: u64,
+}
+
+impl Gpu {
+    fn new() -> Result<Arc<Gpu>, String> {
+        unsafe {
+            let entry = ash::Entry::load().map_err(|e| format!("libvulkan: {e}"))?;
+            let app = vk::ApplicationInfo::default().application_name(c"awb").api_version(vk::API_VERSION_1_3);
+            let exts = [ash::khr::surface::NAME.as_ptr(), ash::khr::android_surface::NAME.as_ptr()];
+            let instance = err(
+                "vkCreateInstance",
+                entry.create_instance(
+                    &vk::InstanceCreateInfo::default().application_info(&app).enabled_extension_names(&exts),
+                    None,
+                ),
+            )?;
+            let required = [
+                ash::khr::swapchain::NAME,
+                ash::khr::external_memory_fd::NAME,
+                ash::ext::external_memory_dma_buf::NAME,
+                ash::ext::image_drm_format_modifier::NAME,
+                ash::ext::queue_family_foreign::NAME,
+            ];
+            let mut chosen = None;
+            for pd in err("vkEnumeratePhysicalDevices", instance.enumerate_physical_devices())? {
+                let props = instance.get_physical_device_properties(pd);
+                if props.api_version < vk::API_VERSION_1_2 {
+                    continue;
+                }
+                let have = instance.enumerate_device_extension_properties(pd).unwrap_or_default();
+                let has = |name: &std::ffi::CStr| have.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
+                if !required.iter().all(|n| has(n)) {
+                    continue;
+                }
+                let qfi = instance
+                    .get_physical_device_queue_family_properties(pd)
+                    .iter()
+                    .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS));
+                if let Some(qfi) = qfi {
+                    log::info!("gpu: {:?}", props.device_name_as_c_str().unwrap_or_default());
+                    chosen = Some((pd, qfi as u32, has(ash::ext::physical_device_drm::NAME)));
+                    break;
+                }
+            }
+            let Some((pd, qfi, has_drm)) = chosen else {
+                return Err("no Vulkan device can import dmabufs".into());
+            };
+
+            let prio = [1.0];
+            let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(qfi).queue_priorities(&prio)];
+            let names: Vec<_> = required.iter().map(|n| n.as_ptr()).collect();
+            let mut v12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+            let info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queues)
+                .enabled_extension_names(&names)
+                .push_next(&mut v12);
+            let device = err("vkCreateDevice", instance.create_device(pd, &info, None))?;
+            let queue = device.get_device_queue(qfi, 0);
+
+            let mut render_node = 0;
+            if has_drm {
+                let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+                instance.get_physical_device_properties2(pd, &mut p2);
+                if drm.has_render != 0 {
+                    render_node = libc::makedev(drm.render_major as u32, drm.render_minor as u32) as u64;
+                }
+            }
+            if render_node == 0 {
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::stat(c"/dev/dri/renderD128".as_ptr(), &mut st) == 0 {
+                    render_node = st.st_rdev as u64;
+                }
+            }
+
+            let mut tl = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+            let timeline =
+                err("timeline", device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tl), None))?;
+            let sampler = err(
+                "sampler",
+                device.create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                    None,
+                ),
+            )?;
+            let samplers = [sampler];
+            let bindings = [vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .immutable_samplers(&samplers)];
+            let dsl = err(
+                "set layout",
+                device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None),
+            )?;
+            let sets = [dsl];
+            let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::VERTEX, offset: 0, size: 32 }];
+            let layout = err(
+                "pipeline layout",
+                device.create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets).push_constant_ranges(&ranges),
+                    None,
+                ),
+            )?;
+            let module = |spv: &[u8]| {
+                let words = ash::util::read_spv(&mut std::io::Cursor::new(spv)).map_err(|e| e.to_string())?;
+                err("shader", device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None))
+            };
+            let (vert, frag) = (module(VERT)?, module(FRAG)?);
+
+            let mut gpu = Gpu {
+                surface_fn: ash::khr::surface::Instance::new(&entry, &instance),
+                android_fn: ash::khr::android_surface::Instance::new(&entry, &instance),
+                swapchain_fn: ash::khr::swapchain::Device::new(&instance, &device),
+                memfd_fn: ash::khr::external_memory_fd::Device::new(&instance, &device),
+                mem_props: instance.get_physical_device_memory_properties(pd),
+                _entry: entry,
+                instance,
+                pd,
+                device,
+                queue,
+                qfi,
+                timeline,
+                dsl,
+                layout,
+                vert,
+                frag,
+                passes: Mutex::new(Vec::new()),
+                retired: Mutex::new(Vec::new()),
+                formats: Vec::new(),
+                render_node,
+            };
+            gpu.formats = gpu.query_formats();
+            log::info!("gpu: {} dmabuf format/modifier pairs, render node {render_node:#x}", gpu.formats.len());
+            Ok(Arc::new(gpu))
+        }
+    }
+
+    /// Format/modifier pairs that can be imported as a dmabuf and sampled.
+    fn query_formats(&self) -> Vec<DmabufFormat> {
+        let mut out = Vec::new();
+        for (fourcc, format, _) in FORMATS {
+            unsafe {
+                let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+                let mut fp = vk::FormatProperties2::default().push_next(&mut list);
+                self.instance.get_physical_device_format_properties2(self.pd, format, &mut fp);
+                let mut mods = vec![vk::DrmFormatModifierPropertiesEXT::default(); list.drm_format_modifier_count as usize];
+                let mut list = vk::DrmFormatModifierPropertiesListEXT::default().drm_format_modifier_properties(&mut mods);
+                let mut fp = vk::FormatProperties2::default().push_next(&mut list);
+                self.instance.get_physical_device_format_properties2(self.pd, format, &mut fp);
+                for m in &mods {
+                    if !m.drm_format_modifier_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
+                        continue;
+                    }
+                    let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+                        .drm_format_modifier(m.drm_format_modifier)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                    let mut ext = vk::PhysicalDeviceExternalImageFormatInfo::default()
+                        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                    let info = vk::PhysicalDeviceImageFormatInfo2::default()
+                        .format(format)
+                        .ty(vk::ImageType::TYPE_2D)
+                        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                        .usage(vk::ImageUsageFlags::SAMPLED)
+                        .push_next(&mut drm)
+                        .push_next(&mut ext);
+                    let mut eprops = vk::ExternalImageFormatProperties::default();
+                    let mut props = vk::ImageFormatProperties2::default().push_next(&mut eprops);
+                    let ok = self.instance.get_physical_device_image_format_properties2(self.pd, &info, &mut props).is_ok();
+                    let features = eprops.external_memory_properties.external_memory_features;
+                    if ok && features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE) {
+                        out.push(DmabufFormat {
+                            fourcc,
+                            modifier: m.drm_format_modifier,
+                            planes: m.drm_format_modifier_plane_count,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The highest serial the GPU has finished.
+    fn completed(&self) -> u64 {
+        unsafe { self.device.get_semaphore_counter_value(self.timeline) }.unwrap_or(0)
+    }
+
+    /// Blocks until `serial` has finished (bounded, so a hung GPU cannot
+    /// wedge the compositor forever).
+    fn wait(&self, serial: u64) {
+        if serial == 0 {
+            return;
+        }
+        let (sems, vals) = ([self.timeline], [serial]);
+        let info = vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&vals);
+        if let Err(e) = unsafe { self.device.wait_semaphores(&info, 2_000_000_000) } {
+            log::warn!("gpu: waiting for frame {serial}: {e}");
+        }
+    }
+
+    fn retire(&self, serial: u64, r: Retired) {
+        if serial <= self.completed() {
+            self.destroy(r);
+        } else {
+            self.retired.lock().unwrap_or_else(|e| e.into_inner()).push((serial, r));
+        }
+    }
+
+    fn destroy(&self, r: Retired) {
+        unsafe {
+            match r {
+                Retired::Image(image, view, memory) => {
+                    self.device.destroy_image_view(view, None);
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                }
+                Retired::Buffer(buffer, memory) => {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+            }
+        }
+    }
+
+    fn collect(&self) {
+        let done = self.completed();
+        let ready: Vec<Retired> = {
+            let mut list = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+            let (ready, keep) = std::mem::take(&mut *list).into_iter().partition(|(s, _)| *s <= done);
+            *list = keep;
+            ready.into_iter().map(|(_, r)| r).collect()
+        };
+        for r in ready {
+            self.destroy(r);
+        }
+    }
+
+    fn memory_type(&self, bits: u32, flags: vk::MemoryPropertyFlags) -> Option<u32> {
+        (0..self.mem_props.memory_type_count).find(|&i| {
+            bits & (1 << i) != 0 && self.mem_props.memory_types[i as usize].property_flags.contains(flags)
+        })
+    }
+
+    /// A host-visible, coherent buffer, mapped.
+    fn host_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
+        unsafe {
+            let d = &self.device;
+            let buffer = err("buffer", d.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None))?;
+            let req = d.get_buffer_memory_requirements(buffer);
+            let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let Some(ti) = self.memory_type(req.memory_type_bits, host) else {
+                d.destroy_buffer(buffer, None);
+                return Err("no host-visible memory".into());
+            };
+            let alloc = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ti);
+            let memory = match d.allocate_memory(&alloc, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    d.destroy_buffer(buffer, None);
+                    return Err(format!("buffer memory: {e}"));
+                }
+            };
+            let ptr = d
+                .bind_buffer_memory(buffer, memory, 0)
+                .and_then(|_| d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()));
+            match ptr {
+                Ok(p) => Ok((buffer, memory, p as *mut u8)),
+                Err(e) => {
+                    d.destroy_buffer(buffer, None);
+                    d.free_memory(memory, None);
+                    Err(format!("map: {e}"))
+                }
+            }
+        }
+    }
+
+    fn view(&self, image: vk::Image, format: vk::Format, opaque: bool) -> Result<vk::ImageView, String> {
+        let a = if opaque { vk::ComponentSwizzle::ONE } else { vk::ComponentSwizzle::IDENTITY };
+        let info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .components(vk::ComponentMapping { a, ..Default::default() })
+            .subresource_range(COLOR);
+        err("image view", unsafe { self.device.create_image_view(&info, None) })
+    }
+
+    /// The render pass and pipeline for a swapchain format.
+    fn pass(&self, format: vk::Format, readback: bool) -> Result<(vk::RenderPass, vk::Pipeline), String> {
+        let mut passes = self.passes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = passes.iter().find(|p| p.format == format && p.readback == readback) {
+            return Ok((p.render_pass, p.pipeline));
+        }
+        unsafe {
+            let d = &self.device;
+            let final_layout =
+                if readback { vk::ImageLayout::TRANSFER_SRC_OPTIMAL } else { vk::ImageLayout::PRESENT_SRC_KHR };
+            let atts = [vk::AttachmentDescription::default()
+                .format(format)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(final_layout)];
+            let color = [vk::AttachmentReference { attachment: 0, layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL }];
+            let subpasses =
+                [vk::SubpassDescription::default().pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS).color_attachments(&color)];
+            let mut deps = vec![vk::SubpassDependency {
+                src_subpass: vk::SUBPASS_EXTERNAL,
+                dst_subpass: 0,
+                src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                src_access_mask: vk::AccessFlags::empty(),
+                dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dependency_flags: vk::DependencyFlags::empty(),
+            }];
+            if readback {
+                deps.push(vk::SubpassDependency {
+                    src_subpass: 0,
+                    dst_subpass: vk::SUBPASS_EXTERNAL,
+                    src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    dst_stage_mask: vk::PipelineStageFlags::TRANSFER,
+                    src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    dst_access_mask: vk::AccessFlags::TRANSFER_READ,
+                    dependency_flags: vk::DependencyFlags::empty(),
+                });
+            }
+            let rp = vk::RenderPassCreateInfo::default().attachments(&atts).subpasses(&subpasses).dependencies(&deps);
+            let render_pass = err("render pass", d.create_render_pass(&rp, None))?;
+
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(self.vert).name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(self.frag).name(c"main"),
+            ];
+            let vi = vk::PipelineVertexInputStateCreateInfo::default();
+            let ia = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
+            let vp = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
+            let rs = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .line_width(1.0);
+            let ms = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let blend = [vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .alpha_blend_op(vk::BlendOp::ADD)
+                .color_write_mask(vk::ColorComponentFlags::RGBA)];
+            let cb = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend);
+            let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let ds = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
+            let info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vi)
+                .input_assembly_state(&ia)
+                .viewport_state(&vp)
+                .rasterization_state(&rs)
+                .multisample_state(&ms)
+                .color_blend_state(&cb)
+                .dynamic_state(&ds)
+                .layout(self.layout)
+                .render_pass(render_pass)
+                .subpass(0);
+            let pipeline = match d.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) {
+                Ok(p) => p[0],
+                Err((_, e)) => {
+                    d.destroy_render_pass(render_pass, None);
+                    return Err(format!("pipeline: {e}"));
+                }
+            };
+            passes.push(Pass { format, readback, render_pass, pipeline });
+            Ok((render_pass, pipeline))
+        }
+    }
+
+    /// Imports a client's dmabuf planes as a sampled image. All planes must
+    /// live in one buffer object (as Mesa allocates CCS aux planes).
+    pub fn import(
+        self: &Arc<Self>,
+        planes: Vec<(OwnedFd, u32, u32)>,
+        width: i32,
+        height: i32,
+        fourcc: u32,
+        modifier: u64,
+        y_invert: bool,
+    ) -> Result<Dmabuf, String> {
+        let (_, format, opaque) = *FORMATS.iter().find(|f| f.0 == fourcc).ok_or("unsupported format")?;
+        let first = &planes.first().ok_or("no planes")?.0;
+        let ino = |fd: &OwnedFd| unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            (libc::fstat(fd.as_raw_fd(), &mut st) == 0).then_some((st.st_dev, st.st_ino))
+        };
+        if planes.iter().any(|p| ino(&p.0).is_none() || ino(&p.0) != ino(first)) {
+            return Err("planes in separate buffers".into());
+        }
+        let size = unsafe { libc::lseek(first.as_raw_fd(), 0, libc::SEEK_END) };
+        if size > 0 {
+            let (_, off, stride) = planes[0];
+            if off as i64 + stride as i64 * height as i64 > size as i64 || planes.iter().any(|p| p.1 as i64 >= size as i64) {
+                return Err("planes outside the buffer".into());
+            }
+        }
+        let d = &self.device;
+        unsafe {
+            let layouts: Vec<vk::SubresourceLayout> = planes
+                .iter()
+                .map(|&(_, offset, stride)| vk::SubresourceLayout {
+                    offset: offset as u64,
+                    size: 0,
+                    row_pitch: stride as u64,
+                    array_pitch: 0,
+                    depth_pitch: 0,
+                })
+                .collect();
+            let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+                .drm_format_modifier(modifier)
+                .plane_layouts(&layouts);
+            let mut ext =
+                vk::ExternalMemoryImageCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D { width: width as u32, height: height as u32, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .usage(vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .push_next(&mut ext)
+                .push_next(&mut explicit);
+            let image = err("import image", d.create_image(&info, None))?;
+            let fail = |e: String| {
+                d.destroy_image(image, None);
+                Err(e)
+            };
+            let fd = libc::dup(first.as_raw_fd());
+            if fd < 0 {
+                return fail("dup".into());
+            }
+            let mut fdp = vk::MemoryFdPropertiesKHR::default();
+            if let Err(e) = self.memfd_fn.get_memory_fd_properties(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT, fd, &mut fdp) {
+                libc::close(fd);
+                return fail(format!("dmabuf properties: {e}"));
+            }
+            let req = d.get_image_memory_requirements(image);
+            let Some(ti) = self.memory_type(req.memory_type_bits & fdp.memory_type_bits, vk::MemoryPropertyFlags::empty()) else {
+                libc::close(fd);
+                return fail("no memory type for the dmabuf".into());
+            };
+            let mut import =
+                vk::ImportMemoryFdInfoKHR::default().handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT).fd(fd);
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ti)
+                .push_next(&mut import)
+                .push_next(&mut dedicated);
+            // On success Vulkan owns `fd`.
+            let memory = match d.allocate_memory(&alloc, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    libc::close(fd);
+                    return fail(format!("import memory: {e}"));
+                }
+            };
+            if let Err(e) = d.bind_image_memory(image, memory, 0) {
+                d.free_memory(memory, None);
+                return fail(format!("bind: {e}"));
+            }
+            let view = match self.view(image, format, opaque) {
+                Ok(v) => v,
+                Err(e) => {
+                    d.free_memory(memory, None);
+                    return fail(e);
+                }
+            };
+            let poll_fd = OwnedFd::from_raw_fd(libc::dup(first.as_raw_fd()).max(0));
+            drop(planes);
+            Ok(Dmabuf {
+                gpu: self.clone(),
+                width,
+                height,
+                y_invert,
+                image,
+                view,
+                memory,
+                poll_fd,
+                last_use: Cell::new(0),
+            })
+        }
+    }
+}
+
+const COLOR: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
+    aspect_mask: vk::ImageAspectFlags::COLOR,
+    base_mip_level: 0,
+    level_count: 1,
+    base_array_layer: 0,
+    layer_count: 1,
+};
+
+/// A client dmabuf imported as an image. Dropped with its wl_buffer and the
+/// last surface showing it; the image is destroyed once the GPU is done.
+pub struct Dmabuf {
+    gpu: Arc<Gpu>,
+    pub width: i32,
+    pub height: i32,
+    pub y_invert: bool,
+    image: vk::Image,
+    view: vk::ImageView,
+    memory: vk::DeviceMemory,
+    /// For readiness: a dmabuf polls readable once its writers are done.
+    poll_fd: OwnedFd,
+    /// Last serial that sampled the image.
+    last_use: Cell<u64>,
+}
+
+impl Dmabuf {
+    /// Whether the client's rendering into the buffer has finished
+    /// (implicit sync: the dmabuf's write fences have signalled).
+    pub fn ready(&self) -> bool {
+        let mut p = libc::pollfd { fd: self.poll_fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        unsafe { libc::poll(&mut p, 1, 0) == 1 && p.revents & libc::POLLIN != 0 }
+    }
+}
+
+impl Drop for Dmabuf {
+    fn drop(&mut self) {
+        self.gpu.retire(self.last_use.get(), Retired::Image(self.image, self.view, self.memory));
+    }
+}
+
+// ---- per-window swapchain ---------------------------------------------
+
+/// A window's swapchain and per-frame resources. Lives in the window's
+/// `NativeSlot`, so it is torn down (on the UI thread) before the
+/// ANativeWindow is released.
+pub struct Target {
+    gpu: Arc<Gpu>,
+    surface: vk::SurfaceKHR,
+    swapchain: vk::SwapchainKHR,
+    format: vk::Format,
+    extent: (i32, i32),
+    images: Vec<vk::Image>,
+    views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+    /// Signalled by each image's rendering, waited on by its present.
+    rendered: Vec<vk::Semaphore>,
+    acquired: vk::Semaphore,
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    descriptors: vk::DescriptorPool,
+    render_pass: vk::RenderPass,
+    pipeline: vk::Pipeline,
+    readable: bool,
+    readback: Option<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)>,
+    /// Caption rows copied by the last frame: first row, rows, width.
+    band: (i32, i32, i32),
+    last_serial: u64,
+    /// The swapchain must be recreated before the next frame.
+    stale: bool,
+}
+
+// Only used under the slot's mutex.
+unsafe impl Send for Target {}
+
+impl Target {
+    fn new(gpu: Arc<Gpu>, win: *mut ANativeWindow) -> Result<Target, String> {
+        unsafe {
+            let d = &gpu.device;
+            let info = vk::AndroidSurfaceCreateInfoKHR::default().window(win as *mut _);
+            let surface = err("android surface", gpu.android_fn.create_android_surface(&info, None))?;
+            let supported = gpu.surface_fn.get_physical_device_surface_support(gpu.pd, gpu.qfi, surface).unwrap_or(false);
+            if !supported {
+                gpu.surface_fn.destroy_surface(surface, None);
+                return Err("queue cannot present to the window".into());
+            }
+            let pool = err(
+                "command pool",
+                d.create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                        .queue_family_index(gpu.qfi),
+                    None,
+                ),
+            )?;
+            let cmd = err(
+                "command buffer",
+                d.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                ),
+            )?[0];
+            let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: MAX_DRAWS }];
+            let descriptors = err(
+                "descriptor pool",
+                d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(MAX_DRAWS).pool_sizes(&sizes), None),
+            )?;
+            let acquired = err("semaphore", d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))?;
+            Ok(Target {
+                gpu: gpu.clone(),
+                surface,
+                swapchain: vk::SwapchainKHR::null(),
+                format: vk::Format::UNDEFINED,
+                extent: (0, 0),
+                images: Vec::new(),
+                views: Vec::new(),
+                framebuffers: Vec::new(),
+                rendered: Vec::new(),
+                acquired,
+                pool,
+                cmd,
+                descriptors,
+                render_pass: vk::RenderPass::null(),
+                pipeline: vk::Pipeline::null(),
+                readable: false,
+                readback: None,
+                band: (0, 0, 0),
+                last_serial: 0,
+                stale: true,
+            })
+        }
+    }
+
+    /// (Re)creates the swapchain at `w` x `h`. Callers have waited for the
+    /// last frame.
+    fn configure(&mut self, w: i32, h: i32) -> Result<(), String> {
+        let gpu = self.gpu.clone();
+        unsafe {
+            let caps = err("surface caps", gpu.surface_fn.get_physical_device_surface_capabilities(gpu.pd, self.surface))?;
+            let formats = err("surface formats", gpu.surface_fn.get_physical_device_surface_formats(gpu.pd, self.surface))?;
+            let pick = [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM]
+                .iter()
+                .find_map(|f| formats.iter().find(|s| s.format == *f))
+                .ok_or("no RGBA swapchain format")?;
+            let extent = vk::Extent2D {
+                width: (w as u32).clamp(caps.min_image_extent.width, caps.max_image_extent.width.max(1)),
+                height: (h as u32).clamp(caps.min_image_extent.height, caps.max_image_extent.height.max(1)),
+            };
+            let readable = caps.supported_usage_flags.contains(vk::ImageUsageFlags::TRANSFER_SRC);
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+            if readable {
+                usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+            }
+            let mut count = caps.min_image_count.max(3);
+            if caps.max_image_count > 0 {
+                count = count.min(caps.max_image_count);
+            }
+            let supported = caps.supported_composite_alpha.as_raw();
+            let alpha = [vk::CompositeAlphaFlagsKHR::OPAQUE, vk::CompositeAlphaFlagsKHR::INHERIT]
+                .into_iter()
+                .find(|a| caps.supported_composite_alpha.contains(*a))
+                .unwrap_or(vk::CompositeAlphaFlagsKHR::from_raw(supported & supported.wrapping_neg()));
+            let info = vk::SwapchainCreateInfoKHR::default()
+                .surface(self.surface)
+                .min_image_count(count)
+                .image_format(pick.format)
+                .image_color_space(pick.color_space)
+                .image_extent(extent)
+                .image_array_layers(1)
+                .image_usage(usage)
+                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .pre_transform(caps.current_transform)
+                .composite_alpha(alpha)
+                .present_mode(vk::PresentModeKHR::FIFO)
+                .clipped(true)
+                .old_swapchain(self.swapchain);
+            let swapchain = err("swapchain", gpu.swapchain_fn.create_swapchain(&info, None))?;
+            self.destroy_swapchain();
+            self.swapchain = swapchain;
+            self.format = pick.format;
+            self.extent = (extent.width as i32, extent.height as i32);
+            self.readable = readable;
+            (self.render_pass, self.pipeline) = gpu.pass(pick.format, readable)?;
+            self.images = err("swapchain images", gpu.swapchain_fn.get_swapchain_images(swapchain))?;
+            for &image in &self.images {
+                let view = gpu.view(image, pick.format, false)?;
+                self.views.push(view);
+                let atts = [view];
+                let fb = vk::FramebufferCreateInfo::default()
+                    .render_pass(self.render_pass)
+                    .attachments(&atts)
+                    .width(extent.width)
+                    .height(extent.height)
+                    .layers(1);
+                self.framebuffers.push(err("framebuffer", gpu.device.create_framebuffer(&fb, None))?);
+                self.rendered.push(err("semaphore", gpu.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))?);
+            }
+            self.stale = false;
+            log::info!("gpu: swapchain {}x{} {:?}, {} images", extent.width, extent.height, pick.format, self.images.len());
+            Ok(())
+        }
+    }
+
+    fn destroy_swapchain(&mut self) {
+        let d = &self.gpu.device;
+        unsafe {
+            for fb in self.framebuffers.drain(..) {
+                d.destroy_framebuffer(fb, None);
+            }
+            for v in self.views.drain(..) {
+                d.destroy_image_view(v, None);
+            }
+            for s in self.rendered.drain(..) {
+                d.destroy_semaphore(s, None);
+            }
+            self.images.clear();
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.gpu.swapchain_fn.destroy_swapchain(self.swapchain, None);
+                self.swapchain = vk::SwapchainKHR::null();
+            }
+        }
+    }
+
+    /// A buffer for `size` bytes of caption readback.
+    fn ensure_readback(&mut self, size: u64) -> Result<(), String> {
+        if self.readback.is_some_and(|r| r.3 >= size) {
+            return Ok(());
+        }
+        if let Some((b, m, _, _)) = self.readback.take() {
+            self.gpu.destroy(Retired::Buffer(b, m));
+        }
+        let (b, m, p) = self.gpu.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
+        self.readback = Some((b, m, p, size));
+        Ok(())
+    }
+
+    /// The caption rows of frame `serial`, as RGBA (0xAABBGGRR) pixels.
+    fn band_pixels(&self, serial: u64) -> Option<(Vec<u32>, i32, i32, i32)> {
+        let (y0, rows, width) = self.band;
+        let (_, _, ptr, _) = self.readback?;
+        if self.last_serial != serial || rows <= 0 || width <= 0 {
+            return None;
+        }
+        let n = (rows * width) as usize;
+        let mut px = unsafe { std::slice::from_raw_parts(ptr as *const u32, n) }.to_vec();
+        if self.format == vk::Format::B8G8R8A8_UNORM {
+            for v in &mut px {
+                *v = (*v & 0xff00ff00) | ((*v >> 16) & 0xff) | ((*v & 0xff) << 16);
+            }
+        }
+        Some((px, width, y0, rows))
+    }
+
+    /// Draws one frame: uploads, the quads, then the caption readback.
+    /// Returns false if the swapchain was out of date (nothing drawn).
+    fn frame(&mut self, draws: &[Draw], band: (i32, i32), serial: u64) -> Result<bool, String> {
+        let gpu = self.gpu.clone();
+        let d = &gpu.device;
+        let (ew, eh) = self.extent;
+        let y0 = band.0.clamp(0, eh);
+        let rows = band.1.clamp(0, eh - y0);
+        let read = self.readable && rows > 0;
+        if read {
+            self.ensure_readback((ew * rows * 4) as u64)?;
+        }
+        unsafe {
+            let idx = match gpu.swapchain_fn.acquire_next_image(self.swapchain, u64::MAX, self.acquired, vk::Fence::null()) {
+                Ok((i, _)) => i as usize,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.stale = true;
+                    return Ok(false);
+                }
+                Err(e) => return Err(format!("acquire: {e}")),
+            };
+            let cmd = self.cmd;
+            err("reset pool", d.reset_descriptor_pool(self.descriptors, vk::DescriptorPoolResetFlags::empty()))?;
+            err("reset cmd", d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()))?;
+            err(
+                "begin",
+                d.begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                ),
+            )?;
+
+            // Uploads of changed shm textures.
+            for draw in draws {
+                if let Source::Shm { image, staging, width, height, upload: true, .. } = draw.source {
+                    barrier(
+                        d,
+                        cmd,
+                        image,
+                        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                        (vk::PipelineStageFlags::FRAGMENT_SHADER, vk::PipelineStageFlags::TRANSFER),
+                        (vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
+                        None,
+                    );
+                    let region = vk::BufferImageCopy::default()
+                        .image_subresource(LAYER)
+                        .image_extent(vk::Extent3D { width: width as u32, height: height as u32, depth: 1 });
+                    d.cmd_copy_buffer_to_image(cmd, staging, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+                    barrier(
+                        d,
+                        cmd,
+                        image,
+                        (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        (vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER),
+                        (vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
+                        None,
+                    );
+                }
+            }
+            // Client dmabufs: acquire from the client's (foreign) queue.
+            let mut foreign: Vec<vk::Image> = Vec::new();
+            for draw in draws {
+                if let Source::Dmabuf { image, .. } = draw.source {
+                    if !foreign.contains(&image) {
+                        foreign.push(image);
+                    }
+                }
+            }
+            for &image in &foreign {
+                barrier(
+                    d,
+                    cmd,
+                    image,
+                    (vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                    (vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::FRAGMENT_SHADER),
+                    (vk::AccessFlags::empty(), vk::AccessFlags::SHADER_READ),
+                    Some((vk::QUEUE_FAMILY_FOREIGN_EXT, gpu.qfi)),
+                );
+            }
+
+            let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: BACKGROUND } }];
+            let area = vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width: ew as u32, height: eh as u32 } };
+            let rp = vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass)
+                .framebuffer(self.framebuffers[idx])
+                .render_area(area)
+                .clear_values(&clear);
+            d.cmd_begin_render_pass(cmd, &rp, vk::SubpassContents::INLINE);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            let viewport = vk::Viewport { x: 0.0, y: 0.0, width: ew as f32, height: eh as f32, min_depth: 0.0, max_depth: 1.0 };
+            d.cmd_set_viewport(cmd, 0, &[viewport]);
+            d.cmd_set_scissor(cmd, 0, &[area]);
+            let layouts = [gpu.dsl];
+            for draw in draws.iter().take(MAX_DRAWS as usize) {
+                let alloc = vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.descriptors).set_layouts(&layouts);
+                let Ok(sets) = d.allocate_descriptor_sets(&alloc) else { break };
+                let info = [vk::DescriptorImageInfo::default()
+                    .image_view(draw.source.view())
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let write = vk::WriteDescriptorSet::default()
+                    .dst_set(sets[0])
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&info);
+                d.update_descriptor_sets(&[write], &[]);
+                d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, gpu.layout, 0, &sets, &[]);
+                let [x0, y0, x1, y1] = draw.dst;
+                let ndc = |v: i32, size: i32| v as f32 / size as f32 * 2.0 - 1.0;
+                let pc: [f32; 8] =
+                    [ndc(x0, ew), ndc(y0, eh), ndc(x1, ew), ndc(y1, eh), draw.uv[0], draw.uv[1], draw.uv[2], draw.uv[3]];
+                let bytes = std::slice::from_raw_parts(pc.as_ptr() as *const u8, 32);
+                d.cmd_push_constants(cmd, gpu.layout, vk::ShaderStageFlags::VERTEX, 0, bytes);
+                d.cmd_draw(cmd, 4, 1, 0, 0);
+            }
+            d.cmd_end_render_pass(cmd);
+
+            if self.readable {
+                let image = self.images[idx];
+                if read {
+                    let (buffer, ..) = self.readback.unwrap();
+                    let region = vk::BufferImageCopy::default()
+                        .image_subresource(LAYER)
+                        .image_offset(vk::Offset3D { x: 0, y: y0, z: 0 })
+                        .image_extent(vk::Extent3D { width: ew as u32, height: rows as u32, depth: 1 });
+                    d.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
+                    let host = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(buffer)
+                        .size(vk::WHOLE_SIZE);
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[host],
+                        &[],
+                    );
+                }
+                barrier(
+                    d,
+                    cmd,
+                    image,
+                    (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR),
+                    (vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE),
+                    (vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::empty()),
+                    None,
+                );
+            }
+            // Hand the client's buffers back.
+            for &image in &foreign {
+                barrier(
+                    d,
+                    cmd,
+                    image,
+                    (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::GENERAL),
+                    (vk::PipelineStageFlags::FRAGMENT_SHADER, vk::PipelineStageFlags::BOTTOM_OF_PIPE),
+                    (vk::AccessFlags::SHADER_READ, vk::AccessFlags::empty()),
+                    Some((gpu.qfi, vk::QUEUE_FAMILY_FOREIGN_EXT)),
+                );
+            }
+            err("end", d.end_command_buffer(cmd))?;
+
+            let waits = [self.acquired];
+            let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER];
+            let signals = [self.rendered[idx], gpu.timeline];
+            let values = [0, serial];
+            let mut tl = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&[0]).signal_semaphore_values(&values);
+            let cmds = [cmd];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(&waits)
+                .wait_dst_stage_mask(&stages)
+                .command_buffers(&cmds)
+                .signal_semaphores(&signals)
+                .push_next(&mut tl);
+            err("submit", d.queue_submit(gpu.queue, &[submit], vk::Fence::null()))?;
+            self.last_serial = serial;
+            self.band = if read { (y0, rows, ew) } else { (0, 0, 0) };
+
+            let present_waits = [self.rendered[idx]];
+            let swapchains = [self.swapchain];
+            let indices = [idx as u32];
+            let present =
+                vk::PresentInfoKHR::default().wait_semaphores(&present_waits).swapchains(&swapchains).image_indices(&indices);
+            match gpu.swapchain_fn.queue_present(gpu.queue, &present) {
+                Ok(false) => {}
+                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.stale = true,
+                Err(e) => log::warn!("gpu: present: {e}"),
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        let gpu = self.gpu.clone();
+        gpu.wait(self.last_serial);
+        self.destroy_swapchain();
+        unsafe {
+            let d = &gpu.device;
+            if let Some((b, m, _, _)) = self.readback.take() {
+                gpu.destroy(Retired::Buffer(b, m));
+            }
+            d.destroy_semaphore(self.acquired, None);
+            d.destroy_descriptor_pool(self.descriptors, None);
+            d.destroy_command_pool(self.pool, None);
+            gpu.surface_fn.destroy_surface(self.surface, None);
+        }
+    }
+}
+
+const LAYER: vk::ImageSubresourceLayers =
+    vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn barrier(
+    d: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    layouts: (vk::ImageLayout, vk::ImageLayout),
+    stages: (vk::PipelineStageFlags, vk::PipelineStageFlags),
+    access: (vk::AccessFlags, vk::AccessFlags),
+    queues: Option<(u32, u32)>,
+) {
+    let (src_q, dst_q) = queues.unwrap_or((vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED));
+    let b = vk::ImageMemoryBarrier::default()
+        .old_layout(layouts.0)
+        .new_layout(layouts.1)
+        .src_access_mask(access.0)
+        .dst_access_mask(access.1)
+        .src_queue_family_index(src_q)
+        .dst_queue_family_index(dst_q)
+        .image(image)
+        .subresource_range(COLOR);
+    unsafe { d.cmd_pipeline_barrier(cmd, stages.0, stages.1, vk::DependencyFlags::empty(), &[], &[], &[b]) };
+}
+
+// ---- the renderer ------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Source {
+    Dmabuf { image: vk::Image, view: vk::ImageView },
+    Shm { image: vk::Image, view: vk::ImageView, staging: vk::Buffer, width: i32, height: i32, upload: bool },
+}
+
+impl Source {
+    fn view(&self) -> vk::ImageView {
+        match *self {
+            Source::Dmabuf { view, .. } | Source::Shm { view, .. } => view,
+        }
+    }
+}
+
+struct Draw {
+    source: Source,
+    /// Destination in px: x0, y0, x1, y1.
+    dst: [i32; 4],
+    uv: [f32; 4],
+}
+
+/// A wl_shm texture on the GPU, per surface.
+struct ShmTex {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    staging: vk::Buffer,
+    staging_mem: vk::DeviceMemory,
+    ptr: *mut u8,
+    size: (i32, i32),
+    /// Texture serial last copied to staging.
+    uploaded: u64,
+    last_use: u64,
+}
+
+/// Compositor-thread state of the GPU path.
+pub struct Renderer {
+    pub gpu: Arc<Gpu>,
+    shm: HashMap<ObjectId, ShmTex>,
+    serial: u64,
+    /// Submitted frames whose caption readback is still to be read.
+    frames: Vec<(u64, u32)>,
+    /// Client buffers to release once the GPU is done with them.
+    releases: Vec<(u64, WlBuffer)>,
+    /// A window was skipped because a client buffer was still being drawn.
+    deferred: bool,
+}
+
+impl Renderer {
+    pub fn new() -> Result<Renderer, String> {
+        let gpu = Gpu::new()?;
+        let serial = gpu.completed();
+        Ok(Renderer { gpu, shm: HashMap::new(), serial, frames: Vec::new(), releases: Vec::new(), deferred: false })
+    }
+
+    /// Whether the event loop should wake up again soon (frames in flight
+    /// or a window waiting for a client's buffer).
+    pub fn busy(&self) -> bool {
+        self.deferred || !self.frames.is_empty() || !self.releases.is_empty()
+    }
+
+    pub fn forget_surface(&mut self, sid: &ObjectId) {
+        if let Some(t) = self.shm.remove(sid) {
+            self.retire_shm(t);
+        }
+    }
+
+    fn retire_shm(&self, t: ShmTex) {
+        self.gpu.retire(t.last_use, Retired::Image(t.image, t.view, t.memory));
+        self.gpu.retire(t.last_use, Retired::Buffer(t.staging, t.staging_mem));
+    }
+
+    /// Releases a client buffer once the GPU no longer reads it.
+    pub fn release(&mut self, buffer: WlBuffer, d: &Dmabuf) {
+        let serial = d.last_use.get();
+        if serial <= self.gpu.completed() {
+            buffer.release();
+        } else {
+            self.releases.push((serial, buffer));
+        }
+    }
+
+    /// The GPU image for a surface's shm texture, staged for upload if it
+    /// changed since the last frame.
+    fn shm_source(&mut self, sid: &ObjectId, t: &Texture) -> Result<Source, String> {
+        let (w, h) = (t.width, t.height);
+        if t.data.len() < (w * h) as usize {
+            return Err("short texture".into());
+        }
+        if self.shm.get(sid).is_some_and(|s| s.size != (w, h)) {
+            let old = self.shm.remove(sid).unwrap();
+            self.retire_shm(old);
+        }
+        if !self.shm.contains_key(sid) {
+            let tex = self.create_shm(w, h)?;
+            self.shm.insert(sid.clone(), tex);
+        }
+        let s = self.shm.get_mut(sid).unwrap();
+        let upload = s.uploaded != t.serial;
+        if upload {
+            // The staging buffer may still feed the previous upload.
+            self.gpu.wait(s.last_use);
+            unsafe { std::ptr::copy_nonoverlapping(t.data.as_ptr() as *const u8, s.ptr, (w * h * 4) as usize) };
+            s.uploaded = t.serial;
+        }
+        Ok(Source::Shm { image: s.image, view: s.view, staging: s.staging, width: w, height: h, upload })
+    }
+
+    fn create_shm(&self, w: i32, h: i32) -> Result<ShmTex, String> {
+        let gpu = &self.gpu;
+        let d = &gpu.device;
+        let format = vk::Format::R8G8B8A8_UNORM;
+        unsafe {
+            let info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D { width: w as u32, height: h as u32, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = err("texture", d.create_image(&info, None))?;
+            let req = d.get_image_memory_requirements(image);
+            let Some(ti) = gpu.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL) else {
+                d.destroy_image(image, None);
+                return Err("no device memory".into());
+            };
+            let memory = match d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ti), None) {
+                Ok(m) => m,
+                Err(e) => {
+                    d.destroy_image(image, None);
+                    return Err(format!("texture memory: {e}"));
+                }
+            };
+            let view = d.bind_image_memory(image, memory, 0).map_err(|e| e.to_string()).and_then(|_| gpu.view(image, format, false));
+            let view = match view {
+                Ok(v) => v,
+                Err(e) => {
+                    d.destroy_image(image, None);
+                    d.free_memory(memory, None);
+                    return Err(e);
+                }
+            };
+            let (staging, staging_mem, ptr) = match gpu.host_buffer((w * h * 4) as u64, vk::BufferUsageFlags::TRANSFER_SRC) {
+                Ok(b) => b,
+                Err(e) => {
+                    gpu.destroy(Retired::Image(image, view, memory));
+                    return Err(e);
+                }
+            };
+            Ok(ShmTex { image, memory, view, staging, staging_mem, ptr, size: (w, h), uploaded: 0, last_use: 0 })
+        }
+    }
+
+    /// Finished frames: caption analysis from their readback, buffer
+    /// releases and deferred destruction.
+    fn collect(&mut self, st: &mut State) {
+        self.gpu.collect();
+        let done = self.gpu.completed();
+        self.releases.retain(|(s, b)| {
+            if *s > done {
+                return true;
+            }
+            if b.is_alive() {
+                b.release();
+            }
+            false
+        });
+        let (finished, pending): (Vec<_>, Vec<_>) = self.frames.drain(..).partition(|(s, _)| *s <= done);
+        self.frames = pending;
+        for (serial, win) in finished {
+            let slot = st.shared.slots.lock().ok().and_then(|s| s.get(&win).cloned());
+            let Some(slot) = slot else { continue };
+            let band = slot.with_target(|_, t| t.as_ref().and_then(|t| t.band_pixels(serial))).flatten();
+            if let Some((rows, width, y0, n)) = band {
+                let band = Band { rows: &rows, width, stride: width as usize, y0, y1: y0 + n };
+                crate::render::caption_feedback(st, win, &band);
+            }
+        }
+    }
+
+    fn render_window(&mut self, st: &mut State, id: u32) {
+        let Some(w) = st.windows.get(&id) else { return };
+        let slot = st.shared.slot(id);
+        if !slot.is_attached() {
+            return;
+        }
+        let display = w.display;
+        let list = st.paint_list(w);
+        for (sid, _, _) in &list {
+            crate::output::ensure_scale(st, sid, display);
+        }
+        // Latch only finished client frames, so a slow client cannot stall
+        // the queue that every window shares.
+        let busy = list.iter().any(|(sid, _, _)| {
+            st.surfaces.get(sid).and_then(|s| s.texture.as_ref()).and_then(|t| t.dmabuf.as_ref()).is_some_and(|(_, d)| !d.ready())
+        });
+        if busy {
+            self.deferred = true;
+            return;
+        }
+        let scale = st.window_scale(id);
+        let Some(w) = st.windows.get(&id) else { return };
+        let (pw, ph) = w.px;
+        let top = w.caption.top;
+        let band = (w.caption.top, w.caption.height);
+        let mut draws = Vec::new();
+        for (sid, ox, oy) in &list {
+            let Some(s) = st.surfaces.get(sid) else { continue };
+            let (Some(t), Some((lw, lh)), Some(src)) = (&s.texture, s.logical_size(), s.source_rect()) else { continue };
+            // Edges are rounded separately so adjacent surfaces meet exactly.
+            let (x, y) = (to_px(*ox as f64, scale), to_px(*oy as f64, scale) + top);
+            let (x1, y1) = (to_px((ox + lw) as f64, scale), to_px((oy + lh) as f64, scale) + top);
+            if x1 <= x || y1 <= y || t.width <= 0 || t.height <= 0 || src[2] <= 0.0 || src[3] <= 0.0 {
+                continue;
+            }
+            let (tw, th) = (t.width as f64, t.height as f64);
+            let mut uv = [src[0] / tw, src[1] / th, (src[0] + src[2]) / tw, (src[1] + src[3]) / th].map(|v| v as f32);
+            let source = match &t.dmabuf {
+                Some((_, d)) => {
+                    if d.y_invert {
+                        (uv[1], uv[3]) = (1.0 - uv[1], 1.0 - uv[3]);
+                    }
+                    Source::Dmabuf { image: d.image, view: d.view }
+                }
+                None => match self.shm_source(sid, t) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("gpu: texture: {e}");
+                        continue;
+                    }
+                },
+            };
+            draws.push(Draw { source, dst: [x, y, x1, y1], uv });
+        }
+
+        let serial = self.serial + 1;
+        let gpu = self.gpu.clone();
+        let result = slot.with_target(|win, target| -> Result<bool, String> {
+            if target.is_none() {
+                *target = Some(Target::new(gpu.clone(), win)?);
+            }
+            let t = target.as_mut().unwrap();
+            gpu.wait(t.last_serial);
+            if t.stale || t.extent != (pw, ph) {
+                t.configure(pw, ph)?;
+            }
+            t.frame(&draws, band, serial)
+        });
+        match result {
+            Some(Ok(true)) => {}
+            Some(Ok(false)) => {
+                self.deferred = true;
+                return;
+            }
+            Some(Err(e)) => {
+                log::warn!("gpu: toplevel {id}: {e}");
+                return;
+            }
+            None => return,
+        }
+        self.serial = serial;
+        self.frames.push((serial, id));
+        let now = st.now_ms();
+        for (sid, _, _) in &list {
+            if let Some(t) = self.shm.get_mut(sid) {
+                t.last_use = serial;
+            }
+            if let Some(s) = st.surfaces.get_mut(sid) {
+                if let Some((_, d)) = s.texture.as_ref().and_then(|t| t.dmabuf.as_ref()) {
+                    d.last_use.set(serial);
+                }
+                for cb in s.frame_cbs.drain(..) {
+                    cb.done(now);
+                }
+            }
+        }
+        if let Some(w) = st.windows.get_mut(&id) {
+            w.dirty = false;
+        }
+    }
+}
+
+pub fn render_dirty(st: &mut State) {
+    let Some(mut r) = st.gpu.take() else { return };
+    r.collect(st);
+    r.deferred = false;
+    let dirty: Vec<u32> = st.windows.values().filter(|w| w.dirty && w.mapped && w.px.0 > 0).map(|w| w.id).collect();
+    for id in dirty {
+        r.render_window(st, id);
+    }
+    st.gpu = Some(r);
+}

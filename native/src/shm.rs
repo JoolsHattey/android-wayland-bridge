@@ -8,12 +8,12 @@ use std::cell::RefCell;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use wayland_server::protocol::{wl_buffer, wl_shm, wl_shm_pool};
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum};
 
-use crate::state::{State, guard};
+use crate::state::{Buffer, State, guard};
 
 pub struct Pool {
     ptr: *mut u8,
@@ -68,12 +68,23 @@ pub struct BufferInfo {
 }
 
 /// A surface's committed pixels, converted to RGBA byte order (as u32 LE:
-/// 0xAABBGGRR), premultiplied like wl_shm ARGB.
+/// 0xAABBGGRR), premultiplied like wl_shm ARGB. A dmabuf texture has no
+/// pixels here: the GPU samples the client's buffer, which is held (not
+/// released) while the texture lives.
 pub struct Texture {
     pub width: i32,
     pub height: i32,
     pub data: Vec<u32>,
     pub opaque: bool,
+    pub dmabuf: Option<(wl_buffer::WlBuffer, Rc<crate::gpu::Dmabuf>)>,
+    /// Unique per commit, so the GPU path uploads each shm texture once.
+    pub serial: u64,
+}
+
+static TEXTURE_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_texture_serial() -> u64 {
+    TEXTURE_SERIAL.fetch_add(1, Ordering::Relaxed)
 }
 
 // ---- SIGBUS protection -------------------------------------------------
@@ -169,7 +180,7 @@ impl BufferInfo {
         if FAULTED.swap(false, Ordering::SeqCst) {
             return None;
         }
-        Some(Texture { width: self.width, height: self.height, data, opaque })
+        Some(Texture { width: self.width, height: self.height, data, opaque, dmabuf: None, serial: next_texture_serial() })
     }
 }
 
@@ -241,7 +252,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for State {
                 }
                 st.buffers.insert(
                     buf.id(),
-                    BufferInfo { pool, offset: offset as usize, width, height, stride: stride as usize, format },
+                    Buffer::Shm(BufferInfo { pool, offset: offset as usize, width, height, stride: stride as usize, format }),
                 );
             }
             wl_shm_pool::Request::Resize { size } => {

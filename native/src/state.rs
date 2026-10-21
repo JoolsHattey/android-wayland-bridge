@@ -21,6 +21,12 @@ use crate::output::{Outputs, to_logical};
 use crate::seat::Seat;
 use crate::shell::Positioner;
 use crate::shm::{BufferInfo, Pool};
+
+/// What a wl_buffer is backed by.
+pub enum Buffer {
+    Shm(BufferInfo),
+    Dmabuf(Rc<crate::gpu::Dmabuf>),
+}
 use crate::surface::{RegionOp, Surface};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -95,7 +101,7 @@ pub struct State {
     pub surfaces: HashMap<ObjectId, Surface>,
     pub regions: HashMap<ObjectId, Vec<RegionOp>>,
     pub pools: HashMap<ObjectId, Rc<RefCell<Pool>>>,
-    pub buffers: HashMap<ObjectId, BufferInfo>,
+    pub buffers: HashMap<ObjectId, Buffer>,
     pub positioners: HashMap<ObjectId, Positioner>,
     pub xdg_surfaces: HashMap<ObjectId, XdgSurf>,
     pub windows: HashMap<u32, Window>,
@@ -103,6 +109,8 @@ pub struct State {
     pub next_window: u32,
     pub seat: Seat,
     pub outputs: Outputs,
+    /// The Vulkan renderer; None draws on the CPU (and offers no dmabuf).
+    pub gpu: Option<crate::gpu::Renderer>,
 }
 
 /// Runs a request handler, turning a panic into a disconnect of the client
@@ -141,6 +149,7 @@ impl State {
             next_window: 1,
             seat: Seat::default(),
             outputs: Outputs::default(),
+            gpu: None,
         }
     }
 

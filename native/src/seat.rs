@@ -328,7 +328,8 @@ pub fn cursor_committed(st: &mut State, sid: &ObjectId) {
     }
     let Some((_, win)) = st.seat.ptr_focus.clone() else { return };
     let Some(s) = st.surfaces.get(sid) else { return };
-    let Some(t) = &s.texture else { return };
+    // A dmabuf cursor has no CPU pixels for a PointerIcon.
+    let Some(t) = s.texture.as_ref().filter(|t| t.dmabuf.is_none()) else { return };
     let bs = s.buffer_scale.max(1);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (t.width, t.height, hx, hy, win).hash(&mut h);

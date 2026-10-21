@@ -8,6 +8,7 @@ description = "Wayland compositor that maps each toplevel to its own Android win
 crate-type = ["cdylib"]
 
 [dependencies]
+ash = "0.38"
 wayland-server = "0.31"
 wayland-protocols = { version = "0.32", features = ["server", "unstable", "staging"] }
 jni = "0.21"

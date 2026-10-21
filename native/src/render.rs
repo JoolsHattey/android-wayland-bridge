@@ -1,4 +1,5 @@
-//! CPU compositing of a window's surfaces into its Android surface.
+//! CPU compositing of a window's surfaces into its Android surface, and the
+//! caption analysis both renderers share.
 
 use crate::Caption;
 use crate::android::Frame;
@@ -89,23 +90,39 @@ fn blit(frame: &mut Frame, t: &Texture, src: [f64; 4], dst: [i32; 4], opaque_cop
     }
 }
 
+/// Composited rows `y0..y1` of a window (RGBA, 0xAABBGGRR): the whole CPU
+/// frame, or the caption band the GPU path reads back.
+pub struct Band<'a> {
+    pub rows: &'a [u32],
+    pub width: i32,
+    pub stride: usize,
+    pub y0: i32,
+    pub y1: i32,
+}
+
+impl Band<'_> {
+    #[inline]
+    fn at(&self, x: i32, y: i32) -> u32 {
+        self.rows[(y - self.y0) as usize * self.stride + x as usize]
+    }
+}
+
 /// Mean luma of the caption strip under the system controls.
-fn caption_is_light(frame: &Frame, c: &Caption) -> Option<bool> {
-    if c.height <= 0 {
+fn caption_is_light(band: &Band, c: &Caption) -> Option<bool> {
+    if c.height <= 0 || band.y1 <= band.y0 {
         return None;
     }
     let rects = &c.controls;
     let (mut sum, mut n) = (0u64, 0u64);
-    let y = (c.top + c.height / 2).clamp(0, frame.height - 1);
-    let row = &frame.pixels[y as usize * frame.stride as usize..][..frame.width as usize];
+    let y = (c.top + c.height / 2).clamp(band.y0, band.y1 - 1);
     let spans: Vec<(i32, i32)> = if rects.is_empty() {
-        vec![(frame.width * 3 / 4, frame.width)]
+        vec![(band.width * 3 / 4, band.width)]
     } else {
         rects.iter().map(|r| (r[0], r[0] + r[2])).collect()
     };
     for (a, b) in spans {
-        for x in (a.max(0)..b.min(frame.width)).step_by(4) {
-            let v = row[x as usize];
+        for x in (a.max(0)..b.min(band.width)).step_by(4) {
+            let v = band.at(x, y);
             let (r, g, b) = (v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff);
             sum += (r * 299 + g * 587 + b * 114) as u64 / 1000;
             n += 1;
@@ -118,29 +135,29 @@ fn caption_is_light(frame: &Frame, c: &Caption) -> Option<bool> {
 /// icons, labels, entries, hovered buttons) and empty header the system may
 /// drag the window by. A column is empty if it is one uniform colour from
 /// top to bottom of the band. Returns exclusion rects in px.
-fn header_exclusion(frame: &Frame, c: &Caption) -> Vec<[i32; 4]> {
+fn header_exclusion(band: &Band, c: &Caption) -> Vec<[i32; 4]> {
     const MARGIN: i32 = 6;
-    let (y0, y1) = (c.top.max(0), (c.top + c.height).min(frame.height));
+    let (y0, y1) = (c.top.max(band.y0), (c.top + c.height).min(band.y1));
     if y1 - y0 < 4 {
         return Vec::new();
     }
-    let stride = frame.stride as usize;
     let busy = |x: i32| {
-        let first = frame.pixels[y0 as usize * stride + x as usize];
-        (y0 + 1..y1).step_by(2).any(|y| frame.pixels[y as usize * stride + x as usize] != first)
+        let first = band.at(x, y0);
+        (y0 + 1..y1).step_by(2).any(|y| band.at(x, y) != first)
     };
+    let width = band.width;
     let mut spans: Vec<(i32, i32)> = Vec::new();
     let mut x = 0;
-    while x < frame.width {
+    while x < width {
         if !busy(x) {
             x += 1;
             continue;
         }
         let start = x;
-        while x < frame.width && busy(x) {
+        while x < width && busy(x) {
             x += 1;
         }
-        let (a, b) = ((start - MARGIN).max(0), (x + MARGIN).min(frame.width));
+        let (a, b) = ((start - MARGIN).max(0), (x + MARGIN).min(width));
         match spans.last_mut() {
             // Gaps too narrow to grab are not worth leaving to the system.
             Some(last) if a - last.1 < 2 * MARGIN => last.1 = b,
@@ -150,7 +167,28 @@ fn header_exclusion(frame: &Frame, c: &Caption) -> Vec<[i32; 4]> {
     spans.into_iter().map(|(a, b)| [a, y0, b - a, y1 - y0]).collect()
 }
 
+/// Updates a window's control colour and gesture exclusion from its
+/// composited caption.
+pub fn caption_feedback(st: &mut State, id: u32, band: &Band) {
+    let Some(w) = st.windows.get_mut(&id) else { return };
+    let light = caption_is_light(band, &w.caption);
+    if light.is_some() && light != w.caption_light {
+        w.caption_light = light;
+        st.host.caption_light(id, light.unwrap());
+    }
+    if w.caption.auto_exclusion {
+        let ex = header_exclusion(band, &w.caption);
+        if ex != w.exclusion {
+            w.exclusion = ex.clone();
+            st.host.exclusion(id, &ex);
+        }
+    }
+}
+
 pub fn render_dirty(st: &mut State) {
+    if st.gpu.is_some() {
+        return crate::gpu::render_dirty(st);
+    }
     let dirty: Vec<u32> = st.windows.values().filter(|w| w.dirty && w.mapped && w.px.0 > 0).map(|w| w.id).collect();
     for id in dirty {
         render_window(st, id);
@@ -172,15 +210,19 @@ fn render_window(st: &mut State, id: u32) {
     let scale = st.window_scale(id);
     let Some(w) = st.windows.get(&id) else { return };
     let (pw, ph) = w.px;
-    let caption = w.caption.clone();
-    let top = caption.top;
-    let mut light = None;
-    let mut exclusion = None;
+    let top = w.caption.top;
+    let caption_rows = (top, top + w.caption.height);
+    // The caption rows, kept for the analysis after posting: pixels, width,
+    // stride, first row, end row.
+    let mut band = (Vec::new(), 0, 0, 0, 0);
     let drawn = slot.draw(pw, ph, |frame| {
         let mut first = true;
         for (sid, ox, oy) in &list {
             let Some(s) = st.surfaces.get(sid) else { continue };
             let (Some(t), Some((lw, lh)), Some(src)) = (&s.texture, s.logical_size(), s.source_rect()) else { continue };
+            if t.data.len() < (t.width * t.height) as usize {
+                continue;
+            }
             // Edges are rounded separately so adjacent surfaces meet exactly.
             let (x, y) = (to_px(*ox as f64, scale), to_px(*oy as f64, scale) + top);
             let (x1, y1) = (to_px((ox + lw) as f64, scale), to_px((oy + lh) as f64, scale) + top);
@@ -201,10 +243,10 @@ fn render_window(st: &mut State, id: u32) {
                 row.fill(BACKGROUND);
             }
         }
-        light = caption_is_light(frame, &caption);
-        if caption.auto_exclusion {
-            exclusion = Some(header_exclusion(frame, &caption));
-        }
+        let (y0, y1) = (caption_rows.0.clamp(0, frame.height), caption_rows.1.clamp(0, frame.height));
+        let stride = frame.stride as usize;
+        let rows = frame.pixels[y0 as usize * stride..y1 as usize * stride].to_vec();
+        band = (rows, frame.width, stride, y0, y1);
     });
     if !drawn {
         return;
@@ -219,12 +261,6 @@ fn render_window(st: &mut State, id: u32) {
     }
     let Some(w) = st.windows.get_mut(&id) else { return };
     w.dirty = false;
-    if light.is_some() && light != w.caption_light {
-        w.caption_light = light;
-        st.host.caption_light(id, light.unwrap());
-    }
-    if let Some(ex) = exclusion.filter(|ex| *ex != w.exclusion) {
-        w.exclusion = ex.clone();
-        st.host.exclusion(id, &ex);
-    }
+    let (rows, width, stride, y0, y1) = band;
+    caption_feedback(st, id, &Band { rows: &rows, width, stride, y0, y1 });
 }

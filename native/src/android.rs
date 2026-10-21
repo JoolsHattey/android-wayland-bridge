@@ -1,4 +1,5 @@
-//! Thin NDK bindings: logcat logging and ANativeWindow CPU rendering.
+//! Thin NDK bindings: logcat logging and the Android surfaces windows draw
+//! into (CPU locking, or a Vulkan swapchain).
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::Mutex;
@@ -81,10 +82,20 @@ struct Win {
     ptr: *mut ANativeWindow,
     /// Buffer geometry last set, so it is only changed on resize.
     geometry: (i32, i32),
+    /// The GPU path's swapchain on this window.
+    target: Option<crate::gpu::Target>,
 }
 
 // The pointer is only used under the slot's mutex.
 unsafe impl Send for Win {}
+
+impl Drop for Win {
+    fn drop(&mut self) {
+        // The swapchain goes first: it must not outlive its window.
+        self.target = None;
+        unsafe { ANativeWindow_release(self.ptr) };
+    }
+}
 
 /// One Android surface (an Activity's SurfaceView), shared between the UI
 /// thread (attach/detach) and the compositor thread (draw).
@@ -105,19 +116,22 @@ impl NativeSlot {
     pub fn attach(&self, env: &JNIEnv, surface: &JObject) {
         let ptr = unsafe { ANativeWindow_fromSurface(env.get_raw(), surface.as_raw()) };
         let mut g = self.win.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = g.take() {
-            unsafe { ANativeWindow_release(old.ptr) };
-        }
+        *g = None;
         if !ptr.is_null() {
-            *g = Some(Win { ptr, geometry: (0, 0) });
+            *g = Some(Win { ptr, geometry: (0, 0), target: None });
         }
     }
 
     pub fn detach(&self) {
+        *self.win.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Runs `f` on the attached window and its swapchain slot, under the
+    /// lock. None if no surface is attached.
+    pub fn with_target<R>(&self, f: impl FnOnce(*mut ANativeWindow, &mut Option<crate::gpu::Target>) -> R) -> Option<R> {
         let mut g = self.win.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = g.take() {
-            unsafe { ANativeWindow_release(old.ptr) };
-        }
+        let win = g.as_mut()?;
+        Some(f(win.ptr, &mut win.target))
     }
 
     pub fn is_attached(&self) -> bool {

@@ -3,6 +3,8 @@
 //! thread, everything Wayland lives on one compositor thread (see `server`).
 
 mod android;
+mod dmabuf;
+mod gpu;
 mod host;
 mod output;
 mod portal;

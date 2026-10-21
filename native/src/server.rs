@@ -5,6 +5,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
@@ -57,6 +58,26 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
     dh.create_global::<State, XdgWmBase, ()>(6, ());
     dh.create_global::<State, ZxdgDecorationManagerV1, ()>(1, ());
 
+    // `renderer=cpu` in awb.properties keeps the CPU compositor.
+    let gpu = if setting(&cfg.socket_path, "renderer").as_deref() == Some("cpu") {
+        log::info!("renderer: cpu (awb.properties)");
+        None
+    } else {
+        match crate::gpu::Renderer::new() {
+            Ok(r) => {
+                log::info!("renderer: vulkan");
+                Some(r)
+            }
+            Err(e) => {
+                log::warn!("renderer: cpu ({e})");
+                None
+            }
+        }
+    };
+    if gpu.is_some() {
+        dh.create_global::<State, ZwpLinuxDmabufV1, ()>(4, ());
+    }
+
     let path = PathBuf::from(&cfg.socket_path);
     let _ = std::fs::remove_file(&path);
     let listener = match ListeningSocket::bind_absolute(path.clone()) {
@@ -74,6 +95,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
     log::info!("listening on {}", path.display());
 
     let mut st = State::new(dh.clone(), shared.clone(), host);
+    st.gpu = gpu;
 
     loop {
         let mut fds = [
@@ -81,7 +103,9 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
             libc::pollfd { fd: display.backend().poll_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: shared.wake_fd, events: libc::POLLIN, revents: 0 },
         ];
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        // While frames are in flight, check back for their completion.
+        let timeout = if st.gpu.as_ref().is_some_and(|g| g.busy()) { 2 } else { -1 };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
         if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             log::error!("poll failed: {}", std::io::Error::last_os_error());
             return;
@@ -114,6 +138,16 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
         }
         let _ = display.flush_clients();
     }
+}
+
+/// A value from awb.properties, next to the socket.
+fn setting(socket_path: &str, name: &str) -> Option<String> {
+    let path = std::path::Path::new(socket_path).with_file_name("awb.properties");
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        (k.trim() == name).then(|| v.trim().to_string())
+    })
 }
 
 fn handle_cmd(st: &mut State, cmd: Cmd) {
