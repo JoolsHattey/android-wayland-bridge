@@ -511,6 +511,11 @@ worst case before the copy) ran 16 out of 16 without a stall.
     wheels: `axis_source(wheel)`, `axis_value120` for v8+ clients, whole
     `axis_discrete` steps (fractions add up) for v5-7, and `axis` at 15
     logical px per notch.
+  - Axis events go out in a frame of their own, with a `motion` (in an
+    earlier frame) only if the pointer moved. GTK delivers a frame's
+    motion or crossing event instead of its scroll
+    (`gdk_wayland_seat_flush_frame_event`), so a scroll sharing a frame
+    with a motion never reached GTK apps (GNOME Console didn't scroll).
   - A touchpad's two-finger scroll reaches the view as a fake finger with
     `CLASSIFICATION_TWO_FINGER_SWIPE`. Its `AXIS_GESTURE_SCROLL_{X,Y}_DISTANCE`
     (px, already in the user's scrolling direction) become
