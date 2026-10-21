@@ -1,15 +1,27 @@
+import com.android.ide.common.vectordrawable.Svg2Vector
+import java.io.ByteArrayOutputStream
+
 plugins {
     id("com.android.application")
 }
 
 // The app of one Linux app: its launcher icon, the Android tasks of its
-// windows (the activities come from :window), and its URL schemes. Built as
-//   gradlew :stub:assembleDebug -Pstub.appId=<desktop id> -Pstub.label=<name> -Pstub.icon=<png> \
-//       -Pstub.schemes=<scheme,...>
+// windows, and its URL schemes. Built as
+//   gradlew :stub:assembleDebug -Pstub.appId=<desktop id> -Pstub.label=<name> -Pstub.icon=<png or svg> \
+//       -Pstub.schemes=<scheme,...> -Pstub.stamp=<stamp>
 // scripts/install-stub.sh fills these in from the chroot's desktop file.
+//
+// It has no window code of its own: its activities are dev.awb's (:window),
+// loaded at run time from the installed dev.awb (StubComponentFactory), so
+// stubs follow dev.awb's updates. Only a change to what this manifest
+// declares needs new stubs: bump stubFormat (and Window.STUB_FORMAT), and
+// scripts/sync-stubs.sh (run by deploy.sh) rebuilds the installed ones.
+val stubFormat = 2
 val linuxAppId = providers.gradleProperty("stub.appId").getOrElse("org.gnome.Adwaita1.Demo")
 val label = providers.gradleProperty("stub.label").getOrElse(linuxAppId)
 val icon = providers.gradleProperty("stub.icon").orNull
+/** What the stub was built from (desktop file and icon): sync-stubs.sh rebuilds it when this changes. */
+val stamp = providers.gradleProperty("stub.stamp").getOrElse("")
 /** The app's x-scheme-handler types: links in these open in the Linux app. */
 val schemes = providers.gradleProperty("stub.schemes").getOrElse("")
     .split(',').map { it.trim().lowercase() }.filter { it.matches(Regex("[a-z][a-z0-9+.-]*")) }
@@ -28,9 +40,10 @@ android {
         applicationId = stubPackage
         minSdk = 35
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = stubFormat
+        versionName = if (stamp.isEmpty()) "$stubFormat" else "$stubFormat-$stamp"
         manifestPlaceholders["linuxAppId"] = linuxAppId
+        manifestPlaceholders["stubFormat"] = stubFormat.toString()
         resValue("string", "app_name", label)
     }
 
@@ -55,10 +68,30 @@ android {
     )
 }
 
-// The Linux app's icon, as the foreground of the adaptive icon.
-val stubIcon by tasks.registering(Copy::class) {
-    if (icon != null) from(icon) { rename { "linux_icon.png" } }
-    into(layout.buildDirectory.dir("generated/stubIcon/drawable-nodpi"))
+// The Linux app's icon, as the foreground of the adaptive icon: a PNG as is,
+// an SVG converted to a vector drawable (with Android Studio's converter,
+// so no SVG renderer is needed on the host).
+val stubIcon by tasks.registering {
+    val src = icon
+    val out = layout.buildDirectory.dir("generated/stubIcon/drawable-nodpi")
+    inputs.property("icon", src ?: "")
+    if (src != null) inputs.file(src)
+    outputs.dir(out)
+    doLast {
+        val dir = out.get().asFile
+        dir.deleteRecursively()
+        dir.mkdirs()
+        if (src == null) return@doLast
+        if (src.endsWith(".svg")) {
+            val xml = ByteArrayOutputStream()
+            val errors = Svg2Vector.parseSvgToXml(File(src).toPath(), xml)
+            if (errors.isNotEmpty()) System.err.println("$src: $errors")
+            if (xml.size() == 0) throw GradleException("cannot convert $src")
+            File(dir, "linux_icon.xml").writeBytes(xml.toByteArray())
+        } else {
+            File(src).copyTo(File(dir, "linux_icon.png"))
+        }
+    }
 }
 
 val stubManifest by tasks.registering {
@@ -92,6 +125,5 @@ $data
 
 tasks.named("preBuild") { dependsOn(stubIcon, stubManifest) }
 
-dependencies {
-    implementation(project(":window"))
-}
+// Java only: no Kotlin stdlib in every stub.
+configurations.configureEach { exclude(group = "org.jetbrains.kotlin") }

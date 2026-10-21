@@ -1,10 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Binding to the compositor's session service (declared by dev.awb). -->
+    <uses-permission android:name="dev.awb.permission.WINDOWS" />
+
+    <queries>
+        <package android:name="dev.awb" />
+    </queries>
+
+    <!-- The activities below are dev.awb's (dev.awb.window): the factory loads
+         them from its installed APK, so they follow dev.awb's updates. -->
     <application
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
-        android:allowBackup="false">
+        android:allowBackup="false"
+        android:appComponentFactory="dev.awb.stub.StubComponentFactory">
+
+        <!-- What this manifest provides; dev.awb lists stubs below its own
+             format as outdated (scripts/sync-stubs.sh rebuilds them). -->
+        <meta-data android:name="dev.awb.stub_format" android:value="${stubFormat}" />
 
         <!-- The launcher icon: asks Wayland Bridge to start the Linux app. -->
         <activity

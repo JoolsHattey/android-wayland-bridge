@@ -30,6 +30,14 @@ To give a Linux app its own launcher icon, build and install its stub app
 ./scripts/install-stub.sh org.gnome.Adwaita1.Demo
 ```
 
+Or let `deploy.sh` do it: it runs `./scripts/sync-stubs.sh`, which builds
+stubs for the apps that opened windows without one (and have a desktop
+file), rebuilds stubs whose desktop file or icon changed, and removes those
+whose app is gone (the root launcher also removes these on its own within
+two minutes of an `apt remove`). Stubs carry no window code: they run
+dev.awb's, so updating dev.awb updates every stub, with nothing to rebuild.
+See [Stub apps](docs/DESIGN.md#stub-apps).
+
 The icon starts the app through `awb-launcher.sh` (the root side, started by
 `deploy.sh`, which also runs the helper that moves windows when an app asks
 to, as on a title-label drag). The app's windows then open as the stub's tasks, so the
@@ -49,9 +57,9 @@ switches back to the CPU compositor.
 Games and 3D apps can lock the pointer (`zwp_pointer_constraints_v1`):
 the window then takes Android's pointer capture, which ends when it loses
 focus (Meta or Alt+Tab); a click back into the window locks it again.
-Stub apps built before this need reinstalling (`install-stub.sh`) for
-pointer lock, touchpad scrolling and full-rate motion; older ones keep
-working as before.
+Stub apps built before stubs ran dev.awb's code (format 1) lack pointer
+lock, touchpad scrolling and full-rate motion until `sync-stubs.sh` (run by
+`deploy.sh`) replaces them.
 
 Electron apps lay their title bar out around Electron's own buttons, not
 Android's. For Claude Desktop, `./scripts/patch-claude-desktop.sh` patches
@@ -65,7 +73,9 @@ Claude Desktop updates.
   session service.
 - `window/`: the window activity (insets, input, surface), shared by `app/`
   and the stubs; it talks to the compositor over binder.
-- `stub/`: the app of one Linux app (launcher icon, window tasks).
-- `scripts/`: deploy loop, chroot and app launchers, stub installer.
+- `stub/`: the app of one Linux app (launcher icon, window tasks); its
+  activities' code is loaded from dev.awb at run time.
+- `scripts/`: deploy loop, chroot and app launchers, stub installer and
+  sync (`awb-stubs.sh` is their device side).
 - `tools/torture/`: a misbehaving client for robustness tests. Build it with
   `cargo build --release --target x86_64-unknown-linux-musl`.
