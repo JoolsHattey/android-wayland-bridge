@@ -3,6 +3,7 @@
 //! thread, everything Wayland lives on one compositor thread (see `server`).
 
 mod android;
+mod direct;
 mod dmabuf;
 mod gpu;
 mod host;
@@ -15,6 +16,7 @@ mod shell;
 mod shm;
 mod state;
 mod surface;
+mod syncobj;
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -45,6 +47,9 @@ pub enum Cmd {
     DisplayRemoved(i32),
     /// The window is now on this Android display.
     WindowDisplay(u32, i32),
+    /// SurfaceFlinger completed a direct-mode transaction (binder thread);
+    /// `fence` releases the buffer it replaced (-1: already released).
+    DirectDone { win: u32, token: u64, fence: i32 },
 }
 
 #[derive(Debug, Clone)]

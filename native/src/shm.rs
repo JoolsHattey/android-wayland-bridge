@@ -77,6 +77,8 @@ pub struct Texture {
     pub data: Vec<u32>,
     pub opaque: bool,
     pub dmabuf: Option<(wl_buffer::WlBuffer, Rc<crate::gpu::Dmabuf>)>,
+    /// Explicit sync points of the commit (dmabuf only).
+    pub sync: Option<crate::syncobj::CommitSync>,
     /// Unique per commit, so the GPU path uploads each shm texture once.
     pub serial: u64,
 }
@@ -180,7 +182,7 @@ impl BufferInfo {
         if FAULTED.swap(false, Ordering::SeqCst) {
             return None;
         }
-        Some(Texture { width: self.width, height: self.height, data, opaque, dmabuf: None, serial: next_texture_serial() })
+        Some(Texture { width: self.width, height: self.height, data, opaque, dmabuf: None, sync: None, serial: next_texture_serial() })
     }
 }
 

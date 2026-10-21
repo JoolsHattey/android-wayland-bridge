@@ -65,7 +65,9 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for State {
     }
 }
 
-/// One tranche: every format and modifier, for the GPU's render node.
+/// Tranches for the GPU's render node. With direct mode, the first holds
+/// what SurfaceFlinger can show as is (no CCS compression), so clients
+/// allocate buffers that skip the blit; the second holds the rest.
 fn send_feedback(st: &State, fb: &ZwpLinuxDmabufFeedbackV1) {
     let Some(r) = &st.gpu else { return };
     let formats = &r.gpu.formats;
@@ -89,11 +91,17 @@ fn send_feedback(st: &State, fb: &ZwpLinuxDmabufFeedbackV1) {
     let dev = r.gpu.render_node.to_ne_bytes().to_vec();
     fb.format_table(file.as_fd(), table.len() as u32);
     fb.main_device(dev.clone());
-    fb.tranche_target_device(dev);
-    fb.tranche_flags(zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty());
-    let indices: Vec<u8> = (0..formats.len() as u16).flat_map(|i| i.to_ne_bytes()).collect();
-    fb.tranche_formats(indices);
-    fb.tranche_done();
+    let preferred = |f: &crate::gpu::DmabufFormat| r.direct_enabled() && f.direct();
+    let (first, rest): (Vec<u16>, Vec<u16>) = (0..formats.len() as u16).partition(|&i| preferred(&formats[i as usize]));
+    for tranche in [first, rest] {
+        if tranche.is_empty() {
+            continue;
+        }
+        fb.tranche_target_device(dev.clone());
+        fb.tranche_flags(zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty());
+        fb.tranche_formats(tranche.iter().flat_map(|i| i.to_ne_bytes()).collect());
+        fb.tranche_done();
+    }
     fb.done();
 }
 

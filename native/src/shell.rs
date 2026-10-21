@@ -461,6 +461,9 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ObjectId> for State {
         if let Some(slot) = st.shared.slots.lock().ok().and_then(|mut s| s.remove(&win)) {
             slot.detach();
         }
+        if let Some(r) = &mut st.gpu {
+            r.forget_window(win);
+        }
     }
 }
 

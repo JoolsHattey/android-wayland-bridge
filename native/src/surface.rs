@@ -6,9 +6,11 @@ use wayland_server::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_output, wl_region, wl_subcompositor, wl_subsurface, wl_surface,
 };
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1;
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
 use crate::shm::{Texture, next_texture_serial};
+use crate::syncobj::{CommitSync, Point, Release};
 use crate::state::{Buffer, State, guard};
 
 #[derive(Debug, Clone, Copy)]
@@ -43,12 +45,26 @@ pub struct SurfState {
     pub vp_src: Option<Option<[f64; 4]>>,
     /// wp_viewport destination size; Some(None) = unset.
     pub vp_dst: Option<Option<(i32, i32)>>,
+    /// Explicit sync points for the attached buffer.
+    pub acquire: Option<Point>,
+    pub release: Option<Point>,
 }
 
 impl SurfState {
     fn merge(&mut self, newer: SurfState) {
         if newer.buffer.is_some() {
+            // The older cached buffer is never shown: give it back.
+            if let Some(Some(old)) = &self.buffer {
+                if newer.buffer.as_ref().is_none_or(|b| b.as_ref() != Some(old)) && old.is_alive() {
+                    old.release();
+                }
+            }
+            if let Some(r) = self.release.take() {
+                r.signal();
+            }
             self.buffer = newer.buffer;
+            self.acquire = newer.acquire;
+            self.release = newer.release;
         }
         if newer.scale.is_some() {
             self.scale = newer.scale;
@@ -101,6 +117,8 @@ pub struct Surface {
     pub fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     /// Display and scale (120ths) last announced to the client.
     pub entered: Option<(i32, u32)>,
+    /// Explicit sync extension, if the client created one.
+    pub syncobj: Option<WpLinuxDrmSyncobjSurfaceV1>,
 }
 
 impl Surface {
@@ -183,6 +201,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for State {
                         vp_dst: None,
                         fractional: None,
                         entered: None,
+                        syncobj: None,
                     },
                 );
             }
@@ -297,15 +316,17 @@ fn destroy_surface(st: &mut State, sid: &ObjectId) {
 }
 
 /// Gives a replaced dmabuf back to its client once the GPU no longer reads
-/// it, unless it is still the current buffer (`current`).
+/// it: its commit's release point, and the wl_buffer unless it is still the
+/// current buffer (`current`).
 fn release_texture(st: &mut State, old: Option<Texture>, current: Option<&ObjectId>) {
-    let Some((buffer, d)) = old.and_then(|t| t.dmabuf) else { return };
-    if current == Some(&buffer.id()) || !buffer.is_alive() {
-        return;
-    }
+    let Some(t) = old else { return };
+    let Some((buffer, d)) = t.dmabuf else { return };
+    let buffer = (current != Some(&buffer.id()) && buffer.is_alive()).then_some(buffer);
+    let release = t.sync.map(|s| s.release);
     match &mut st.gpu {
-        Some(r) => r.release(buffer, &d),
-        None => buffer.release(),
+        Some(r) => r.release(buffer, release, &d),
+        // Dropping `release` signals it.
+        None => buffer.into_iter().for_each(|b| b.release()),
     }
 }
 
@@ -322,6 +343,9 @@ fn effectively_sync(st: &State, sid: &ObjectId) -> bool {
 }
 
 fn commit(st: &mut State, sid: &ObjectId) {
+    if !crate::syncobj::validate(st, sid) {
+        return;
+    }
     let Some(s) = st.surfaces.get_mut(sid) else { return };
     let pending = std::mem::take(&mut s.pending);
     if effectively_sync(st, sid) {
@@ -337,7 +361,11 @@ fn commit(st: &mut State, sid: &ObjectId) {
 
 /// Makes `state` current on the surface, then applies cached state of
 /// synchronized children and runs role-specific commit logic.
-fn apply(st: &mut State, sid: &ObjectId, state: SurfState) {
+fn apply(st: &mut State, sid: &ObjectId, mut state: SurfState) {
+    let sync = match (state.acquire.take(), state.release.take()) {
+        (Some(acquire), Some(release)) => Some(CommitSync { acquire, release: Release(release) }),
+        _ => None,
+    };
     let mut new_texture: Option<Option<Texture>> = None;
     if let Some(buffer) = &state.buffer {
         new_texture = Some(match buffer {
@@ -351,6 +379,7 @@ fn apply(st: &mut State, sid: &ObjectId, state: SurfState) {
                             data: Vec::new(),
                             opaque: false,
                             dmabuf: Some((b.clone(), d.clone())),
+                            sync,
                             serial: next_texture_serial(),
                         }),
                         false,

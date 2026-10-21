@@ -133,9 +133,11 @@ through its `/dev` bind mount.
 * **Chroot side.** Debian's Mesa 25.0 needs `mesa-vulkan-drivers` and
   `libgl1-mesa-dri`. GTK then picks `GskGLRenderer` on the Arc,
   `es2gears_wayland` runs at the panel's 120 Hz, and `vkcube` uses ANV.
-* **`zwp_linux_dmabuf_v1` v4** (`dmabuf.rs`). Feedback has one tranche:
-  every pair, for the render node's `dev_t`. Version 3 clients get
-  `modifier` events. A buffer is imported into Vulkan when its `wl_buffer`
+* **`zwp_linux_dmabuf_v1` v4** (`dmabuf.rs`). Feedback is for the render
+  node's `dev_t`, in two tranches. The first holds the pairs SurfaceFlinger
+  can show as is (8-bit RGB; linear, X- or 4-tiled; no CCS), so clients pick
+  those and can go [direct](#direct-mode-zero-copy). The second holds the
+  rest. Version 3 clients get `modifier` events. A buffer is imported into Vulkan when its `wl_buffer`
   is created, so a bad buffer fails there (`failed`, or `invalid_wl_buffer`
   for `create_immed`), never at draw time.
   - All planes must share one buffer object (as Mesa allocates CCS aux
@@ -146,6 +148,13 @@ through its `/dev` bind mount.
   - **Per window:** a swapchain on the `ANativeWindow` (R8G8B8A8, FIFO). It
     lives in the window's slot, so `surfaceDestroyed` tears it down before
     the window is released.
+  - **Pacing:** acquire never blocks the compositor thread. With
+    `VK_GOOGLE_display_timing` (presents carry ids; past timings say which
+    the display has shown), a window with 2 frames queued is not drawn until
+    one is shown. The zero-timeout acquire stays as a backstop. Android logs
+    every acquire that would block, so asking only when an image is free
+    matters. A window whose display is slow then waits by itself; others keep
+    their rate (two es2gears and a vkcube all hold 120 FPS).
   - **Per surface:** one quad, blended as premultiplied alpha, with a
     bilinear sampler. A quad that lands 1:1 on pixel centres samples
     exactly, so fractional-scale clients stay pixel-exact.
@@ -153,10 +162,21 @@ through its `/dev` bind mount.
     `VK_QUEUE_FAMILY_FOREIGN_EXT` each frame. `wl_shm` textures are uploaded
     through a staging buffer when they change. An X-format swizzles alpha to
     1 in the image view.
-* **Implicit sync.** A window is drawn only once every dmabuf it shows polls
-  readable, i.e. the client's rendering has finished. A slow client then
-  only delays its own window, instead of stalling the queue all windows
-  share.
+* **Latching.** A window is drawn only once every buffer it shows is
+  finished. A slow client then only delays its own window, instead of
+  stalling the queue all windows share.
+  - **Implicit sync:** the dmabuf polls readable.
+  - **Explicit sync** (`syncobj.rs`, `wp_linux_drm_syncobj_v1`, offered
+    when the render node has timeline syncobjs): each commit carries an
+    acquire and a release point. Timelines are imported into our own DRM
+    fd. The acquire point is checked with `SYNCOBJ_QUERY`; the release point
+    is signalled from the CPU (`SYNCOBJ_TIMELINE_SIGNAL`) when the buffer
+    would be released. A commit's release is a value that signals when
+    dropped, so every path that lets go of a buffer gives it back, cached
+    subsurface state included. Mesa's Vulkan WSI uses it (vkcube, vkgears
+    at 120 FPS); GL clients stay on implicit sync. The protocol errors
+    (`no_buffer`, `no_acquire_point`, `conflicting_points`, …) are checked
+    at commit.
 * **Buffer lifetime.** A dmabuf stays held while it is the surface's
   buffer. It is released when replaced, once the last frame that sampled it
   has completed. Images, staging buffers and readbacks are destroyed the
@@ -170,6 +190,58 @@ through its `/dev` bind mount.
   offered. Mesa then falls back to llvmpipe and GTK to cairo.
 * Shaders (`native/shaders/`) are compiled to SPIR-V by `build.rs` with the
   NDK's `glslc`.
+
+### Direct mode (zero-copy)
+
+A window that is a single dmabuf surface, drawn 1:1 and covering the whole
+window, is never blitted. Its buffer goes to SurfaceFlinger on a child
+`SurfaceControl` of the window (`ASurfaceControl_createFromWindow`, z 1,
+above the swapchain's layer), cropped to the window with
+`ASurfaceTransaction_setGeometry`. This covers fractional-scale GTK windows,
+whose buffer includes a resize margin around the window.
+
+* **Wrapping the buffer** (`direct.rs`). There is no public way to make an
+  AHardwareBuffer from a foreign dmabuf. `AHardwareBuffer_createFromHandle`
+  exists, but returns `BAD_VALUE` here even for a genuine gralloc handle.
+  The public `AHardwareBuffer_recvHandleFromUnixSocket` reads
+  GraphicBuffer's flattened form (a `GB01` header, then the native
+  handle's ints, with fds over `SCM_RIGHTS`). So we write that message
+  ourselves around minigbm's `cros_gralloc_handle`, laid out as this
+  device's gralloc does (native handle version 12, read from real buffers).
+  - The handle carries one plane fd plus minigbm's metadata region. That
+    region is a memfd filled from a template, which is read through
+    `sendHandleToUnixSocket` from a fresh gralloc buffer. Without it,
+    SurfaceFlinger's metadata queries log an error every frame.
+  - The handle also carries strides, offsets, sizes, the DRM format,
+    minigbm's i915 tiling for the modifier (0, 1 or 9), the modifier itself,
+    use flags (`0x25`), the magic number, the HAL format (RGBA/RGBX/BGRA
+    8888) and the usage (GPU sampled, framebuffer, composer overlay).
+  - The mapper then imports the client's buffer object like any gralloc
+    buffer. Each dmabuf is wrapped once, on first direct use.
+* **Pacing.** One transaction in flight per window. Its `OnComplete` (on a
+  binder thread) becomes `Cmd::DirectDone`, and the window's next frame
+  waits for it.
+* **Buffer release.** `OnComplete` also carries the previous buffer's
+  release fence. A dmabuf counts its SurfaceFlinger holds, and is released
+  (wl_buffer and syncobj point) only when both the GPU and every hold are
+  done.
+* **Leaving direct mode.** When a window needs compositing again (a popup,
+  a resize, a scaled or second surface), the layer is hidden and given a
+  1×1 placeholder, so SurfaceFlinger hands the client's buffer back. A new
+  Target means a new layer, and the old holds are dropped.
+* **Header analysis.** The caption rows are copied straight out of the
+  client's image, which is imported with `TRANSFER_SRC` where the modifier
+  allows it. The analysis then runs as for a composited frame; exclusion
+  works in direct mode.
+* `direct=0` in `files/awb.properties` turns it off.
+
+Verified on the device:
+
+* libadwaita is direct: a 1260×924 4-tiled ARGB buffer for a 1200×864
+  window.
+* Opening the menu popover switches it to composited, and closing the
+  popover switches it back to direct.
+* vkcube at `scale=1` is direct with explicit sync and keeps animating.
 
 ### Scale, per display
 
@@ -365,9 +437,10 @@ takes that role (`native/src/portal.rs`):
   any order, so windows and popups are found by their own resource. The
   torture test found exactly this bug: windows leaked when the `xdg_surface`
   died before its `xdg_toplevel`.
-* With the GPU renderer, `torture abort`, `popup` and `churn 40` (42 windows),
-  plus `kill -9` of vkcube and es2gears mid-frame, also leave the app
-  running with no leftover windows.
+* With the GPU renderer, `torture abort`, `popup` and `churn 40`, plus
+  `kill -9` of vkcube, es2gears and libadwaita mid-frame (direct and
+  composited), also leave the app running. No windows or `awb-direct`
+  layers are left over.
 * `tools/torture` is a static musl client that misbehaves on purpose:
   `abort` (dies mid-frame with a commit in flight), `sigbus` (truncates its
   pool under an attached buffer), `popup` (exits with a popup open) and
@@ -383,6 +456,8 @@ Working on the device:
   resize→configure and close.
 * wl_shm and dmabuf rendering, composited with Vulkan (CPU fallback).
 * GPU clients: GTK's GL renderer, EGL/GLES and Vulkan on the Arc.
+* Per-window pacing, explicit sync (`wp_linux_drm_syncobj_v1`) and zero-copy
+  direct mode for single-surface windows.
 * Popups and tooltips.
 * Keyboard and mouse input.
 * Client cursors.
@@ -423,25 +498,28 @@ es2gears_wayland.
   fullscreen (`desktop-first-but-fullscreen-cross-app-launch`). Avoid
   showing `MainActivity` while windows open; starting the service with
   `am start-foreground-service` sidesteps it.
-* **Pacing.** The compositor still composites (one GPU blit per frame) and
-  presents every window from its single thread. Swapchain acquire blocks
-  with FIFO, so a window whose display is slow to take frames delays the
-  others. `wl_shm` clients also pay two CPU copies per commit (client to
-  texture, texture to staging).
-* **Sync.** Only implicit sync (dmabuf poll). `wp_linux_drm_syncobj_v1`
-  would let Vulkan clients use explicit sync.
+* **Copies.** `wl_shm` clients pay two CPU copies per commit (client to
+  texture, texture to staging). Composited windows are one GPU blit per
+  frame.
 * **Readback.** The caption band (about 0.4 MB) is read back every frame
-  for the header analysis.
+  for the header analysis, in direct mode too.
+* **Direct mode** depends on minigbm's private handle layout and the
+  GraphicBuffer wire format. A gralloc update could change either; the
+  mapper then rejects the buffer (logged) and the window stays composited.
+  Scaled buffers (integer-scale clients such as vkcube at 1.5×) and
+  multi-surface windows (libdecor decorations, popups) still composite.
+  SurfaceFlinger could scale them, but the header analysis needs window
+  px.
+* **Explicit sync** is CPU-side: the acquire point is polled, and release
+  points are signalled after the GPU or SurfaceFlinger is done, not by a
+  GPU-side signal.
 
 ## Roadmap
 
 1. ~~Per-window scale, fractional scaling and viewporter.~~ Done.
 2. SSD mode (opaque system caption) per the client's decoration preference.
-3. ~~`linux-dmabuf` with Vulkan import and compositing.~~ Done. Next:
-   present single-surface windows' dmabufs straight through
-   `ASurfaceTransaction` (`SurfaceControl`), skipping the blit and letting
-   each window pace on its own transactions. That needs a private
-   `AHardwareBuffer_createFromHandle` and minigbm's handle layout.
+3. ~~`linux-dmabuf` with Vulkan import and compositing, per-window
+   pacing, explicit sync, zero-copy direct mode.~~ Done.
 4. ~~Dark mode and accent colour via the settings portal.~~ Done.
 5. Clipboard: `wl_data_device` ↔ `ClipboardManager` (text first), then
    drag and drop.

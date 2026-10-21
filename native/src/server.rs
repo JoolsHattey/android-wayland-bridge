@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
@@ -63,7 +64,9 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
         log::info!("renderer: cpu (awb.properties)");
         None
     } else {
-        match crate::gpu::Renderer::new() {
+        // `direct=0` keeps every window composited (no zero-copy layers).
+        let direct = setting(&cfg.socket_path, "direct").as_deref() != Some("0");
+        match crate::gpu::Renderer::new(shared.clone(), direct) {
             Ok(r) => {
                 log::info!("renderer: vulkan");
                 Some(r)
@@ -74,8 +77,12 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
             }
         }
     };
+    let drm = gpu.as_ref().and_then(|g| crate::syncobj::Drm::open(g.gpu.render_node));
     if gpu.is_some() {
         dh.create_global::<State, ZwpLinuxDmabufV1, ()>(4, ());
+    }
+    if drm.is_some() {
+        dh.create_global::<State, WpLinuxDrmSyncobjManagerV1, ()>(1, ());
     }
 
     let path = PathBuf::from(&cfg.socket_path);
@@ -96,6 +103,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
 
     let mut st = State::new(dh.clone(), shared.clone(), host);
     st.gpu = gpu;
+    st.drm = drm;
 
     loop {
         let mut fds = [
@@ -181,6 +189,13 @@ fn handle_cmd(st: &mut State, cmd: Cmd) {
                 w.display = display;
                 w.dirty = true;
                 st.configure_window(win);
+            }
+        }
+        Cmd::DirectDone { win, token, fence } => {
+            use std::os::fd::FromRawFd;
+            let fence = (fence >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fence) });
+            if let Some(r) = &mut st.gpu {
+                r.direct_done(win, token, fence);
             }
         }
         Cmd::Pointer(ev) => crate::seat::handle_pointer(st, ev),

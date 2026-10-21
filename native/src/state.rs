@@ -111,6 +111,8 @@ pub struct State {
     pub outputs: Outputs,
     /// The Vulkan renderer; None draws on the CPU (and offers no dmabuf).
     pub gpu: Option<crate::gpu::Renderer>,
+    /// The render node, for explicit sync (wp_linux_drm_syncobj_v1).
+    pub drm: Option<Arc<crate::syncobj::Drm>>,
 }
 
 /// Runs a request handler, turning a panic into a disconnect of the client
@@ -150,6 +152,7 @@ impl State {
             seat: Seat::default(),
             outputs: Outputs::default(),
             gpu: None,
+            drm: None,
         }
     }
 

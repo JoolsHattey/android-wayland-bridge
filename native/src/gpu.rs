@@ -12,6 +12,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -20,10 +21,13 @@ use wayland_server::backend::ObjectId;
 use wayland_server::protocol::wl_buffer::WlBuffer;
 
 use crate::android::ANativeWindow;
+use crate::direct::{AHardwareBuffer, Layer};
 use crate::output::to_px;
 use crate::render::Band;
 use crate::shm::Texture;
 use crate::state::State;
+use crate::Shared;
+use crate::syncobj::Release;
 
 const fn fourcc(s: &[u8; 4]) -> u32 {
     s[0] as u32 | (s[1] as u32) << 8 | (s[2] as u32) << 16 | (s[3] as u32) << 24
@@ -47,6 +51,10 @@ const BACKGROUND: [f32; 4] = [0x20 as f32 / 255.0, 0x20 as f32 / 255.0, 0x20 as 
 /// Descriptor sets per window frame, i.e. surfaces drawn per window.
 const MAX_DRAWS: u32 = 128;
 
+/// Frames a window may have queued for its display: enough to keep it busy,
+/// few enough that clients are not paced frames ahead of the screen.
+const MAX_QUEUED: u32 = 2;
+
 static VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.vert.spv"));
 static FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.frag.spv"));
 
@@ -60,6 +68,15 @@ pub struct DmabufFormat {
     pub modifier: u64,
     /// Memory planes the modifier needs (CCS adds aux planes).
     pub planes: u32,
+    /// Can also be copied from (for the caption readback in direct mode).
+    pub transfer: bool,
+}
+
+impl DmabufFormat {
+    /// Whether SurfaceFlinger can take such a buffer as is (direct mode).
+    pub fn direct(&self) -> bool {
+        self.planes == 1 && crate::direct::hal_format(self.fourcc).is_some() && crate::direct::tiling(self.modifier).is_some()
+    }
 }
 
 enum Retired {
@@ -86,6 +103,8 @@ pub struct Gpu {
     device: ash::Device,
     swapchain_fn: ash::khr::swapchain::Device,
     memfd_fn: ash::khr::external_memory_fd::Device,
+    /// Tells which presented frames the display has shown (for pacing).
+    timing_fn: Option<ash::google::display_timing::Device>,
     queue: vk::Queue,
     qfi: u32,
     mem_props: vk::PhysicalDeviceMemoryProperties,
@@ -139,17 +158,21 @@ impl Gpu {
                     .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS));
                 if let Some(qfi) = qfi {
                     log::info!("gpu: {:?}", props.device_name_as_c_str().unwrap_or_default());
-                    chosen = Some((pd, qfi as u32, has(ash::ext::physical_device_drm::NAME)));
+                    let optional = (has(ash::ext::physical_device_drm::NAME), has(ash::google::display_timing::NAME));
+                    chosen = Some((pd, qfi as u32, optional));
                     break;
                 }
             }
-            let Some((pd, qfi, has_drm)) = chosen else {
+            let Some((pd, qfi, (has_drm, has_timing))) = chosen else {
                 return Err("no Vulkan device can import dmabufs".into());
             };
 
             let prio = [1.0];
             let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(qfi).queue_priorities(&prio)];
-            let names: Vec<_> = required.iter().map(|n| n.as_ptr()).collect();
+            let mut names: Vec<_> = required.iter().map(|n| n.as_ptr()).collect();
+            if has_timing {
+                names.push(ash::google::display_timing::NAME.as_ptr());
+            }
             let mut v12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
             let info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
@@ -220,6 +243,7 @@ impl Gpu {
                 android_fn: ash::khr::android_surface::Instance::new(&entry, &instance),
                 swapchain_fn: ash::khr::swapchain::Device::new(&instance, &device),
                 memfd_fn: ash::khr::external_memory_fd::Device::new(&instance, &device),
+                timing_fn: has_timing.then(|| ash::google::display_timing::Device::new(&instance, &device)),
                 mem_props: instance.get_physical_device_memory_properties(pd),
                 _entry: entry,
                 instance,
@@ -256,36 +280,48 @@ impl Gpu {
                 let mut fp = vk::FormatProperties2::default().push_next(&mut list);
                 self.instance.get_physical_device_format_properties2(self.pd, format, &mut fp);
                 for m in &mods {
-                    if !m.drm_format_modifier_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
+                    let features = m.drm_format_modifier_tiling_features;
+                    if !features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+                        || !self.importable(format, m.drm_format_modifier, vk::ImageUsageFlags::SAMPLED)
+                    {
                         continue;
                     }
-                    let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
-                        .drm_format_modifier(m.drm_format_modifier)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-                    let mut ext = vk::PhysicalDeviceExternalImageFormatInfo::default()
-                        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-                    let info = vk::PhysicalDeviceImageFormatInfo2::default()
-                        .format(format)
-                        .ty(vk::ImageType::TYPE_2D)
-                        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                        .usage(vk::ImageUsageFlags::SAMPLED)
-                        .push_next(&mut drm)
-                        .push_next(&mut ext);
-                    let mut eprops = vk::ExternalImageFormatProperties::default();
-                    let mut props = vk::ImageFormatProperties2::default().push_next(&mut eprops);
-                    let ok = self.instance.get_physical_device_image_format_properties2(self.pd, &info, &mut props).is_ok();
-                    let features = eprops.external_memory_properties.external_memory_features;
-                    if ok && features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE) {
-                        out.push(DmabufFormat {
-                            fourcc,
-                            modifier: m.drm_format_modifier,
-                            planes: m.drm_format_modifier_plane_count,
-                        });
-                    }
+                    let transfer = features.contains(vk::FormatFeatureFlags::TRANSFER_SRC)
+                        && self.importable(
+                            format,
+                            m.drm_format_modifier,
+                            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC,
+                        );
+                    out.push(DmabufFormat {
+                        fourcc,
+                        modifier: m.drm_format_modifier,
+                        planes: m.drm_format_modifier_plane_count,
+                        transfer,
+                    });
                 }
             }
         }
         out
+    }
+
+    /// Whether a dmabuf with this format and modifier imports for `usage`.
+    fn importable(&self, format: vk::Format, modifier: u64, usage: vk::ImageUsageFlags) -> bool {
+        let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut ext =
+            vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(usage)
+            .push_next(&mut drm)
+            .push_next(&mut ext);
+        let mut eprops = vk::ExternalImageFormatProperties::default();
+        let mut props = vk::ImageFormatProperties2::default().push_next(&mut eprops);
+        let ok = unsafe { self.instance.get_physical_device_image_format_properties2(self.pd, &info, &mut props) }.is_ok();
+        ok && eprops.external_memory_properties.external_memory_features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
     }
 
     /// The highest serial the GPU has finished.
@@ -498,6 +534,11 @@ impl Gpu {
         y_invert: bool,
     ) -> Result<Dmabuf, String> {
         let (_, format, opaque) = *FORMATS.iter().find(|f| f.0 == fourcc).ok_or("unsupported format")?;
+        let entry = *self.formats.iter().find(|f| f.fourcc == fourcc && f.modifier == modifier).ok_or("unsupported modifier")?;
+        let mut usage = vk::ImageUsageFlags::SAMPLED;
+        if entry.transfer {
+            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
         let first = &planes.first().ok_or("no planes")?.0;
         let ino = |fd: &OwnedFd| unsafe {
             let mut st: libc::stat = std::mem::zeroed();
@@ -538,7 +579,7 @@ impl Gpu {
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .usage(vk::ImageUsageFlags::SAMPLED)
+                .usage(usage)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
                 .push_next(&mut ext)
@@ -590,6 +631,7 @@ impl Gpu {
                 }
             };
             let poll_fd = OwnedFd::from_raw_fd(libc::dup(first.as_raw_fd()).max(0));
+            let (_, offset, stride) = planes[0];
             drop(planes);
             Ok(Dmabuf {
                 gpu: self.clone(),
@@ -601,6 +643,14 @@ impl Gpu {
                 memory,
                 poll_fd,
                 last_use: Cell::new(0),
+                format: entry,
+                bgra: format == vk::Format::B8G8R8A8_UNORM,
+                opaque,
+                offset,
+                stride,
+                size: size.max(0) as u64,
+                ahb: Cell::new(std::ptr::null_mut()),
+                sf_holds: Cell::new(0),
             })
         }
     }
@@ -628,9 +678,37 @@ pub struct Dmabuf {
     poll_fd: OwnedFd,
     /// Last serial that sampled the image.
     last_use: Cell<u64>,
+    format: DmabufFormat,
+    bgra: bool,
+    opaque: bool,
+    offset: u32,
+    stride: u32,
+    size: u64,
+    /// The buffer wrapped for SurfaceFlinger (direct mode), once needed.
+    ahb: Cell<*mut AHardwareBuffer>,
+    /// Transactions that gave the buffer to SurfaceFlinger and whose
+    /// release is still outstanding.
+    sf_holds: Cell<u32>,
 }
 
 impl Dmabuf {
+    /// Whether both the GPU and SurfaceFlinger are done with the buffer.
+    fn idle(&self, completed: u64) -> bool {
+        self.last_use.get() <= completed && self.sf_holds.get() == 0
+    }
+
+    /// The buffer as an AHardwareBuffer, wrapping it on first use.
+    fn hardware_buffer(&self) -> Option<*mut AHardwareBuffer> {
+        if self.ahb.get().is_null() && self.size > 0 {
+            let plane = crate::direct::Plane { fd: &self.poll_fd, offset: self.offset, stride: self.stride, size: self.size };
+            if let Some(b) = crate::direct::wrap(&plane, self.width, self.height, self.format.fourcc, self.format.modifier) {
+                self.ahb.set(b);
+            }
+        }
+        let b = self.ahb.get();
+        (!b.is_null()).then_some(b)
+    }
+
     /// Whether the client's rendering into the buffer has finished
     /// (implicit sync: the dmabuf's write fences have signalled).
     pub fn ready(&self) -> bool {
@@ -641,6 +719,8 @@ impl Dmabuf {
 
 impl Drop for Dmabuf {
     fn drop(&mut self) {
+        // SurfaceFlinger keeps its own reference while it shows the buffer.
+        crate::direct::release(self.ahb.get());
         self.gpu.retire(self.last_use.get(), Retired::Image(self.image, self.view, self.memory));
     }
 }
@@ -669,12 +749,22 @@ pub struct Target {
     pipeline: vk::Pipeline,
     readable: bool,
     readback: Option<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)>,
-    /// Caption rows copied by the last frame: first row, rows, width.
-    band: (i32, i32, i32),
+    /// Caption rows copied by the last frame: first row, rows, width, and
+    /// whether they are BGRA.
+    band: (i32, i32, i32, bool),
     last_serial: u64,
     /// The swapchain must be recreated before the next frame.
     stale: bool,
+    /// Present ids: the last one queued, and the last the display showed.
+    presented: u32,
+    shown: u32,
+    /// The child layer for direct mode, created when first needed.
+    layer: Option<Layer>,
+    /// Unique per Target, so direct-mode bookkeeping notices a new one.
+    pub generation: u64,
 }
+
+static TARGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // Only used under the slot's mutex.
 unsafe impl Send for Target {}
@@ -732,9 +822,13 @@ impl Target {
                 pipeline: vk::Pipeline::null(),
                 readable: false,
                 readback: None,
-                band: (0, 0, 0),
+                band: (0, 0, 0, false),
                 last_serial: 0,
                 stale: true,
+                presented: 0,
+                shown: 0,
+                layer: None,
+                generation: TARGETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             })
         }
     }
@@ -804,6 +898,7 @@ impl Target {
                 self.rendered.push(err("semaphore", gpu.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))?);
             }
             self.stale = false;
+            (self.presented, self.shown) = (0, 0);
             log::info!("gpu: swapchain {}x{} {:?}, {} images", extent.width, extent.height, pick.format, self.images.len());
             Ok(())
         }
@@ -844,14 +939,14 @@ impl Target {
 
     /// The caption rows of frame `serial`, as RGBA (0xAABBGGRR) pixels.
     fn band_pixels(&self, serial: u64) -> Option<(Vec<u32>, i32, i32, i32)> {
-        let (y0, rows, width) = self.band;
+        let (y0, rows, width, bgra) = self.band;
         let (_, _, ptr, _) = self.readback?;
         if self.last_serial != serial || rows <= 0 || width <= 0 {
             return None;
         }
         let n = (rows * width) as usize;
         let mut px = unsafe { std::slice::from_raw_parts(ptr as *const u32, n) }.to_vec();
-        if self.format == vk::Format::B8G8R8A8_UNORM {
+        if bgra {
             for v in &mut px {
                 *v = (*v & 0xff00ff00) | ((*v >> 16) & 0xff) | ((*v & 0xff) << 16);
             }
@@ -860,7 +955,8 @@ impl Target {
     }
 
     /// Draws one frame: uploads, the quads, then the caption readback.
-    /// Returns false if the swapchain was out of date (nothing drawn).
+    /// Returns false if nothing was drawn: no image is free yet (the
+    /// display still holds them) or the swapchain is out of date.
     fn frame(&mut self, draws: &[Draw], band: (i32, i32), serial: u64) -> Result<bool, String> {
         let gpu = self.gpu.clone();
         let d = &gpu.device;
@@ -872,8 +968,23 @@ impl Target {
             self.ensure_readback((ew * rows * 4) as u64)?;
         }
         unsafe {
-            let idx = match gpu.swapchain_fn.acquire_next_image(self.swapchain, u64::MAX, self.acquired, vk::Fence::null()) {
+            // Never block: a window waiting for its display must not hold up
+            // the others. It is retried shortly (Renderer::busy). With
+            // display timing we know how many frames are still queued and
+            // don't even ask; Android logs every acquire that would block.
+            if let Some(timing) = &gpu.timing_fn {
+                if let Ok(past) = timing.get_past_presentation_timing(self.swapchain) {
+                    if let Some(id) = past.iter().map(|t| t.present_id).max() {
+                        self.shown = self.shown.max(id);
+                    }
+                }
+                if self.presented.wrapping_sub(self.shown) >= MAX_QUEUED {
+                    return Ok(false);
+                }
+            }
+            let idx = match gpu.swapchain_fn.acquire_next_image(self.swapchain, 0, self.acquired, vk::Fence::null()) {
                 Ok((i, _)) => i as usize,
+                Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => return Ok(false),
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.stale = true;
                     return Ok(false);
@@ -1039,13 +1150,19 @@ impl Target {
                 .push_next(&mut tl);
             err("submit", d.queue_submit(gpu.queue, &[submit], vk::Fence::null()))?;
             self.last_serial = serial;
-            self.band = if read { (y0, rows, ew) } else { (0, 0, 0) };
+            self.band = if read { (y0, rows, ew, self.format == vk::Format::B8G8R8A8_UNORM) } else { (0, 0, 0, false) };
 
             let present_waits = [self.rendered[idx]];
             let swapchains = [self.swapchain];
             let indices = [idx as u32];
-            let present =
+            self.presented = self.presented.wrapping_add(1);
+            let times = [vk::PresentTimeGOOGLE { present_id: self.presented, desired_present_time: 0 }];
+            let mut times = vk::PresentTimesInfoGOOGLE::default().times(&times);
+            let mut present =
                 vk::PresentInfoKHR::default().wait_semaphores(&present_waits).swapchains(&swapchains).image_indices(&indices);
+            if gpu.timing_fn.is_some() {
+                present = present.push_next(&mut times);
+            }
             match gpu.swapchain_fn.queue_present(gpu.queue, &present) {
                 Ok(false) => {}
                 Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.stale = true,
@@ -1056,9 +1173,95 @@ impl Target {
     }
 }
 
+impl Target {
+    fn layer(&mut self, win: *mut ANativeWindow) -> Option<&Layer> {
+        if self.layer.is_none() {
+            self.layer = Layer::new(win);
+        }
+        self.layer.as_ref()
+    }
+
+    /// Direct mode's stand-in for the composited caption: copies the band's
+    /// window rows (`band`: first row, rows; `width` px wide) out of the
+    /// client's buffer, which lies at `origin` in window px. Callers have
+    /// waited for the last frame.
+    fn read_direct(&mut self, d: &Dmabuf, origin: (i32, i32), width: i32, band: (i32, i32), serial: u64) -> Result<bool, String> {
+        let y0 = band.0.max(origin.1);
+        let rows = (band.0 + band.1).min(origin.1 + d.height) - y0;
+        if rows <= 0 || width <= 0 || !d.format.transfer {
+            return Ok(false);
+        }
+        let gpu = self.gpu.clone();
+        let dev = &gpu.device;
+        self.ensure_readback((width * rows * 4) as u64)?;
+        let (buffer, ..) = self.readback.unwrap();
+        let cmd = self.cmd;
+        unsafe {
+            err("reset cmd", dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()))?;
+            err(
+                "begin",
+                dev.begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                ),
+            )?;
+            barrier(
+                dev,
+                cmd,
+                d.image,
+                (vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+                (vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER),
+                (vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ),
+                Some((vk::QUEUE_FAMILY_FOREIGN_EXT, gpu.qfi)),
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(LAYER)
+                .image_offset(vk::Offset3D { x: -origin.0, y: y0 - origin.1, z: 0 })
+                .image_extent(vk::Extent3D { width: width as u32, height: rows as u32, depth: 1 });
+            dev.cmd_copy_image_to_buffer(cmd, d.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
+            barrier(
+                dev,
+                cmd,
+                d.image,
+                (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::GENERAL),
+                (vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE),
+                (vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::empty()),
+                Some((gpu.qfi, vk::QUEUE_FAMILY_FOREIGN_EXT)),
+            );
+            let host = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(buffer)
+                .size(vk::WHOLE_SIZE);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[host],
+                &[],
+            );
+            err("end", dev.end_command_buffer(cmd))?;
+            let signals = [gpu.timeline];
+            let values = [serial];
+            let mut tl = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+            let cmds = [cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds).signal_semaphores(&signals).push_next(&mut tl);
+            err("submit", dev.queue_submit(gpu.queue, &[submit], vk::Fence::null()))?;
+        }
+        self.last_serial = serial;
+        self.band = (y0, rows, width, d.bgra);
+        Ok(true)
+    }
+}
+
 impl Drop for Target {
     fn drop(&mut self) {
         let gpu = self.gpu.clone();
+        self.layer = None;
         gpu.wait(self.last_serial);
         self.destroy_swapchain();
         unsafe {
@@ -1132,7 +1335,8 @@ struct ShmTex {
     staging_mem: vk::DeviceMemory,
     ptr: *mut u8,
     size: (i32, i32),
-    /// Texture serial last copied to staging.
+    /// Texture serial in the staging buffer, and in the image.
+    staged: u64,
     uploaded: u64,
     last_use: u64,
 }
@@ -1144,23 +1348,98 @@ pub struct Renderer {
     serial: u64,
     /// Submitted frames whose caption readback is still to be read.
     frames: Vec<(u64, u32)>,
-    /// Client buffers to release once the GPU is done with them.
-    releases: Vec<(u64, WlBuffer)>,
+    /// Client buffers and release points to give back once the GPU and
+    /// SurfaceFlinger are done with them (a `Release` signals when dropped).
+    releases: Vec<(Rc<Dmabuf>, Option<WlBuffer>, Option<Release>)>,
     /// A window was skipped because a client buffer was still being drawn.
     deferred: bool,
+    /// Direct mode (see `direct.rs`): off with `direct=0`.
+    direct_enabled: bool,
+    shared: Arc<Shared>,
+    direct: HashMap<u32, Direct>,
+    /// SurfaceFlinger release fences, each for one hold of a buffer.
+    sf_fences: Vec<(OwnedFd, Rc<Dmabuf>)>,
+    placeholder: *mut AHardwareBuffer,
+    next_token: u64,
+}
+
+/// A window's direct-mode layer, as last told to SurfaceFlinger.
+#[derive(Default)]
+struct Direct {
+    /// The Target whose layer this describes.
+    generation: u64,
+    /// The client buffer on the layer.
+    shown: Option<Rc<Dmabuf>>,
+    /// The transaction not yet complete, if any: windows apply one at a
+    /// time, which paces them to their display.
+    in_flight: Option<u64>,
+    /// Per outstanding transaction, the buffer it took off the layer
+    /// (released by that transaction's previous-release fence).
+    replaced: HashMap<u64, Option<Rc<Dmabuf>>>,
+}
+
+impl Direct {
+    /// Forgets the layer (it was destroyed with its Target): SurfaceFlinger
+    /// drops its buffers with it.
+    fn reset(&mut self) {
+        for d in self.shown.take().into_iter().chain(self.replaced.drain().filter_map(|(_, d)| d)) {
+            d.sf_holds.set(d.sf_holds.get().saturating_sub(1));
+        }
+        self.in_flight = None;
+    }
 }
 
 impl Renderer {
-    pub fn new() -> Result<Renderer, String> {
+    pub fn new(shared: Arc<Shared>, direct_enabled: bool) -> Result<Renderer, String> {
         let gpu = Gpu::new()?;
         let serial = gpu.completed();
-        Ok(Renderer { gpu, shm: HashMap::new(), serial, frames: Vec::new(), releases: Vec::new(), deferred: false })
+        Ok(Renderer {
+            gpu,
+            shm: HashMap::new(),
+            serial,
+            frames: Vec::new(),
+            releases: Vec::new(),
+            deferred: false,
+            direct_enabled,
+            shared,
+            direct: HashMap::new(),
+            sf_fences: Vec::new(),
+            placeholder: if direct_enabled { crate::direct::placeholder() } else { std::ptr::null_mut() },
+            next_token: 1,
+        })
     }
 
-    /// Whether the event loop should wake up again soon (frames in flight
-    /// or a window waiting for a client's buffer).
+    /// Whether direct mode may be used, i.e. clients should prefer formats
+    /// SurfaceFlinger takes as is.
+    pub fn direct_enabled(&self) -> bool {
+        self.direct_enabled
+    }
+
+    /// Whether the event loop should wake up again soon (frames in flight,
+    /// buffers to give back, or a window waiting for a client's buffer).
     pub fn busy(&self) -> bool {
-        self.deferred || !self.frames.is_empty() || !self.releases.is_empty()
+        self.deferred || !self.frames.is_empty() || !self.releases.is_empty() || !self.sf_fences.is_empty()
+    }
+
+    /// A window is gone; its layer went with its Target.
+    pub fn forget_window(&mut self, win: u32) {
+        if let Some(mut d) = self.direct.remove(&win) {
+            d.reset();
+        }
+    }
+
+    /// SurfaceFlinger completed a direct-mode transaction (`Cmd::DirectDone`).
+    pub fn direct_done(&mut self, win: u32, token: u64, fence: Option<OwnedFd>) {
+        let Some(state) = self.direct.get_mut(&win) else { return };
+        if state.in_flight == Some(token) {
+            state.in_flight = None;
+        }
+        let Some(Some(replaced)) = state.replaced.remove(&token) else { return };
+        match fence {
+            Some(f) => self.sf_fences.push((f, replaced)),
+            // -1: the buffer was already released.
+            None => replaced.sf_holds.set(replaced.sf_holds.get().saturating_sub(1)),
+        }
     }
 
     pub fn forget_surface(&mut self, sid: &ObjectId) {
@@ -1174,13 +1453,15 @@ impl Renderer {
         self.gpu.retire(t.last_use, Retired::Buffer(t.staging, t.staging_mem));
     }
 
-    /// Releases a client buffer once the GPU no longer reads it.
-    pub fn release(&mut self, buffer: WlBuffer, d: &Dmabuf) {
-        let serial = d.last_use.get();
-        if serial <= self.gpu.completed() {
-            buffer.release();
+    /// Releases a client buffer (and signals its commit's release point)
+    /// once neither the GPU nor SurfaceFlinger reads it.
+    pub fn release(&mut self, buffer: Option<WlBuffer>, release: Option<Release>, d: &Rc<Dmabuf>) {
+        if d.idle(self.gpu.completed()) {
+            if let Some(b) = buffer {
+                b.release();
+            }
         } else {
-            self.releases.push((serial, buffer));
+            self.releases.push((d.clone(), buffer, release));
         }
     }
 
@@ -1200,13 +1481,14 @@ impl Renderer {
             self.shm.insert(sid.clone(), tex);
         }
         let s = self.shm.get_mut(sid).unwrap();
-        let upload = s.uploaded != t.serial;
-        if upload {
+        if s.staged != t.serial {
             // The staging buffer may still feed the previous upload.
             self.gpu.wait(s.last_use);
             unsafe { std::ptr::copy_nonoverlapping(t.data.as_ptr() as *const u8, s.ptr, (w * h * 4) as usize) };
-            s.uploaded = t.serial;
+            s.staged = t.serial;
         }
+        // Counts as uploaded once a frame recording the copy is submitted.
+        let upload = s.uploaded != t.serial;
         Ok(Source::Shm { image: s.image, view: s.view, staging: s.staging, width: w, height: h, upload })
     }
 
@@ -1254,7 +1536,7 @@ impl Renderer {
                     return Err(e);
                 }
             };
-            Ok(ShmTex { image, memory, view, staging, staging_mem, ptr, size: (w, h), uploaded: 0, last_use: 0 })
+            Ok(ShmTex { image, memory, view, staging, staging_mem, ptr, size: (w, h), staged: 0, uploaded: 0, last_use: 0 })
         }
     }
 
@@ -1263,11 +1545,19 @@ impl Renderer {
     fn collect(&mut self, st: &mut State) {
         self.gpu.collect();
         let done = self.gpu.completed();
-        self.releases.retain(|(s, b)| {
-            if *s > done {
+        self.sf_fences.retain(|(fence, d)| {
+            let mut p = libc::pollfd { fd: fence.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let signalled = unsafe { libc::poll(&mut p, 1, 0) } == 1;
+            if signalled {
+                d.sf_holds.set(d.sf_holds.get().saturating_sub(1));
+            }
+            !signalled
+        });
+        self.releases.retain(|(d, b, _)| {
+            if !d.idle(done) {
                 return true;
             }
-            if b.is_alive() {
+            if let Some(b) = b.as_ref().filter(|b| b.is_alive()) {
                 b.release();
             }
             false
@@ -1297,9 +1587,15 @@ impl Renderer {
             crate::output::ensure_scale(st, sid, display);
         }
         // Latch only finished client frames, so a slow client cannot stall
-        // the queue that every window shares.
+        // the queue that every window shares: the acquire point with explicit
+        // sync, else the dmabuf's implicit fences.
         let busy = list.iter().any(|(sid, _, _)| {
-            st.surfaces.get(sid).and_then(|s| s.texture.as_ref()).and_then(|t| t.dmabuf.as_ref()).is_some_and(|(_, d)| !d.ready())
+            let Some(t) = st.surfaces.get(sid).and_then(|s| s.texture.as_ref()) else { return false };
+            match (&t.sync, &t.dmabuf) {
+                (Some(sync), _) => !sync.acquire.signalled(),
+                (None, Some((_, d))) => !d.ready(),
+                _ => false,
+            }
         });
         if busy {
             self.deferred = true;
@@ -1340,9 +1636,15 @@ impl Renderer {
             draws.push(Draw { source, dst: [x, y, x1, y1], uv });
         }
 
+        let generation = slot.with_target(|_, t| t.as_ref().map(|t| t.generation)).flatten();
+        self.sync_layer(id, generation);
+        if let Some((d, at)) = self.direct_candidate(st, &list, &draws, (pw, ph), top) {
+            return self.render_direct(st, id, &slot, &list, d, at, (pw, ph), top, band);
+        }
+
         let serial = self.serial + 1;
         let gpu = self.gpu.clone();
-        let result = slot.with_target(|win, target| -> Result<bool, String> {
+        let result = slot.with_target(|win, target| -> Result<(bool, u64), String> {
             if target.is_none() {
                 *target = Some(Target::new(gpu.clone(), win)?);
             }
@@ -1351,11 +1653,11 @@ impl Renderer {
             if t.stale || t.extent != (pw, ph) {
                 t.configure(pw, ph)?;
             }
-            t.frame(&draws, band, serial)
+            Ok((t.frame(&draws, band, serial)?, t.generation))
         });
-        match result {
-            Some(Ok(true)) => {}
-            Some(Ok(false)) => {
+        let generation = match result {
+            Some(Ok((true, g))) => g,
+            Some(Ok((false, _))) => {
                 self.deferred = true;
                 return;
             }
@@ -1364,18 +1666,145 @@ impl Renderer {
                 return;
             }
             None => return,
-        }
+        };
         self.serial = serial;
         self.frames.push((serial, id));
+        // Composited again: take the client's buffer off the direct layer.
+        self.sync_layer(id, Some(generation));
+        if let Some(state) = self.direct.get_mut(&id).filter(|s| s.shown.is_some()) {
+            let token = self.next_token;
+            self.next_token += 1;
+            let (shared, placeholder) = (self.shared.clone(), self.placeholder);
+            slot.with_target(|_, t| {
+                if let Some(layer) = t.as_ref().and_then(|t| t.layer.as_ref()) {
+                    layer.present(None, placeholder, [0; 4], &shared, id, token);
+                }
+            });
+            state.replaced.insert(token, state.shown.take());
+            log::info!("toplevel {id}: composited");
+        }
         let now = st.now_ms();
         for (sid, _, _) in &list {
             if let Some(t) = self.shm.get_mut(sid) {
+                t.uploaded = t.staged;
                 t.last_use = serial;
             }
             if let Some(s) = st.surfaces.get_mut(sid) {
                 if let Some((_, d)) = s.texture.as_ref().and_then(|t| t.dmabuf.as_ref()) {
                     d.last_use.set(serial);
                 }
+                for cb in s.frame_cbs.drain(..) {
+                    cb.done(now);
+                }
+            }
+        }
+        if let Some(w) = st.windows.get_mut(&id) {
+            w.dirty = false;
+        }
+    }
+}
+
+impl Renderer {
+    /// Resets a window's direct-mode state if its Target (and so its
+    /// layer) is not the one the state describes.
+    fn sync_layer(&mut self, id: u32, generation: Option<u64>) {
+        let state = self.direct.entry(id).or_default();
+        if generation != Some(state.generation) {
+            state.reset();
+            state.generation = generation.unwrap_or(0);
+        }
+    }
+
+    /// The window's buffer and where it lies (window px), if SurfaceFlinger
+    /// can show it as is: one dmabuf surface, drawn 1:1, covering the whole
+    /// window below the caption's top. Anything outside (GTK's resize
+    /// margin) is cropped.
+    fn direct_candidate(
+        &self,
+        st: &State,
+        list: &[(ObjectId, i32, i32)],
+        draws: &[Draw],
+        (pw, ph): (i32, i32),
+        top: i32,
+    ) -> Option<(Rc<Dmabuf>, [i32; 4])> {
+        if !self.direct_enabled || self.placeholder.is_null() || list.len() != 1 || draws.len() != 1 {
+            return None;
+        }
+        let draw = &draws[0];
+        let [x0, y0, x1, y1] = draw.dst;
+        let covers = x0 <= 0 && y0 <= top && x1 >= pw && y1 >= ph;
+        if !matches!(draw.source, Source::Dmabuf { .. }) || !covers || draw.uv != [0.0, 0.0, 1.0, 1.0] {
+            return None;
+        }
+        let (_, d) = st.surfaces.get(&list[0].0)?.texture.as_ref()?.dmabuf.as_ref()?;
+        let fits = d.format.direct() && !d.y_invert && (d.width, d.height) == (x1 - x0, y1 - y0);
+        (fits && d.hardware_buffer().is_some()).then(|| (d.clone(), draw.dst))
+    }
+
+    /// Shows the buffer on the window's layer, one transaction at a time.
+    #[allow(clippy::too_many_arguments)]
+    fn render_direct(
+        &mut self,
+        st: &mut State,
+        id: u32,
+        slot: &Arc<crate::android::NativeSlot>,
+        list: &[(ObjectId, i32, i32)],
+        d: Rc<Dmabuf>,
+        at: [i32; 4],
+        (pw, ph): (i32, i32),
+        top: i32,
+        band: (i32, i32),
+    ) {
+        if self.direct.get(&id).is_some_and(|s| s.in_flight.is_some()) {
+            self.deferred = true;
+            return;
+        }
+        let Some(ahb) = d.hardware_buffer() else { return };
+        let serial = self.serial + 1;
+        let token = self.next_token;
+        self.next_token += 1;
+        let (gpu, shared, placeholder) = (self.gpu.clone(), self.shared.clone(), self.placeholder);
+        let result = slot.with_target(|win, target| -> Result<(u64, bool), String> {
+            if target.is_none() {
+                *target = Some(Target::new(gpu.clone(), win)?);
+            }
+            let t = target.as_mut().unwrap();
+            gpu.wait(t.last_serial);
+            let layer = t.layer(win).ok_or("cannot create the direct layer")?;
+            // The window's part of the buffer, in buffer px.
+            let src = [-at[0], top - at[1], pw - at[0], ph - at[1]];
+            layer.present(Some((ahb, src, d.opaque)), placeholder, [0, top, pw, ph], &shared, id, token);
+            let read = t.read_direct(&d, (at[0], at[1]), pw, band, serial).unwrap_or_else(|e| {
+                log::warn!("gpu: caption readback: {e}");
+                false
+            });
+            Ok((t.generation, read))
+        });
+        let (generation, read) = match result {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => {
+                log::warn!("gpu: toplevel {id}: {e}");
+                return;
+            }
+            None => return,
+        };
+        self.sync_layer(id, Some(generation));
+        let state = self.direct.get_mut(&id).unwrap();
+        d.sf_holds.set(d.sf_holds.get() + 1);
+        let replaced = state.shown.replace(d.clone());
+        if replaced.is_none() {
+            log::info!("toplevel {id}: direct ({}x{} {:#x}/{:#x})", d.width, d.height, d.format.fourcc, d.format.modifier);
+        }
+        state.replaced.insert(token, replaced);
+        state.in_flight = Some(token);
+        if read {
+            self.serial = serial;
+            self.frames.push((serial, id));
+            d.last_use.set(serial);
+        }
+        let now = st.now_ms();
+        for (sid, _, _) in list {
+            if let Some(s) = st.surfaces.get_mut(sid) {
                 for cb in s.frame_cbs.drain(..) {
                     cb.done(now);
                 }
