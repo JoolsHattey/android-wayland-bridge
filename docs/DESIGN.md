@@ -257,6 +257,44 @@ Fallbacks for `xdg_toplevel.move` if needed, both privileged:
 Settings for experiments, in `files/awb.properties`:
 `exclusion=auto|caption|none`.
 
+## Appearance: dark mode and accent colour
+
+On a Linux desktop, the shell (GNOME Shell, KWin) is the source of the
+appearance settings. Apps read them from `org.freedesktop.portal.Settings`
+on the session bus and follow `SettingChanged` live. Here the compositor
+takes that role (`native/src/portal.rs`):
+
+* `awb-run.sh` starts one session `dbus-daemon` for the chroot's apps. The
+  start is serialised with util-linux `flock -o` so concurrent launches
+  don't start two. Its socket lives in the app's files dir: `/run/awb/bus`
+  inside the chroot, `files/bus` for the compositor. Apps get
+  `DBUS_SESSION_BUS_ADDRESS` pointing at it.
+* The compositor connects from Android (thread `awb-portal`) and owns
+  `org.freedesktop.portal.Desktop`. If the daemon restarts it reconnects
+  (polling every second, with a liveness check every 5 s).
+  - dbus-daemon only admits uids it can resolve. `awb-run.sh` therefore
+    registers the app's uid (owner of its files dir) as the system user
+    `awb` in the chroot's passwd and group files.
+  - The bus policy allows only `root` and `awb`.
+* `org.freedesktop.appearance` is served with `ReadAll`, `ReadOne` and the
+  legacy `Read`:
+  - `color-scheme` is 1 (dark) or 2 (light), from
+    `Configuration.isNightModeActive`.
+  - `accent-color` is Material You's `system_accent1_500` as `(ddd)`.
+* `AwbApp` publishes both on start and in `onConfigurationChanged`, so a
+  night-mode toggle or a wallpaper change reaches running apps as
+  `SettingChanged`.
+* GTK looks for the portal once, at start-up. On a fresh bus,
+  `awb-run.sh` waits up to about 3 s for the name before starting the app.
+* Verified: libadwaita apps switch light/dark live with
+  `cmd uimode night yes|no`, and their header changes flip Android's
+  caption icons via the existing brightness check.
+  - Plain GTK 4.18 apps (no libadwaita) stay light, as on GNOME. GTK 4.20
+    maps the portal's scheme to `gtk-interface-color-scheme`.
+  - GTK3/Qt aren't covered yet.
+* With a session bus, GApplication apps also behave as on a desktop: they
+  can be single-instance and are activatable.
+
 ## Robustness
 
 * Every request handler runs in `guard()` (`catch_unwind`). A panic logs and
@@ -333,10 +371,11 @@ Tested with adwaita-1-demo, gtk4-demo, foot and weston-simple-shm.
 3. `linux-dmabuf`: import client dmabufs as `AHardwareBuffer` and present
    them through `ASurfaceTransaction` (`SurfaceControl`) without copies.
    This also lets each window pace on its own transactions.
-4. Clipboard: `wl_data_device` ↔ `ClipboardManager` (text first), then
+4. ~~Dark mode and accent colour via the settings portal.~~ Done.
+5. Clipboard: `wl_data_device` ↔ `ClipboardManager` (text first), then
    drag and drop.
-5. IME: `zwp_text_input_v3` ↔ `InputConnection`.
-6. Window Controls Overlay hints for Chromium/Electron; a per-window
+6. IME: `zwp_text_input_v3` ↔ `InputConnection`.
+7. Window Controls Overlay hints for Chromium/Electron; a per-window
    caption-geometry channel for GTK.
-7. Optional privileged drag helper for `xdg_toplevel.move` and
+8. Optional privileged drag helper for `xdg_toplevel.move` and
    `resize`.

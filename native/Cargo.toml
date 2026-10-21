@@ -13,6 +13,7 @@ wayland-protocols = { version = "0.32", features = ["server", "unstable", "stagi
 jni = "0.21"
 libc = "0.2"
 log = "0.4"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
 [profile.release]
 # Panics must unwind so a bug triggered by one client is caught and only that

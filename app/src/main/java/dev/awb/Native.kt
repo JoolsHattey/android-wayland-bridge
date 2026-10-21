@@ -17,6 +17,12 @@ object Native {
 
     @JvmStatic external fun displayRemoved(id: Int)
 
+    /**
+     * Android's appearance, served to Linux apps as the portal's
+     * org.freedesktop.appearance settings. [accent] is ARGB; 0 = none.
+     */
+    @JvmStatic external fun appearance(dark: Boolean, accent: Int)
+
     /** Window [win] is now on Android display [display]. */
     @JvmStatic external fun windowDisplay(win: Int, display: Int)
 

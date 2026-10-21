@@ -5,6 +5,7 @@
 mod android;
 mod host;
 mod output;
+mod portal;
 mod render;
 mod seat;
 mod server;
@@ -91,6 +92,7 @@ pub struct Shared {
 }
 
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
+static PORTAL: OnceLock<Arc<portal::Portal>> = OnceLock::new();
 
 impl Shared {
     pub fn push(&self, cmd: Cmd) {
@@ -162,6 +164,11 @@ pub extern "system" fn Java_dev_awb_Native_start(
             slots: Mutex::new(HashMap::new()),
         });
         let _ = SHARED.set(shared.clone());
+        // The chroot's session bus lives next to the Wayland socket.
+        let bus = std::path::Path::new(&path).with_file_name("bus");
+        let portal = PORTAL.get_or_init(Default::default).clone();
+        let address = format!("unix:path={}", bus.display());
+        let _ = std::thread::Builder::new().name("awb-portal".into()).spawn(move || portal::run(address, portal));
         let cfg = server::Config { socket_path: path };
         std::thread::Builder::new()
             .name("awb-compositor".into())
@@ -299,4 +306,14 @@ pub extern "system" fn Java_dev_awb_Native_displayRemoved(_env: JNIEnv, _cls: JC
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_awb_Native_windowDisplay(_env: JNIEnv, _cls: JClass, win: jint, display: jint) {
     push(Cmd::WindowDisplay(win as u32, display));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_appearance(_env: JNIEnv, _cls: JClass, dark: jboolean, accent: jint) {
+    ffi_guard("appearance", (), || {
+        // `accent` is Android ARGB; alpha 0 means none.
+        let channel = |shift: u32| ((accent as u32 >> shift) & 0xff) as f64 / 255.0;
+        let accent = ((accent as u32) >> 24 != 0).then(|| (channel(16), channel(8), channel(0)));
+        PORTAL.get_or_init(Default::default).set(portal::Appearance { dark: dark != 0, accent });
+    })
 }

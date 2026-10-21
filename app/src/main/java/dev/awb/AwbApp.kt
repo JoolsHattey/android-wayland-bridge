@@ -3,6 +3,7 @@ package dev.awb
 import android.app.ActivityOptions
 import android.app.Application
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
@@ -55,6 +56,20 @@ class AwbApp : Application(), NativeCallbacks {
         val dm = getSystemService(DisplayManager::class.java)
         dm.displays.forEach { reportDisplay(it.displayId) }
         dm.registerDisplayListener(displayListener, main)
+        publishAppearance(resources.configuration)
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Night mode and wallpaper (accent) changes both arrive here.
+        publishAppearance(newConfig)
+    }
+
+    private fun publishAppearance(config: Configuration) {
+        val dark = config.isNightModeActive
+        // Material You's accent; libadwaita derives its own shades from it.
+        val accent = runCatching { getColor(android.R.color.system_accent1_500) }.getOrDefault(0)
+        Native.appearance(dark, accent)
     }
 
     /**
