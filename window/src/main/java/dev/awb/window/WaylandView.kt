@@ -1,16 +1,21 @@
-package dev.awb
+package dev.awb.window
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.RemoteException
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.PointerIcon
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 
-/** The client's pixels (drawn natively into this surface) and its pointer input. */
+/**
+ * The client's pixels and its pointer input. The surface is handed to the
+ * compositor, which draws into it from its own process.
+ */
 @SuppressLint("ViewConstructor")
-class WaylandView(context: Context, private val win: Int) : SurfaceView(context), SurfaceHolder.Callback {
+class WaylandView(context: Context, private val session: IToplevelSession, private val win: Int) :
+    SurfaceView(context), SurfaceHolder.Callback {
     var icon: PointerIcon? = null
 
     init {
@@ -19,12 +24,20 @@ class WaylandView(context: Context, private val win: Int) : SurfaceView(context)
         isFocusableInTouchMode = true
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) = Native.attachSurface(win, holder.surface)
+    /** Session calls fail only once the compositor died; the activity closes then. */
+    private inline fun call(f: () -> Unit) {
+        try {
+            f()
+        } catch (_: RemoteException) {
+        }
+    }
+
+    override fun surfaceCreated(holder: SurfaceHolder) = call { session.attachSurface(win, holder.surface) }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) =
-        Native.resize(win, width, height)
+        call { session.resize(win, width, height) }
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) = Native.attachSurface(win, null)
+    override fun surfaceDestroyed(holder: SurfaceHolder) = call { session.attachSurface(win, null) }
 
     private fun isMouse(e: MotionEvent) =
         e.isFromSource(InputDevice.SOURCE_MOUSE) || e.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)
@@ -33,7 +46,7 @@ class WaylandView(context: Context, private val win: Int) : SurfaceView(context)
     private fun buttons(e: MotionEvent): Int = if (isMouse(e)) e.buttonState else 0
 
     private fun send(e: MotionEvent, action: Int, buttons: Int = buttons(e)) =
-        Native.pointer(win, action, e.x, e.y, buttons, 0f, 0f, e.eventTime)
+        call { session.pointer(win, action, e.x, e.y, buttons, 0f, 0f, e.eventTime) }
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
@@ -47,10 +60,12 @@ class WaylandView(context: Context, private val win: Int) : SurfaceView(context)
 
     override fun onGenericMotionEvent(e: MotionEvent): Boolean {
         when (e.actionMasked) {
-            MotionEvent.ACTION_SCROLL -> Native.pointer(
-                win, 1, e.x, e.y, buttons(e),
-                e.getAxisValue(MotionEvent.AXIS_VSCROLL), e.getAxisValue(MotionEvent.AXIS_HSCROLL), e.eventTime,
-            )
+            MotionEvent.ACTION_SCROLL -> call {
+                session.pointer(
+                    win, 1, e.x, e.y, buttons(e),
+                    e.getAxisValue(MotionEvent.AXIS_VSCROLL), e.getAxisValue(MotionEvent.AXIS_HSCROLL), e.eventTime,
+                )
+            }
             // A hover exit also precedes every press; only a real exit leaves.
             MotionEvent.ACTION_HOVER_EXIT ->
                 if (e.x < 0 || e.y < 0 || e.x >= width || e.y >= height) send(e, 2)

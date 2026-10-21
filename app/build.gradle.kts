@@ -37,4 +37,8 @@ val cargoBuild by tasks.registering(Exec::class) {
     commandLine("cargo", "ndk", "-t", "x86_64", "--platform", "35", "-o", outDir.get().asFile.path, "build", "--release")
 }
 
+dependencies {
+    implementation(project(":window"))
+}
+
 tasks.named("preBuild") { dependsOn(cargoBuild) }

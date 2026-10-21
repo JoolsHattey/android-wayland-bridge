@@ -1,4 +1,4 @@
-package dev.awb
+package dev.awb.window
 
 import android.view.KeyEvent
 

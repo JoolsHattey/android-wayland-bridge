@@ -2,32 +2,51 @@ package dev.awb
 
 import android.app.ActivityOptions
 import android.app.Application
+import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.os.Handler
 import android.os.Looper
+import android.os.RemoteException
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import android.view.Display
-import android.view.PointerIcon
-import android.view.WindowManager
+import android.view.Surface
+import dev.awb.window.IToplevelHost
+import dev.awb.window.IToplevelSession
+import dev.awb.window.ToplevelActivity
+import dev.awb.window.Window
 import java.io.File
+import java.util.concurrent.FutureTask
 import kotlin.math.roundToInt
 
 /**
  * Starts the compositor with the process and turns its callbacks into
- * Android windows: one [ToplevelActivity] (own task) per Wayland toplevel.
+ * Android windows: one [ToplevelActivity] (own task) per Wayland toplevel,
+ * in the stub app of its Linux app when one is installed, else in dev.awb.
+ * The activities reach the compositor through [session].
  */
 class AwbApp : Application(), NativeCallbacks {
     private val main = Handler(Looper.getMainLooper())
-    val activities = HashMap<Int, ToplevelActivity>()
+
+    /** The activity of each attached window. Main thread only, like the rest of the state. */
+    private val hosts = HashMap<Int, IToplevelHost>()
 
     /** Windows the compositor has mapped in this process. */
-    val mapped = HashSet<Int>()
-    private val pendingCursor = HashMap<Int, PointerIcon?>()
+    private val mapped = HashSet<Int>()
+
+    /** Android display of each attached window. */
+    private val windowDisplays = HashMap<Int, Int>()
+    private val pendingCursor = HashMap<Int, Cursor>()
     private var cascade = 0
+
+    private class Cursor(val bitmap: Bitmap?, val hotX: Float, val hotY: Float)
 
     lateinit var socketPath: String
         private set
@@ -51,6 +70,7 @@ class AwbApp : Application(), NativeCallbacks {
         super.onCreate()
         instance = this
         socketPath = File(filesDir, "wayland-0").path
+        createLaunchFifo()
         val ok = Native.start(socketPath, this)
         Log.i(TAG, "compositor start=$ok socket=$socketPath")
         val dm = getSystemService(DisplayManager::class.java)
@@ -118,30 +138,48 @@ class AwbApp : Application(), NativeCallbacks {
         val options = ActivityOptions.makeBasic()
             .setLaunchDisplayId(target.displayId)
             .setLaunchBounds(Rect(left, top, left + w, top + h))
-        val intent = Intent(this, ToplevelActivity::class.java)
-            .putExtra(ToplevelActivity.EXTRA_WIN, win)
-            .putExtra(ToplevelActivity.EXTRA_TITLE, title.ifEmpty { appId })
+        val activity = stubFor(appId) ?: ComponentName(this, ToplevelActivity::class.java)
+        val intent = Intent().setComponent(activity)
+            .putExtra(Window.EXTRA_WIN, win)
+            .putExtra(Window.EXTRA_TITLE, title.ifEmpty { appId })
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_NEW_DOCUMENT)
-        Log.i(TAG, "map $win ${w}x$h '$title' ($appId)")
+        Log.i(TAG, "map $win ${w}x$h '$title' ($appId) in ${activity.packageName}")
         mapped += win
         startActivity(intent, options.toBundle())
     }.let {}
 
+    /**
+     * The installed stub app for Linux app [appId]: an exported
+     * [Window.ACTION_TOPLEVEL] activity whose meta-data names it.
+     */
+    private fun stubFor(appId: String): ComponentName? {
+        if (appId.isEmpty()) return null
+        val flags = PackageManager.ResolveInfoFlags.of(PackageManager.GET_META_DATA.toLong())
+        return packageManager.queryIntentActivities(Intent(Window.ACTION_TOPLEVEL), flags)
+            .map { it.activityInfo }
+            .firstOrNull { it.metaData?.getString(Window.META_APP_ID) == appId }
+            ?.let { ComponentName(it.packageName, it.name) }
+    }
+
     override fun onUnmap(win: Int) = main.post {
         Log.i(TAG, "unmap $win")
         mapped -= win
-        activities.remove(win)?.closeFromClient()
+        windowDisplays -= win
+        hosts.remove(win)?.let { h -> remote { h.closeFromClient() } }
     }.let {}
 
-    override fun onTitle(win: Int, title: String) = main.post { activities[win]?.setWindowTitle(title) }.let {}
+    /** Calls [win]'s activity, if attached, on the main thread. */
+    private fun host(win: Int, f: (IToplevelHost) -> Unit) = main.post { hosts[win]?.let { h -> remote { f(h) } } }.let {}
 
-    override fun onMinimize(win: Int) = main.post { activities[win]?.moveTaskToBack(true) }.let {}
+    override fun onTitle(win: Int, title: String) = host(win) { it.setTitle(title) }
 
-    override fun onMoveRequest(win: Int) = main.post { activities[win]?.onMoveRequest() }.let {}
+    override fun onMinimize(win: Int) = host(win) { it.minimize() }
 
-    override fun onCaptionLight(win: Int, light: Boolean) = main.post { activities[win]?.setCaptionLight(light) }.let {}
+    override fun onMoveRequest(win: Int) = host(win) { it.moveRequest() }
 
-    override fun onExclusion(win: Int, rects: IntArray) = main.post { activities[win]?.setHeaderExclusion(rects) }.let {}
+    override fun onCaptionLight(win: Int, light: Boolean) = host(win) { it.setCaptionLight(light) }
+
+    override fun onExclusion(win: Int, rects: IntArray) = host(win) { it.setExclusion(rects) }
 
     /**
      * Writes files/gtk.css (imported by the chroot's GTK config, see
@@ -167,23 +205,146 @@ class AwbApp : Application(), NativeCallbacks {
     }
 
     override fun onCursor(win: Int, argb: IntArray?, width: Int, height: Int, hotX: Int, hotY: Int, scale: Float) {
-        val icon = if (argb == null || width <= 0 || height <= 0) {
-            PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL)
+        val cursor = if (argb == null || width <= 0 || height <= 0) {
+            Cursor(null, 0f, 0f)
         } else {
             var bmp = Bitmap.createBitmap(argb, width, height, Bitmap.Config.ARGB_8888)
             val (w, h) = (width * scale).roundToInt().coerceAtLeast(1) to (height * scale).roundToInt().coerceAtLeast(1)
             if (w != width || h != height) bmp = Bitmap.createScaledBitmap(bmp, w, h, true)
-            PointerIcon.create(bmp, (hotX * scale).coerceIn(0f, w - 1f), (hotY * scale).coerceIn(0f, h - 1f))
+            Cursor(bmp, (hotX * scale).coerceIn(0f, w - 1f), (hotY * scale).coerceIn(0f, h - 1f))
         }
         main.post {
-            val a = activities[win]
-            if (a != null) a.setPointer(icon) else pendingCursor[win] = icon
+            val h = hosts[win]
+            if (h != null) remote { h.setPointer(cursor.bitmap, cursor.hotX, cursor.hotY) } else pendingCursor[win] = cursor
         }
     }
 
-    fun register(win: Int, activity: ToplevelActivity) {
-        activities[win] = activity
-        pendingCursor.remove(win)?.let { activity.setPointer(it) }
+    /** Ignores a dead activity's process; its death notice cleans up. */
+    private inline fun remote(f: () -> Unit) {
+        try {
+            f()
+        } catch (e: RemoteException) {
+            Log.w(TAG, "window activity gone: $e")
+        }
+    }
+
+    /** Runs [f] on the main thread and waits for it (binder threads; in-process calls already are on it). */
+    private fun <T> onMain(f: () -> T): T {
+        if (Looper.myLooper() == main.looper) return f()
+        val task = FutureTask(f)
+        main.post(task)
+        return task.get()
+    }
+
+    /**
+     * The compositor as the window activities see it (served by
+     * [ToplevelService]). Input goes straight to the compositor thread;
+     * anything touching window state hops to the main thread.
+     */
+    val session = object : IToplevelSession.Stub() {
+        override fun attach(win: Int, host: IToplevelHost, displayId: Int): Boolean = onMain {
+            if (win !in mapped) return@onMain false
+            hosts[win] = host
+            // Before the surface exists, so the first configure uses this display's scale.
+            windowDisplays[win] = displayId
+            Native.windowDisplay(win, displayId)
+            host.asBinder().linkToDeath({ main.post { died(win, host) } }, 0)
+            pendingCursor.remove(win)?.let { c -> remote { host.setPointer(c.bitmap, c.hotX, c.hotY) } }
+            true
+        }
+
+        override fun attachSurface(win: Int, surface: Surface?) = Native.attachSurface(win, surface)
+
+        override fun resize(win: Int, width: Int, height: Int) = Native.resize(win, width, height)
+
+        override fun windowDisplay(win: Int, displayId: Int) {
+            main.post { if (win in hosts) windowDisplays[win] = displayId }
+            Native.windowDisplay(win, displayId)
+        }
+
+        override fun focus(win: Int, focused: Boolean) {
+            if (focused) main.post { windowDisplays[win]?.let { lastDisplay = it } }
+            Native.focus(win, focused)
+        }
+
+        override fun pointer(win: Int, action: Int, x: Float, y: Float, buttons: Int, vscroll: Float, hscroll: Float, time: Long) =
+            Native.pointer(win, action, x, y, buttons, vscroll, hscroll, time)
+
+        override fun key(win: Int, code: Int, down: Boolean, time: Long) = Native.key(win, code, down, time)
+
+        override fun caption(win: Int, top: Int, height: Int, rects: IntArray, width: Int) = main.post {
+            val host = hosts[win] ?: return@post
+            // How the header is shared between app and system (see docs/DESIGN.md):
+            //  auto    - the compositor excludes whatever is drawn in the header;
+            //            empty header stays draggable by the system (default)
+            //  caption - the whole caption is the app's (clicks only, no drag)
+            //  none    - nothing excluded; the system takes every caption click
+            val mode = setting("exclusion", "auto")
+            Native.caption(win, top, height, rects, mode == "auto")
+            if (mode != "auto") {
+                remote { host.setExclusion(if (mode == "caption" && height > 0) intArrayOf(0, top, width, height) else IntArray(0)) }
+            }
+            if (top == 0 && height > 0) {
+                val controls = (0 until rects.size / 4).map { i -> rects[i * 4] to rects[i * 4] + rects[i * 4 + 2] }
+                val start = controls.filter { it.first == 0 }.maxOfOrNull { it.second } ?: 0
+                val end = controls.filter { it.second >= width }.maxOfOrNull { width - it.first } ?: 0
+                writeGtkCss(start, end, height, scale120(windowDisplays[win] ?: Display.DEFAULT_DISPLAY))
+            }
+        }.let {}
+
+        override fun close(win: Int) = main.post {
+            if (hosts.remove(win) != null) Native.close(win)
+        }.let {}
+
+        override fun launch(appId: String) = launchApp(appId)
+    }
+
+    /** [win]'s activity process died (a crashed or killed stub): the window goes too. */
+    private fun died(win: Int, host: IToplevelHost) {
+        if (hosts[win]?.asBinder() !== host.asBinder()) return
+        Log.w(TAG, "win $win: activity process died")
+        hosts.remove(win)
+        Native.attachSurface(win, null)
+        Native.close(win)
+    }
+
+    private val launchFifo get() = File(filesDir, "launch")
+
+    /**
+     * The launch requests' channel to the root side (scripts/awb-launcher.sh),
+     * created here so that it carries this app's file label and owner.
+     */
+    private fun createLaunchFifo() {
+        val path = launchFifo.path
+        try {
+            if (!OsConstants.S_ISFIFO(Os.lstat(path).st_mode)) {
+                Os.remove(path)
+                Os.mkfifo(path, "600".toInt(8))
+            }
+        } catch (_: ErrnoException) {
+            runCatching { Os.mkfifo(path, "600".toInt(8)) }.onFailure { Log.e(TAG, "mkfifo $path: $it") }
+        }
+    }
+
+    /** Hands desktop file id [appId] to the root launcher, which runs it in the chroot. */
+    private fun launchApp(appId: String) {
+        if (!appId.matches(Regex("[A-Za-z0-9._-]+"))) return
+        try {
+            // Non-blocking: with no reader (launcher not running) this fails at once.
+            val fd = Os.open(launchFifo.path, OsConstants.O_WRONLY or OsConstants.O_NONBLOCK, 0)
+            try {
+                val line = "$appId\n".toByteArray()
+                Os.write(fd, line, 0, line.size)
+            } finally {
+                Os.close(fd)
+            }
+            Log.i(TAG, "launch $appId")
+        } catch (e: ErrnoException) {
+            Log.e(TAG, "launch $appId: root launcher not running ($e)")
+            main.post {
+                android.widget.Toast.makeText(this, "Linux app launcher is not running (scripts/awb-launcher.sh)", android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     companion object {

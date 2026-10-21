@@ -14,4 +14,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "android-wayland-bridge"
-include(":app")
+include(":app", ":window", ":stub")

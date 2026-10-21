@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Binding to the compositor's session service (declared by dev.awb). -->
+    <uses-permission android:name="dev.awb.permission.WINDOWS" />
+
+    <queries>
+        <package android:name="dev.awb" />
+    </queries>
+</manifest>

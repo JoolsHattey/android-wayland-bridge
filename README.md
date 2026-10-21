@@ -23,6 +23,17 @@ On the device, as root, run any Wayland app from the Debian chroot:
 adb shell /data/local/tmp/awb-run.sh adwaita-1-demo
 ```
 
+To give a Linux app its own launcher icon, build and install its stub app
+(name and icon come from the chroot's desktop file):
+
+```bash
+./scripts/install-stub.sh org.gnome.Adwaita1.Demo
+```
+
+The icon starts the app through `awb-launcher.sh` (the root side, started by
+`deploy.sh`). The app's windows then open as the stub's tasks, so the
+taskbar and recents show them under that app.
+
 For GPU rendering in the apps, the chroot needs Mesa's drivers
 (`apt install mesa-vulkan-drivers libgl1-mesa-dri`). The compositor itself
 composites with Vulkan; `renderer=cpu` in the app's `files/awb.properties`
@@ -31,7 +42,11 @@ switches back to the CPU compositor.
 ## Layout
 
 - `native/`: the compositor (Rust, `wayland-server`), built as `libawb.so`.
-- `app/`: the Kotlin layer (windows, insets, input).
-- `scripts/`: deploy loop and chroot launcher.
+- `app/`: the Kotlin layer: compositor callbacks, displays, the window
+  session service.
+- `window/`: the window activity (insets, input, surface), shared by `app/`
+  and the stubs; it talks to the compositor over binder.
+- `stub/`: the app of one Linux app (launcher icon, window tasks).
+- `scripts/`: deploy loop, chroot and app launchers, stub installer.
 - `tools/torture/`: a misbehaving client for robustness tests. Build it with
   `cargo build --release --target x86_64-unknown-linux-musl`.

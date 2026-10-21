@@ -20,6 +20,7 @@ class MainActivity : Activity() {
                 Scale here: ${app.scale120(display.displayId) / 120f}
 
                 In the Debian chroot: scripts/awb-run.sh <app>
+                Linux app icons: scripts/install-stub.sh <desktop id>
             """.trimIndent()
         })
     }

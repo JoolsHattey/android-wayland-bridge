@@ -4,4 +4,9 @@
         <item name="android:windowBackground">@android:color/black</item>
         <item name="android:windowDisablePreview">true</item>
     </style>
+
+    <!-- A launcher icon's activity: never seen, it only forwards the launch. -->
+    <style name="Launch" parent="@android:style/Theme.Translucent.NoTitleBar">
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
 </resources>

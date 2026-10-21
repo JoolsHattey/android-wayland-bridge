@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false">
+
+        <!-- The launcher icon: asks Wayland Bridge to start the Linux app. -->
+        <activity
+            android:name="dev.awb.window.LaunchActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@style/Launch">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="dev.awb.app_id" android:value="${linuxAppId}" />
+        </activity>
+
+        <!-- One task per window of the Linux app, started by the compositor
+             (dev.awb), which looks it up by the action and app id. -->
+        <activity
+            android:name="dev.awb.window.ToplevelActivity"
+            android:exported="true"
+            android:permission="dev.awb.permission.WINDOWS"
+            android:documentLaunchMode="always"
+            android:resizeableActivity="true"
+            android:theme="@style/Toplevel"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation|density|keyboard|keyboardHidden|navigation|uiMode|fontScale|layoutDirection|colorMode|touchscreen|fontWeightAdjustment">
+            <intent-filter>
+                <action android:name="dev.awb.action.TOPLEVEL" />
+            </intent-filter>
+            <meta-data android:name="dev.awb.app_id" android:value="${linuxAppId}" />
+        </activity>
+    </application>
+</manifest>
