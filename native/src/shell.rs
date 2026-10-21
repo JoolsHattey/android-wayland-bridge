@@ -163,7 +163,15 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
                 s.xdg = Some(xs.id());
                 st.xdg_surfaces.insert(
                     xs.id(),
-                    XdgSurf { surface, res: xs, role: XdgRole::None, geometry: None, pending_geometry: None, configured: false },
+                    XdgSurf {
+                        surface,
+                        res: xs,
+                        role: XdgRole::None,
+                        geometry: None,
+                        pending_geometry: None,
+                        configured: false,
+                        pending_ack: None,
+                    },
                 );
             }
             _ => {}
@@ -246,6 +254,10 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
                             px: (0, 0),
                             display: st.outputs.default_display(),
                             configured: None,
+                            configure_serial: 0,
+                            acked: 0,
+                            sync: None,
+                            window_layer: false,
                             focused: false,
                             popups: Vec::new(),
                             dirty: false,
@@ -293,7 +305,11 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
                         }
                     }
                 }
-                xdg_surface::Request::AckConfigure { .. } => {}
+                xdg_surface::Request::AckConfigure { serial } => {
+                    if let Some(xs) = st.xdg_surfaces.get_mut(&xid) {
+                        xs.pending_ack = Some(serial);
+                    }
+                }
                 _ => {}
             }
         });
@@ -336,7 +352,13 @@ pub fn xdg_committed(st: &mut State, xid: &ObjectId) {
     let role = xs.role;
     let first = !xs.configured;
     xs.configured = true;
+    let acked = xs.pending_ack.take();
     let sid = xs.surface.id();
+    if let (XdgRole::Toplevel(win), Some(serial)) = (role, acked) {
+        if let Some(w) = st.windows.get_mut(&win) {
+            w.acked = serial;
+        }
+    }
     let has_buffer = st.surfaces.get(&sid).is_some_and(|s| s.texture.is_some());
     match role {
         XdgRole::Toplevel(win) => {

@@ -1,5 +1,6 @@
 package dev.awb
 
+import android.hardware.HardwareBuffer
 import android.view.Surface
 
 /** JNI entry points into libawb (native/src/lib.rs). Safe to call from the UI thread. */
@@ -30,6 +31,20 @@ object Native {
     @JvmStatic external fun attachSurface(win: Int, surface: Surface?)
 
     @JvmStatic external fun resize(win: Int, width: Int, height: Int)
+
+    /**
+     * As [dev.awb.window.IToplevelSession.redraw]; blocks (binder threads
+     * only). The frame is the returned buffer, with [geometry] = source crop
+     * and destination (left, top, right, bottom each) and opaque (0/1), and
+     * [token]`[0]` the token for [presented].
+     */
+    @JvmStatic external fun redraw(win: Int, width: Int, height: Int, geometry: IntArray, token: LongArray): HardwareBuffer?
+
+    /** As [dev.awb.window.IToplevelSession.presented]. */
+    @JvmStatic external fun presented(win: Int, token: Long)
+
+    /** As [dev.awb.window.IToplevelSession.ownsLayer]. */
+    @JvmStatic external fun ownsLayer(win: Int)
 
     @JvmStatic external fun focus(win: Int, focused: Boolean)
 
@@ -82,4 +97,10 @@ interface NativeCallbacks {
     fun onClipboard(text: String)
     /** A Linux app started a drag in [win]; [argb] is its icon, if any (as [onCursor]). */
     fun onStartDrag(win: Int, text: String?, argb: IntArray?, width: Int, height: Int, scale: Float)
+    /**
+     * A direct-mode frame for a window that owns its layer (see
+     * [dev.awb.window.IToplevelHost.present]); a null [buffer] clears it.
+     * Unlike the others, it must not wait for the main thread.
+     */
+    fun onPresent(win: Int, buffer: HardwareBuffer?, src: IntArray, dst: IntArray, opaque: Boolean, token: Long)
 }

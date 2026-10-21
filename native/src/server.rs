@@ -176,6 +176,28 @@ fn handle_cmd(st: &mut State, cmd: Cmd) {
                 st.configure_window(win);
             }
         }
+        Cmd::RedrawSync { win, size, reply } => {
+            // May overtake the oneway Resize for the same size.
+            handle_cmd(st, Cmd::Resize(win, size.0, size.1));
+            let gpu = st.gpu.is_some();
+            let Some(w) = st.windows.get_mut(&win).filter(|w| w.mapped && w.window_layer && gpu) else {
+                let _ = reply.send(None);
+                return;
+            };
+            if let Some(old) = w.sync.take() {
+                let _ = old.reply.send(None);
+            }
+            log::debug!("toplevel {win}: sync {}x{} for configure {} (acked {})", size.0, size.1, w.configure_serial, w.acked);
+            w.sync = Some(crate::state::SyncReq { serial: w.configure_serial, start: std::time::Instant::now(), reply });
+            w.dirty = true;
+        }
+        // Sent right after the window attaches, before its surface exists,
+        // so no layer of ours was made for it.
+        Cmd::OwnsLayer(win) => {
+            if let Some(w) = st.windows.get_mut(&win) {
+                w.window_layer = true;
+            }
+        }
         Cmd::Focus(win, focused) => {
             if focused {
                 st.outputs.default = st.windows.get(&win).map(|w| w.display);

@@ -80,6 +80,13 @@ unsafe extern "C" {
     fn ASurfaceTransaction_setZOrder(t: *mut ASurfaceTransaction, sc: *mut ASurfaceControl, z: i32);
     fn ASurfaceTransaction_setBufferTransparency(t: *mut ASurfaceTransaction, sc: *mut ASurfaceControl, transparency: i8);
     fn ASurfaceTransactionStats_getPreviousReleaseFenceFd(stats: *mut ASurfaceTransactionStats, sc: *mut ASurfaceControl) -> i32;
+    fn AHardwareBuffer_toHardwareBuffer(env: *mut jni::sys::JNIEnv, buffer: *mut AHardwareBuffer) -> jni::sys::jobject;
+}
+
+/// A Java `HardwareBuffer` for `buffer` (a local reference), to hand to a
+/// window process that owns its direct layer.
+pub fn to_java<'a>(env: &jni::JNIEnv<'a>, buffer: *mut AHardwareBuffer) -> jni::objects::JObject<'a> {
+    unsafe { jni::objects::JObject::from_raw(AHardwareBuffer_toHardwareBuffer(env.get_raw(), buffer)) }
 }
 
 const fn fourcc(s: &[u8; 4]) -> u32 {

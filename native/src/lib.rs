@@ -36,6 +36,12 @@ pub enum Cmd {
     Redraw(u32),
     /// The Android surface of a window changed size (pixels).
     Resize(u32, i32, i32),
+    /// Android waits for the window's frame at this size (pixels): `reply`
+    /// gets the direct-mode frame, for the window process to show with its
+    /// synced frame, or None to draw as usual.
+    RedrawSync { win: u32, size: (i32, i32), reply: SyncReply },
+    /// The window's process owns its direct layer: frames go to it.
+    OwnsLayer(u32),
     Focus(u32, bool),
     Pointer(PointerEvent),
     Key { win: u32, code: u32, down: bool, time: u32 },
@@ -59,6 +65,21 @@ pub enum Cmd {
     /// A client's data source was read (None: failed or too large).
     SourceRead { id: u64, text: Option<String> },
 }
+
+/// A direct-mode frame for a window process that owns its layer: the
+/// client's buffer (a Java `HardwareBuffer`), its source crop (buffer px),
+/// where it goes (window px), and the token to report with
+/// `Native.presented` once it is on screen.
+pub struct WindowFrame {
+    pub buffer: jni::objects::GlobalRef,
+    pub src: [i32; 4],
+    pub dst: [i32; 4],
+    pub opaque: bool,
+    pub token: u64,
+}
+
+/// Where a synced redraw's frame goes.
+pub type SyncReply = std::sync::mpsc::Sender<Option<WindowFrame>>;
 
 /// An Android drag event on one of our windows (`View.onDragEvent`).
 #[derive(Debug)]
@@ -242,6 +263,53 @@ pub extern "system" fn Java_dev_awb_Native_attachSurface(
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_awb_Native_resize(_env: JNIEnv, _cls: JClass, win: jint, w: jint, h: jint) {
     push(Cmd::Resize(win as u32, w, h));
+}
+
+/// Blocks (a binder thread) until the compositor has the window's frame at
+/// `w`x`h`, or returns null. The frame is the returned HardwareBuffer, with
+/// `geometry` = source crop, destination (left, top, right, bottom each)
+/// and opaque (0/1), and `token[0]` the token to report with `presented`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_redraw(
+    env: JNIEnv,
+    _cls: JClass,
+    win: jint,
+    w: jint,
+    h: jint,
+    geometry: JIntArray,
+    token: jni::objects::JLongArray,
+) -> jni::sys::jobject {
+    ffi_guard("redraw", std::ptr::null_mut(), || {
+        let Some(shared) = SHARED.get() else { return std::ptr::null_mut() };
+        let (reply, rx) = std::sync::mpsc::channel();
+        shared.push(Cmd::RedrawSync { win: win as u32, size: (w, h), reply });
+        // Longer than the compositor's own wait, which then shows the frame
+        // itself if this side gave up.
+        match rx.recv_timeout(state::SYNC_TIMEOUT * 2) {
+            Ok(Some(f)) => {
+                let mut g = [0; 9];
+                g[..4].copy_from_slice(&f.src);
+                g[4..8].copy_from_slice(&f.dst);
+                g[8] = f.opaque as i32;
+                let _ = env.set_int_array_region(&geometry, 0, &g);
+                let _ = env.set_long_array_region(&token, 0, &[f.token as i64]);
+                env.new_local_ref(f.buffer.as_obj()).map(|o| o.into_raw()).unwrap_or(std::ptr::null_mut())
+            }
+            _ => std::ptr::null_mut(),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_ownsLayer(_env: JNIEnv, _cls: JClass, win: jint) {
+    push(Cmd::OwnsLayer(win as u32));
+}
+
+/// The window process saw a frame it was handed on screen.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_presented(_env: JNIEnv, _cls: JClass, win: jint, token: jlong) {
+    // Presented: the buffer it replaced is off screen, so no release fence.
+    push(Cmd::DirectDone { win: win as u32, token: token as u64, fence: -1 });
 }
 
 #[unsafe(no_mangle)]

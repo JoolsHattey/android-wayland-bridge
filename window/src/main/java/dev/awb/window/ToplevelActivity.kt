@@ -50,6 +50,11 @@ class ToplevelActivity : Activity() {
             }
             session = s
             displayId = display.displayId
+            // Before the surface exists: direct frames come to our own layer.
+            try {
+                s.ownsLayer(win)
+            } catch (_: RemoteException) {
+            }
             val v = WaylandView(this@ToplevelActivity, s, win)
             view = v
             setContentView(v)
@@ -96,6 +101,18 @@ class ToplevelActivity : Activity() {
         override fun closeFromClient() = runOnUiThread {
             closedByClient = true
             finishAndRemoveTask()
+        }
+        // Not on the UI thread: a frame must not wait behind it.
+        override fun present(frame: Bundle) {
+            val v = view
+            if (v != null) {
+                v.present(frame)
+            } else {
+                try {
+                    session?.presented(win, frame.getLong("k"))
+                } catch (_: RemoteException) {
+                }
+            }
         }
     }
 

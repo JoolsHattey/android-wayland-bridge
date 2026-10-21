@@ -10,7 +10,9 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.hardware.HardwareBuffer
 import android.hardware.display.DisplayManager
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.RemoteException
@@ -26,6 +28,7 @@ import dev.awb.window.IToplevelSession
 import dev.awb.window.ToplevelActivity
 import dev.awb.window.Window
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.FutureTask
 import kotlin.math.roundToInt
 
@@ -40,6 +43,12 @@ class AwbApp : Application(), NativeCallbacks {
 
     /** The activity of each attached window. Main thread only, like the rest of the state. */
     private val hosts = HashMap<Int, IToplevelHost>()
+
+    /**
+     * The attached windows that own their direct layer, for [onPresent] on
+     * the compositor thread (frames must not wait for the main thread).
+     */
+    private val layerHosts = ConcurrentHashMap<Int, IToplevelHost>()
 
     /** Windows the compositor has mapped in this process. */
     private val mapped = HashSet<Int>()
@@ -169,11 +178,30 @@ class AwbApp : Application(), NativeCallbacks {
         Log.i(TAG, "unmap $win")
         mapped -= win
         windowDisplays -= win
+        layerHosts.remove(win)
         hosts.remove(win)?.let { h -> remote { h.closeFromClient() } }
     }.let {}
 
     /** Calls [win]'s activity, if attached, on the main thread. */
     private fun host(win: Int, f: (IToplevelHost) -> Unit) = main.post { hosts[win]?.let { h -> remote { f(h) } } }.let {}
+
+    override fun onPresent(win: Int, buffer: HardwareBuffer?, src: IntArray, dst: IntArray, opaque: Boolean, token: Long) {
+        layerHosts[win]?.let { h ->
+            remote {
+                h.present(
+                    Bundle().apply {
+                        putParcelable("b", buffer)
+                        putIntArray("src", src)
+                        putIntArray("dst", dst)
+                        putBoolean("opaque", opaque)
+                        putLong("k", token)
+                    },
+                )
+            }
+        }
+        // Sent (a oneway call parcels it before returning).
+        buffer?.close()
+    }
 
     override fun onTitle(win: Int, title: String) = host(win) { it.setTitle(title) }
 
@@ -312,6 +340,28 @@ class AwbApp : Application(), NativeCallbacks {
 
         override fun resize(win: Int, width: Int, height: Int) = Native.resize(win, width, height)
 
+        override fun redraw(win: Int, width: Int, height: Int): Bundle? {
+            val geometry = IntArray(9)
+            val token = LongArray(1)
+            val b = Native.redraw(win, width, height, geometry, token) ?: return null
+            return Bundle().apply {
+                putParcelable("b", b)
+                putIntArray("src", geometry.copyOfRange(0, 4))
+                putIntArray("dst", geometry.copyOfRange(4, 8))
+                putBoolean("opaque", geometry[8] != 0)
+                putLong("k", token[0])
+            }
+        }
+
+        override fun presented(win: Int, token: Long) = Native.presented(win, token)
+
+        override fun ownsLayer(win: Int) = onMain {
+            hosts[win]?.let { h ->
+                layerHosts[win] = h
+                Native.ownsLayer(win)
+            }
+        }.let {}
+
         override fun windowDisplay(win: Int, displayId: Int) {
             main.post { if (win in hosts) windowDisplays[win] = displayId }
             Native.windowDisplay(win, displayId)
@@ -358,6 +408,7 @@ class AwbApp : Application(), NativeCallbacks {
             Native.drag(win, action, x, y, local, result, mimes, text)
 
         override fun close(win: Int) = main.post {
+            layerHosts.remove(win)
             if (hosts.remove(win) != null) Native.close(win)
         }.let {}
 
@@ -387,6 +438,7 @@ class AwbApp : Application(), NativeCallbacks {
         if (hosts[win]?.asBinder() !== host.asBinder()) return
         Log.w(TAG, "win $win: activity process died")
         hosts.remove(win)
+        layerHosts.remove(win)
         Native.attachSurface(win, null)
         Native.close(win)
     }

@@ -78,7 +78,7 @@ disconnect itself.
 |---|---|
 | `xdg_toplevel` gets its first buffer | `startActivity(ToplevelActivity)`: `NEW_TASK \| MULTIPLE_TASK \| NEW_DOCUMENT`, `ActivityOptions.setLaunchBounds` = client size |
 | `set_title` | `Activity.title` and `TaskDescription` label |
-| SurfaceView size change (user resize) | `xdg_toplevel.configure(w/scale, h/scale)`; client redraws live (veiled resizing is off on the device) |
+| SurfaceView size change (user resize) | `xdg_toplevel.configure(w/scale, h/scale)`; the client's frame at the new size lands with Android's (see [Synced resizes](#synced-resizes); veiled resizing is off on the device) |
 | window focus | keyboard enter/leave and the `activated` state |
 | Android close (✕) | `xdg_toplevel.close`; the client decides |
 | toplevel destroyed / unmapped / client gone | `finishAndRemoveTask()` |
@@ -197,7 +197,9 @@ A window that is a single dmabuf surface, drawn 1:1 and covering the whole
 window, is never blitted. Its buffer goes to SurfaceFlinger on a child
 `SurfaceControl` of the window (`ASurfaceControl_createFromWindow`, z 1,
 above the swapchain's layer), cropped to the window with
-`ASurfaceTransaction_setGeometry`. This covers fractional-scale GTK windows,
+`ASurfaceTransaction_setGeometry`. (Windows that own their direct layer
+get the buffer to set themselves instead; see
+[Synced resizes](#synced-resizes).) This covers fractional-scale GTK windows,
 whose buffer includes a resize margin around the window.
 
 * **Wrapping the buffer** (`direct.rs`). There is no public way to make an
@@ -226,9 +228,10 @@ whose buffer includes a resize margin around the window.
   (wl_buffer and syncobj point) only when both the GPU and every hold are
   done.
 * **Leaving direct mode.** When a window needs compositing again (a popup,
-  a resize, a scaled or second surface), the layer is hidden and given a
-  1×1 placeholder, so SurfaceFlinger hands the client's buffer back. A new
-  Target means a new layer, and the old holds are dropped.
+  a resize the client has not caught up with, a scaled or second surface),
+  the layer is hidden and given a 1×1 placeholder, so SurfaceFlinger hands
+  the client's buffer back. A new Target means a new layer, and the old
+  holds are dropped.
 * **Header analysis.** The caption rows are copied straight out of the
   client's image, which is imported with `TRANSFER_SRC` where the modifier
   allows it. The analysis then runs as for a composited frame; exclusion
@@ -242,6 +245,71 @@ Verified on the device:
 * Opening the menu popover switches it to composited, and closing the
   popover switches it back to direct.
 * vkcube at `scale=1` is direct with explicit sync and keeps animating.
+
+### Synced resizes
+
+Android resizes a window first and tells the app afterwards. Without help,
+the compositor shows the client's old frame in the new bounds for a few
+frames: content pinned top-left, clipped or stretched, jumping on a
+left-edge drag. Wayland avoids this with `configure`/`ack_configure`; awb
+carries that across to Android's own resize sync.
+
+* `WaylandView` implements `SurfaceHolder.Callback2`. Android calls
+  `surfaceRedrawNeededAsync` on every step of a resize (the shell's
+  animated `resizeTask` and interactive edge drags alike), and holds the
+  window's new bounds until `drawingFinished` runs, or about a second.
+* The callback makes a blocking binder call, `redraw(win, w, h)`. It
+  carries the size, so `surfaceChanged` sends no separate `resize`, which
+  would reach the compositor first and be drawn unsynced.
+* The compositor (`Cmd::RedrawSync`) configures the client if the logical
+  size changed. It then shows nothing of that window until a commit
+  acknowledges that configure (`ack_configure` applies with the next
+  commit). Older frames are dropped, but their frame callbacks still fire,
+  so the client keeps drawing.
+* The window owns its direct layer (`ownsLayer`, right after `attach`):
+  `WaylandView` makes `awb-direct` a child of its SurfaceView, and the
+  compositor sends it frames instead of setting buffers itself. A frame is
+  the client's buffer as a `HardwareBuffer`, its source crop, where it
+  goes, whether it is opaque, and a token: `IToplevelHost.present` for
+  ordinary frames, the `redraw` reply for a synced one. The window imports
+  each buffer once (cached by id), sets it, waits for the present fence
+  and reports `presented(win, token)`, which the compositor takes as
+  `Cmd::DirectDone`. Windows of stubs built before this keep the
+  compositor's own layer (and get no synced resizes).
+* A synced frame does not carry the client's buffer. The window copies
+  it, 1:1, into one of two buffers of its own (`HardwareBufferRenderer`,
+  grown in 256 px steps, used in turn so a copy never goes into the one on
+  screen), and applies that with its fence through `applyTransactionOnDraw`,
+  so it joins the window's synced frame. Then `drawingFinished`. Bounds and
+  content change in one SurfaceFlinger transaction.
+  - Why the copy: Android 17's shell pairs the app's and the caption's
+    transaction for every drag step (`DragResizingSynchronizer`). With a
+    client buffer in the app's frame (the compositor's wrap of the client's
+    dmabuf, see [Direct mode](#direct-mode-zero-copy)), that frame
+    sometimes never committed, in roughly one fast drag in ten. The app and
+    SystemUI's caption renderer then waited out `BLASTBufferQueue`'s
+    one-second commit timeout on every step, and SystemUI hit an input
+    ANR. Whose layer it was, whose listener was in the frame, and the
+    window's launch frame made no difference. A buffer allocated by
+    gralloc itself in its place never stalled.
+  - Ordinary frames stay zero-copy: only resize steps pay for the copy.
+* Fallbacks: past 100 ms (`SYNC_TIMEOUT`) without the client's frame, or
+  for a composited frame (the swapchain is outside Android's sync), the
+  window gets nothing back and the compositor draws as before. If the copy
+  fails, the frame is applied on its own, outside the synced frame. If the
+  window gave up waiting, the compositor sends the frame as an ordinary
+  one. A frame that is never reported presented is dropped after a second.
+* Not used: `SurfaceView.applyTransactionToFrame` (it waits for the
+  SurfaceView's next queued buffer, which direct mode never sends), and
+  applying the frame once the window's frame commits (safe, but a frame
+  late, which shows).
+
+Verified on the device (Adwaita Demo, edge drags injected with
+`input mouse motionevent`, and by hand): every step's frame is handed over
+in 5–20 ms and changes in the same SurfaceFlinger sample as the window's
+bounds, against about 40 ms behind without sync. Screen recordings show no
+stretched or clipped frames. Fast drags on freshly opened windows (the
+worst case before the copy) ran 16 out of 16 without a stall.
 
 ### Scale, per display
 

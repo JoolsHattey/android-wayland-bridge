@@ -44,6 +44,19 @@ pub struct XdgSurf {
     pub geometry: Option<Rect>,
     pub pending_geometry: Option<Rect>,
     pub configured: bool,
+    /// ack_configure serial, applied with the next commit.
+    pub pending_ack: Option<u32>,
+}
+
+/// How long a synced resize waits for the client's frame at the new size.
+pub const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Android waiting for a window's frame at its new size (`Cmd::RedrawSync`).
+pub struct SyncReq {
+    /// The configure the frame must answer.
+    pub serial: u32,
+    pub start: Instant,
+    pub reply: crate::SyncReply,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -72,6 +85,14 @@ pub struct Window {
     pub display: i32,
     /// Last configured size in logical px and activated state.
     pub configured: Option<(i32, i32, bool)>,
+    /// Serial of the last configure, and the last one the client acked
+    /// with a commit.
+    pub configure_serial: u32,
+    pub acked: u32,
+    pub sync: Option<SyncReq>,
+    /// The window's process owns its direct layer (`Cmd::OwnsLayer`):
+    /// direct frames go to it instead of onto a layer of ours.
+    pub window_layer: bool,
     pub focused: bool,
     /// Popup wl_surfaces of this window, bottom to top.
     pub popups: Vec<ObjectId>,
@@ -316,6 +337,7 @@ impl State {
         w.toplevel.configure(lw, lh, bytes);
         w.xdg_surface.configure(serial);
         w.configured = Some((lw, lh, w.focused));
+        w.configure_serial = serial;
     }
 
     pub fn mark_dirty(&mut self, sid: &ObjectId) {

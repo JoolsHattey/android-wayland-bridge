@@ -1,6 +1,7 @@
 package dev.awb.window;
 
 import android.graphics.Bitmap;
+import android.os.Bundle;
 
 /** A window's activity, as seen by the compositor. */
 oneway interface IToplevelHost {
@@ -43,4 +44,13 @@ oneway interface IToplevelHost {
 
     /** The client destroyed the toplevel. */
     void closeFromClient();
+
+    /**
+     * A direct-mode frame for the window's own layer (see
+     * [IToplevelSession.ownsLayer]): the client's HardwareBuffer ("b", null
+     * to clear the layer), its source crop ("src", buffer px), where it goes
+     * ("dst", view px; both left, top, right, bottom), "opaque", and the
+     * token ("k") to report with [IToplevelSession.presented].
+     */
+    void present(in Bundle frame);
 }

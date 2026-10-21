@@ -25,7 +25,7 @@ use crate::direct::{AHardwareBuffer, Layer};
 use crate::output::to_px;
 use crate::render::Band;
 use crate::shm::Texture;
-use crate::state::State;
+use crate::state::{SYNC_TIMEOUT, State};
 use crate::Shared;
 use crate::syncobj::Release;
 
@@ -1373,6 +1373,8 @@ struct Direct {
     /// The transaction not yet complete, if any: windows apply one at a
     /// time, which paces them to their display.
     in_flight: Option<u64>,
+    /// When it was handed out: a window process may never apply it.
+    in_flight_since: Option<std::time::Instant>,
     /// Per outstanding transaction, the buffer it took off the layer
     /// (released by that transaction's previous-release fence).
     replaced: HashMap<u64, Option<Rc<Dmabuf>>>,
@@ -1586,6 +1588,29 @@ impl Renderer {
         for (sid, _, _) in &list {
             crate::output::ensure_scale(st, sid, display);
         }
+        // A synced resize (`Cmd::RedrawSync`) shows only the client's frame
+        // for the new size; older frames are dropped (their callbacks still
+        // fire, so the client keeps drawing). Past the timeout it draws as
+        // usual.
+        let sync = st.windows.get(&id).and_then(|w| w.sync.as_ref().map(|s| (w.acked >= s.serial, s.start.elapsed() >= SYNC_TIMEOUT)));
+        match sync {
+            Some((_, true)) => {
+                answer_sync(st, id, None, "timed out");
+            }
+            Some((false, false)) => {
+                let now = st.now_ms();
+                for (sid, _, _) in &list {
+                    if let Some(s) = st.surfaces.get_mut(sid) {
+                        for cb in s.frame_cbs.drain(..) {
+                            cb.done(now);
+                        }
+                    }
+                }
+                self.deferred = true;
+                return;
+            }
+            _ => {}
+        }
         // Latch only finished client frames, so a slow client cannot stall
         // the queue that every window shares: the acquire point with explicit
         // sync, else the dmabuf's implicit fences.
@@ -1641,6 +1666,8 @@ impl Renderer {
         if let Some((d, at)) = self.direct_candidate(st, &list, &draws, (pw, ph), top) {
             return self.render_direct(st, id, &slot, &list, d, at, (pw, ph), top, band);
         }
+        // Composited frames go through the swapchain, outside Android's sync.
+        answer_sync(st, id, None, "not direct");
 
         let serial = self.serial + 1;
         let gpu = self.gpu.clone();
@@ -1675,11 +1702,15 @@ impl Renderer {
             let token = self.next_token;
             self.next_token += 1;
             let (shared, placeholder) = (self.shared.clone(), self.placeholder);
-            slot.with_target(|_, t| {
-                if let Some(layer) = t.as_ref().and_then(|t| t.layer.as_ref()) {
-                    layer.present(None, placeholder, [0; 4], &shared, id, token);
-                }
-            });
+            if st.windows.get(&id).is_some_and(|w| w.window_layer) {
+                st.host.present(id, None, [0; 4], token);
+            } else {
+                slot.with_target(|_, t| {
+                    if let Some(layer) = t.as_ref().and_then(|t| t.layer.as_ref()) {
+                        layer.present(None, placeholder, [0; 4], &shared, id, token);
+                    }
+                });
+            }
             state.replaced.insert(token, state.shown.take());
             log::info!("toplevel {id}: composited");
         }
@@ -1755,25 +1786,34 @@ impl Renderer {
         top: i32,
         band: (i32, i32),
     ) {
-        if self.direct.get(&id).is_some_and(|s| s.in_flight.is_some()) {
-            self.deferred = true;
-            return;
+        if let Some(state) = self.direct.get_mut(&id).filter(|s| s.in_flight.is_some()) {
+            if state.in_flight_since.is_some_and(|t| t.elapsed() > DIRECT_WATCHDOG) {
+                log::warn!("toplevel {id}: direct transaction {:?} never completed", state.in_flight);
+                state.in_flight = None;
+            } else {
+                self.deferred = true;
+                return;
+            }
         }
         let Some(ahb) = d.hardware_buffer() else { return };
         let serial = self.serial + 1;
         let token = self.next_token;
         self.next_token += 1;
         let (gpu, shared, placeholder) = (self.gpu.clone(), self.shared.clone(), self.placeholder);
+        // A window that owns its layer sets the buffer itself (`Cmd::OwnsLayer`).
+        let window_layer = st.windows.get(&id).is_some_and(|w| w.window_layer);
+        // The window's part of the buffer (buffer px), and where it goes.
+        let (src, dst) = ([-at[0], top - at[1], pw - at[0], ph - at[1]], [0, top, pw, ph]);
         let result = slot.with_target(|win, target| -> Result<(u64, bool), String> {
             if target.is_none() {
                 *target = Some(Target::new(gpu.clone(), win)?);
             }
             let t = target.as_mut().unwrap();
             gpu.wait(t.last_serial);
-            let layer = t.layer(win).ok_or("cannot create the direct layer")?;
-            // The window's part of the buffer, in buffer px.
-            let src = [-at[0], top - at[1], pw - at[0], ph - at[1]];
-            layer.present(Some((ahb, src, d.opaque)), placeholder, [0, top, pw, ph], &shared, id, token);
+            if !window_layer {
+                let layer = t.layer(win).ok_or("cannot create the direct layer")?;
+                layer.present(Some((ahb, src, d.opaque)), placeholder, dst, &shared, id, token);
+            }
             let read = t.read_direct(&d, (at[0], at[1]), pw, band, serial).unwrap_or_else(|e| {
                 log::warn!("gpu: caption readback: {e}");
                 false
@@ -1797,6 +1837,21 @@ impl Renderer {
         }
         state.replaced.insert(token, replaced);
         state.in_flight = Some(token);
+        state.in_flight_since = Some(std::time::Instant::now());
+        if window_layer {
+            // Android waits for this frame: it goes back with the redraw, and
+            // the window shows it with its own synced frame.
+            let synced = st.windows.get(&id).is_some_and(|w| w.sync.is_some());
+            let handed = synced
+                && st.host.hardware_buffer(ahb).is_some_and(|buffer| {
+                    let f = crate::WindowFrame { buffer, src, dst, opaque: d.opaque, token };
+                    answer_sync(st, id, Some(f), &format!("handed over {}x{}", d.width, d.height))
+                });
+            if !handed {
+                answer_sync(st, id, None, "not handed over");
+                st.host.present(id, Some((ahb, src, d.opaque)), dst, token);
+            }
+        }
         if read {
             self.serial = serial;
             self.frames.push((serial, id));
@@ -1814,6 +1869,18 @@ impl Renderer {
             w.dirty = false;
         }
     }
+}
+
+/// How long a direct transaction may stay incomplete before the window draws
+/// again anyway (a window process may never apply one it was handed).
+const DIRECT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Answers a window's pending synced resize, if any; false if there was
+/// none or nobody waits for it any more.
+fn answer_sync(st: &mut State, id: u32, t: Option<crate::WindowFrame>, what: &str) -> bool {
+    let Some(s) = st.windows.get_mut(&id).and_then(|w| w.sync.take()) else { return false };
+    log::debug!("toplevel {id}: sync {what} after {} ms", s.start.elapsed().as_millis());
+    s.reply.send(t).is_ok()
 }
 
 pub fn render_dirty(st: &mut State) {

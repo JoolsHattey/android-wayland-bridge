@@ -41,6 +41,51 @@ impl Host {
         }
     }
 
+    /// `buffer` as a Java HardwareBuffer that outlives this call, for a
+    /// synced redraw's reply (`Cmd::RedrawSync`).
+    pub fn hardware_buffer(&self, buffer: *mut crate::direct::AHardwareBuffer) -> Option<GlobalRef> {
+        let mut env = self.vm.attach_current_thread_permanently().ok()?;
+        let r = env.with_local_frame(4, |env| -> jni::errors::Result<_> {
+            let obj = crate::direct::to_java(env, buffer);
+            if obj.is_null() {
+                return Ok(None);
+            }
+            Ok(Some(env.new_global_ref(&obj)?))
+        });
+        r.unwrap_or_else(|e| {
+            log::warn!("hardware buffer: {e}");
+            None
+        })
+    }
+
+    /// Shows a direct-mode frame on the window's own layer (a window that
+    /// owns it, see `Cmd::OwnsLayer`), or with None clears the layer. The
+    /// window reports it on screen with `Native.presented(win, token)`.
+    pub fn present(&self, win: u32, frame: Option<(*mut crate::direct::AHardwareBuffer, [i32; 4], bool)>, dst: [i32; 4], token: u64) {
+        self.with_env(|env, cb| {
+            let (buffer, src, opaque) = match frame {
+                Some((b, src, opaque)) => (crate::direct::to_java(env, b), src, opaque),
+                None => (JObject::null(), [0; 4], false),
+            };
+            let src = int_array(env, &src)?;
+            let dst = int_array(env, &dst)?;
+            env.call_method(
+                cb,
+                "onPresent",
+                "(ILandroid/hardware/HardwareBuffer;[I[IZJ)V",
+                &[
+                    JValue::Int(win as i32),
+                    JValue::Object(&buffer),
+                    JValue::Object(&src),
+                    JValue::Object(&dst),
+                    JValue::Bool(opaque as u8),
+                    JValue::Long(token as i64),
+                ],
+            )?;
+            Ok(())
+        });
+    }
+
     /// A toplevel got its first buffer: open an Android window for `w`x`h`
     /// logical px (Kotlin applies the target display's density).
     /// `ssd`: the window wants server-side decorations (see `decorations`).

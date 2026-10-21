@@ -1,5 +1,6 @@
 package dev.awb.window;
 
+import android.os.Bundle;
 import android.view.Surface;
 import dev.awb.window.IToplevelHost;
 
@@ -71,4 +72,28 @@ interface IToplevelSession {
      * stub declares (claude://..., say), from a browser.
      */
     oneway void open(String appId, String uri);
+
+    // Added later, and kept last, so that stubs built before keep their
+    // transaction codes.
+
+    /**
+     * Android waits for [win]'s frame at [width] x [height] px. Blocks until
+     * the compositor has it: a frame as [IToplevelHost.present] takes, to
+     * show with the window's synced frame; null to go on without (not
+     * direct mode, or the client was too slow). Needs [ownsLayer].
+     */
+    @nullable Bundle redraw(int win, int width, int height);
+
+    /**
+     * The frame with token [token] ([IToplevelHost.present], [redraw]) is
+     * on screen, so the compositor can release what it replaced.
+     */
+    oneway void presented(int win, long token);
+
+    /**
+     * [win]'s activity owns its direct layer: direct-mode frames come
+     * through [IToplevelHost.present] and [redraw]. Called right after
+     * [attach], before the surface exists.
+     */
+    void ownsLayer(int win);
 }
