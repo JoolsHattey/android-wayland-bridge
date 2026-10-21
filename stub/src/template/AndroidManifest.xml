@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The template that dev.awb.StubMaker turns into a Linux app's stub on the
+     device: it renames the package, sets the label, app id and version,
+     turns the placeholder scheme into the app's schemes (or drops the
+     filter) and, given an icon, points the app's icon at ic_launcher_png
+     (named by the meta-data below, which it removes). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <meta-data android:name="dev.awb.template.icon_png" android:resource="@mipmap/ic_launcher_png" />
+        <activity android:name="dev.awb.window.LaunchActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="awb-template-scheme" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
