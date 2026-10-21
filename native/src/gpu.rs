@@ -805,6 +805,9 @@ pub struct Target {
     /// Caption rows copied by the last frame that read them back: first
     /// row, rows, width, and whether they are BGRA; and that frame.
     band: (i32, i32, i32, bool),
+    /// For a scaled buffer read in direct mode: the readback's width, then
+    /// per band column and row the readback px it shows (nearest).
+    band_resample: Option<(usize, Vec<usize>, Vec<usize>)>,
     band_serial: u64,
     last_serial: u64,
     /// The last submit's sync_file, for the Renderer to take.
@@ -884,6 +887,7 @@ impl Target {
                 readable: false,
                 readback: None,
                 band: (0, 0, 0, false),
+                band_resample: None,
                 band_serial: 0,
                 last_serial: 0,
                 fence: None,
@@ -1012,8 +1016,14 @@ impl Target {
         if self.band_serial != serial || rows <= 0 || width <= 0 {
             return None;
         }
-        let n = (rows * width) as usize;
-        let mut px = unsafe { std::slice::from_raw_parts(ptr as *const u32, n) }.to_vec();
+        let mut px = match &self.band_resample {
+            None => unsafe { std::slice::from_raw_parts(ptr as *const u32, (rows * width) as usize) }.to_vec(),
+            Some((stride, cols, lines)) => {
+                let n = lines.last().map_or(0, |l| (l + 1) * stride);
+                let read = unsafe { std::slice::from_raw_parts(ptr as *const u32, n) };
+                lines.iter().flat_map(|l| cols.iter().map(move |c| read[l * stride + c])).collect()
+            }
+        };
         if bgra {
             for v in &mut px {
                 *v = (*v & 0xff00ff00) | ((*v >> 16) & 0xff) | ((*v & 0xff) << 16);
@@ -1234,6 +1244,7 @@ impl Target {
             self.last_serial = serial;
             if read {
                 self.band = (y0, rows, ew, self.format == vk::Format::B8G8R8A8_UNORM);
+                self.band_resample = None;
                 self.band_serial = serial;
             }
 
@@ -1286,19 +1297,30 @@ impl Target {
         self.layer.as_ref()
     }
 
-    /// Direct mode's stand-in for the composited caption: copies the band's
-    /// window rows (`band`: first row, rows; `width` px wide) out of the
-    /// client's buffer, which lies at `origin` in window px. Callers have
-    /// waited for the last frame.
-    fn read_direct(&mut self, d: &Dmabuf, origin: (i32, i32), width: i32, band: (i32, i32), serial: u64) -> Result<bool, String> {
-        let y0 = band.0.max(origin.1);
-        let rows = (band.0 + band.1).min(origin.1 + d.height) - y0;
-        if rows <= 0 || width <= 0 || !d.format.transfer {
+    /// Direct mode's stand-in for the composited caption: copies the
+    /// client's buffer px under the band's window rows (`band`: first row,
+    /// rows) in a window of `size` px, placed by `map`. A scaled buffer's
+    /// part is resampled to window px when read (`band_pixels`). Callers
+    /// have waited for the last frame.
+    fn read_direct(&mut self, d: &Dmabuf, map: BufferMap, size: (i32, i32), band: (i32, i32), serial: u64) -> Result<bool, String> {
+        let (width, y0) = (size.0, band.0.clamp(0, size.1));
+        let rows = band.1.clamp(0, size.1 - y0);
+        if rows <= 0 || width <= 0 || d.width <= 0 || d.height <= 0 || !d.format.transfer {
             return Ok(false);
         }
+        // The buffer px under each band px's centre: one run of columns
+        // and one of rows, read whole.
+        let cols: Vec<i32> = (0..width).map(|i| BufferMap::under(map.x, i, d.width)).collect();
+        let lines: Vec<i32> = (y0..y0 + rows).map(|j| BufferMap::under(map.y, j, d.height)).collect();
+        let (bx, by) = (cols[0], lines[0]);
+        let (bw, bh) = (cols[cols.len() - 1] - bx + 1, lines[lines.len() - 1] - by + 1);
+        let resample = ((bw, bh) != (width, rows)).then(|| {
+            let index = |v: &[i32], o: i32| v.iter().map(|&c| (c - o) as usize).collect();
+            (bw as usize, index(&cols, bx), index(&lines, by))
+        });
         let gpu = self.gpu.clone();
         let dev = &gpu.device;
-        self.ensure_readback((width * rows * 4) as u64)?;
+        self.ensure_readback((bw * bh * 4) as u64)?;
         let (buffer, ..) = self.readback.unwrap();
         let cmd = self.cmd;
         unsafe {
@@ -1321,8 +1343,8 @@ impl Target {
             );
             let region = vk::BufferImageCopy::default()
                 .image_subresource(LAYER)
-                .image_offset(vk::Offset3D { x: -origin.0, y: y0 - origin.1, z: 0 })
-                .image_extent(vk::Extent3D { width: width as u32, height: rows as u32, depth: 1 });
+                .image_offset(vk::Offset3D { x: bx, y: by, z: 0 })
+                .image_extent(vk::Extent3D { width: bw as u32, height: bh as u32, depth: 1 });
             dev.cmd_copy_image_to_buffer(cmd, d.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
             barrier(
                 dev,
@@ -1364,6 +1386,7 @@ impl Target {
         }
         self.last_serial = serial;
         self.band = (y0, rows, width, d.bgra);
+        self.band_resample = resample;
         self.band_serial = serial;
         Ok(true)
     }
@@ -1437,6 +1460,33 @@ struct Draw {
     /// Destination in px: x0, y0, x1, y1.
     dst: [i32; 4],
     uv: [f32; 4],
+}
+
+/// Where window px fall on a client buffer: per axis, buffer px =
+/// offset + window px × scale.
+#[derive(Clone, Copy)]
+struct BufferMap {
+    x: (f64, f64),
+    y: (f64, f64),
+}
+
+impl BufferMap {
+    /// The buffer px (of `len`) under the centre of window px `i`.
+    fn under(axis: (f64, f64), i: i32, len: i32) -> i32 {
+        ((axis.0 + (i as f64 + 0.5) * axis.1).floor() as i32).clamp(0, len - 1)
+    }
+
+    /// The buffer px window rect `r` shows, clamped to a `w`×`h` buffer.
+    /// Fractional edges are rounded inward, so the crop never takes in px
+    /// beyond them (GTK's resize margin); SurfaceFlinger stretches the rest
+    /// over the whole rect, so no gap shows either.
+    fn crop(&self, r: [i32; 4], (w, h): (i32, i32)) -> [i32; 4] {
+        // Slack for float error in an edge that is really whole.
+        const EPS: f64 = 1e-3;
+        let lo = |a: (f64, f64), v: i32| (a.0 + v as f64 * a.1 - EPS).ceil() as i32;
+        let hi = |a: (f64, f64), v: i32| (a.0 + v as f64 * a.1 + EPS).floor() as i32;
+        [lo(self.x, r[0]).max(0), lo(self.y, r[1]).max(0), hi(self.x, r[2]).min(w), hi(self.y, r[3]).min(h)]
+    }
 }
 
 /// What a window's caption band was drawn from. A frame that draws it from
@@ -1871,8 +1921,8 @@ impl Renderer {
 
         let generation = slot.with_target(|_, t| t.as_ref().map(|t| t.generation)).flatten();
         self.sync_layer(id, generation);
-        if let Some((d, at)) = self.direct_candidate(st, &list, &draws, (pw, ph), top) {
-            return self.render_direct(st, id, &slot, &list, d, at, (pw, ph), top, band, (read, key));
+        if let Some((d, map)) = self.direct_candidate(st, &list, &draws, (pw, ph), top) {
+            return self.render_direct(st, id, &slot, &list, d, map, (pw, ph), top, band, (read, key));
         }
         // Composited frames go through the swapchain, outside Android's sync.
         answer_sync(st, id, None, "not direct");
@@ -2001,10 +2051,11 @@ impl Renderer {
         }
     }
 
-    /// The window's buffer and where it lies (window px), if SurfaceFlinger
-    /// can show it as is: one dmabuf surface, drawn 1:1, covering the whole
-    /// window below the caption's top. Anything outside (GTK's resize
-    /// margin) is cropped.
+    /// The window's buffer and where window px fall on it, if
+    /// SurfaceFlinger can show it: one dmabuf surface covering the whole
+    /// window below the caption's top, at any scale or viewport crop
+    /// (SurfaceFlinger scales it as the quad would). Anything outside
+    /// (GTK's resize margin) is cropped.
     fn direct_candidate(
         &self,
         st: &State,
@@ -2012,19 +2063,25 @@ impl Renderer {
         draws: &[Draw],
         (pw, ph): (i32, i32),
         top: i32,
-    ) -> Option<(Rc<Dmabuf>, [i32; 4])> {
+    ) -> Option<(Rc<Dmabuf>, BufferMap)> {
         if !self.direct_enabled || self.placeholder.is_null() || list.len() != 1 || draws.len() != 1 {
             return None;
         }
         let draw = &draws[0];
         let [x0, y0, x1, y1] = draw.dst;
         let covers = x0 <= 0 && y0 <= top && x1 >= pw && y1 >= ph;
-        if !matches!(draw.source, Source::Dmabuf { .. }) || !covers || draw.uv != [0.0, 0.0, 1.0, 1.0] {
+        if !matches!(draw.source, Source::Dmabuf { .. }) || !covers {
             return None;
         }
-        let (_, d) = st.surfaces.get(&list[0].0)?.texture.as_ref()?.dmabuf.as_ref()?;
-        let fits = d.format.direct() && !d.y_invert && (d.width, d.height) == (x1 - x0, y1 - y0);
-        (fits && d.hardware_buffer().is_some()).then(|| (d.clone(), draw.dst))
+        let s = st.surfaces.get(&list[0].0)?;
+        let (_, d) = s.texture.as_ref()?.dmabuf.as_ref()?;
+        // The quad's mapping, from the source rect itself (uv is f32).
+        let [sx, sy, sw, sh] = s.source_rect()?;
+        let (kx, ky) = (sw / (x1 - x0) as f64, sh / (y1 - y0) as f64);
+        let map = BufferMap { x: (sx - x0 as f64 * kx, kx), y: (sy - y0 as f64 * ky, ky) };
+        let [cx0, cy0, cx1, cy1] = map.crop([0, top, pw, ph], (d.width, d.height));
+        let fits = d.format.direct() && !d.y_invert && cx1 > cx0 && cy1 > cy0;
+        (fits && d.hardware_buffer().is_some()).then(|| (d.clone(), map))
     }
 
     /// Shows the buffer on the window's layer, one transaction at a time.
@@ -2036,7 +2093,7 @@ impl Renderer {
         slot: &Arc<crate::android::NativeSlot>,
         list: &[(ObjectId, i32, i32)],
         d: Rc<Dmabuf>,
-        at: [i32; 4],
+        map: BufferMap,
         (pw, ph): (i32, i32),
         top: i32,
         band: (i32, i32),
@@ -2059,8 +2116,10 @@ impl Renderer {
         let (gpu, shared, placeholder) = (self.gpu.clone(), self.shared.clone(), self.placeholder);
         // A window that owns its layer sets the buffer itself (`Cmd::OwnsLayer`).
         let window_layer = st.windows.get(&id).is_some_and(|w| w.window_layer);
-        // The window's part of the buffer (buffer px), and where it goes.
-        let (src, dst) = ([-at[0], top - at[1], pw - at[0], ph - at[1]], [0, top, pw, ph]);
+        // The window's part of the buffer (buffer px), and where it goes:
+        // SurfaceFlinger scales one to the other.
+        let dst = [0, top, pw, ph];
+        let src = map.crop(dst, (d.width, d.height));
         let result = slot.with_target(|win, target| -> Result<(u64, bool, Option<OwnedFd>), String> {
             if target.is_none() {
                 *target = Some(Target::new(gpu.clone(), win)?);
@@ -2072,7 +2131,7 @@ impl Renderer {
                 layer.present(Some((ahb, src, d.opaque)), placeholder, dst, &shared, id, token);
             }
             let read = want_read
-                && t.read_direct(&d, (at[0], at[1]), pw, band, serial).unwrap_or_else(|e| {
+                && t.read_direct(&d, map, (pw, ph), band, serial).unwrap_or_else(|e| {
                     log::warn!("gpu: caption readback: {e}");
                     false
                 });
@@ -2096,7 +2155,9 @@ impl Renderer {
         d.sf_holds.set(d.sf_holds.get() + 1);
         let replaced = state.shown.replace(d.clone());
         if replaced.is_none() {
-            log::info!("toplevel {id}: direct ({}x{} {:#x}/{:#x})", d.width, d.height, d.format.fourcc, d.format.modifier);
+            let (sw, sh) = (src[2] - src[0], src[3] - src[1]);
+            let scaled = if (sw, sh) == (pw, ph - top) { String::new() } else { format!(", {sw}x{sh} to {pw}x{}", ph - top) };
+            log::info!("toplevel {id}: direct ({}x{} {:#x}/{:#x}{scaled})", d.width, d.height, d.format.fourcc, d.format.modifier);
         }
         state.replaced.insert(token, replaced);
         state.in_flight = Some(token);

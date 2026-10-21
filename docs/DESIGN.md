@@ -223,14 +223,25 @@ through its `/dev` bind mount.
 
 ### Direct mode (zero-copy)
 
-A window that is a single dmabuf surface, drawn 1:1 and covering the whole
-window, is never blitted. Its buffer goes to SurfaceFlinger on a child
+A window that is a single dmabuf surface covering the whole window is
+never blitted. Its buffer goes to SurfaceFlinger on a child
 `SurfaceControl` of the window (`ASurfaceControl_createFromWindow`, z 1,
-above the swapchain's layer), cropped to the window with
+above the swapchain's layer), cropped and scaled to the window with
 `ASurfaceTransaction_setGeometry`. (Windows that own their direct layer
 get the buffer to set themselves instead; see
 [Synced resizes](#synced-resizes).) This covers fractional-scale GTK windows,
-whose buffer includes a resize margin around the window.
+whose buffer includes a resize margin around the window, and scaled ones:
+an integer-scale client on a fractional display (vkcube at scale 2 on
+1.5×), or a `wp_viewporter` source crop or destination size.
+
+* **Geometry.** The source crop is the buffer px under the window's
+  visible part (below the caption's top), mapped as the composited quad
+  maps them; the destination is that part, whole window px. A fractional
+  crop edge is rounded inward, so the resize margin never shows, and
+  SurfaceFlinger stretches the crop over the whole destination, so no gap
+  does either (at most a buffer px of stretch). The window's own layer
+  takes the same pair; its synced-resize copy is made at buffer px and
+  scaled the same way.
 
 * **Wrapping the buffer** (`direct.rs`). There is no public way to make an
   AHardwareBuffer from a foreign dmabuf. `AHardwareBuffer_createFromHandle`
@@ -258,14 +269,17 @@ whose buffer includes a resize margin around the window.
   (wl_buffer and syncobj point) only when both the GPU and every hold are
   done.
 * **Leaving direct mode.** When a window needs compositing again (a popup,
-  a resize the client has not caught up with, a scaled or second surface),
+  a resize the client has not caught up with, a second surface, a
+  `y_invert` buffer),
   the layer is hidden and given a 1×1 placeholder, so SurfaceFlinger hands
   the client's buffer back. A new Target means a new layer, and the old
   holds are dropped.
-* **Header analysis.** The caption rows are copied straight out of the
-  client's image, which is imported with `TRANSFER_SRC` where the modifier
-  allows it. The analysis then runs as for a composited frame; exclusion
-  works in direct mode.
+* **Header analysis.** The buffer px under the caption band are copied
+  straight out of the client's image, which is imported with
+  `TRANSFER_SRC` where the modifier allows it. For a scaled buffer that is
+  the band's rows and columns in buffer px, resampled (nearest, per window
+  px centre) to window px on the CPU when read. The analysis then runs as
+  for a composited frame; exclusion works in direct mode.
 * `direct=0` in `files/awb.properties` turns it off.
 
 Verified on the device:
@@ -737,10 +751,9 @@ es2gears_wayland.
 * **Direct mode** depends on minigbm's private handle layout and the
   GraphicBuffer wire format. A gralloc update could change either; the
   mapper then rejects the buffer (logged) and the window stays composited.
-  Scaled buffers (integer-scale clients such as vkcube at 1.5×) and
-  multi-surface windows (libdecor decorations, popups) still composite.
-  SurfaceFlinger could scale them, but the header analysis needs window
-  px.
+  Multi-surface windows (libdecor decorations, popups) and `y_invert`
+  buffers still composite. Scaled buffers go direct, scaled by
+  SurfaceFlinger (its filtering, not our bilinear quad).
 * **Explicit sync.** Acquire points are still waited for on the CPU (by
   eventfd), as the latching wants: a GPU-side wait in the shared queue
   would let a slow client stall every window. Release points of buffers
