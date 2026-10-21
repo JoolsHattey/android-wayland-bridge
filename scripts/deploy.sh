@@ -6,7 +6,7 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 A=(adb -s "${ADB_SERIAL:-192.168.0.40:5555}")
-./gradlew.bat :app:assembleDebug --console=plain -q
+./gradlew :app:assembleDebug --console=plain -q
 "${A[@]}" install -r app/build/outputs/apk/debug/app-debug.apk
 "${A[@]}" push scripts/awb-run.sh /data/local/tmp/awb-run.sh >/dev/null
 "${A[@]}" push scripts/awb-launcher.sh /data/local/tmp/awb-launcher.sh >/dev/null

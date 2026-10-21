@@ -58,6 +58,6 @@ esac
 [ -s "$PNG" ] || { echo "no icon rendered from $SRC" >&2; exit 1; }
 
 echo "$ID: '$NAME', icon $SRC${SCHEMES:+, links $SCHEMES}"
-./gradlew.bat :stub:assembleDebug --console=plain -q \
+./gradlew :stub:assembleDebug --console=plain -q \
     "-Pstub.appId=$ID" "-Pstub.label=$NAME" "-Pstub.icon=$(path "$PWD/$PNG")" "-Pstub.schemes=$SCHEMES"
 "${A[@]}" install -r stub/build/outputs/apk/debug/stub-debug.apk
