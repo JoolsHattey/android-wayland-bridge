@@ -46,6 +46,13 @@ For GPU rendering in the apps, the chroot needs Mesa's drivers
 composites with Vulkan; `renderer=cpu` in the app's `files/awb.properties`
 switches back to the CPU compositor.
 
+Games and 3D apps can lock the pointer (`zwp_pointer_constraints_v1`):
+the window then takes Android's pointer capture, which ends when it loses
+focus (Meta or Alt+Tab); a click back into the window locks it again.
+Stub apps built before this need reinstalling (`install-stub.sh`) for
+pointer lock, touchpad scrolling and full-rate motion; older ones keep
+working as before.
+
 Electron apps lay their title bar out around Electron's own buttons, not
 Android's. For Claude Desktop, `./scripts/patch-claude-desktop.sh` patches
 its `app.asar` to keep clear of Android's caption controls; rerun it after

@@ -102,6 +102,7 @@ class ToplevelActivity : Activity() {
             closedByClient = true
             finishAndRemoveTask()
         }
+        override fun setPointerCapture(capture: Boolean) = runOnUiThread { view?.setCapture(capture) }
         // Not on the UI thread: a frame must not wait behind it.
         override fun present(frame: Bundle) {
             val v = view

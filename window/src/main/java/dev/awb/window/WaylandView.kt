@@ -14,6 +14,7 @@ import android.graphics.Rect
 import android.graphics.RenderNode
 import android.hardware.HardwareBuffer
 import android.hardware.SyncFence
+import android.os.Build
 import android.os.Bundle
 import android.os.RemoteException
 import android.view.DragEvent
@@ -244,6 +245,119 @@ class WaylandView(context: Context, private val session: IToplevelSession, priva
     private fun send(e: MotionEvent, action: Int, buttons: Int = buttons(e)) =
         call { session.pointer(win, action, e.x, e.y, buttons, 0f, 0f, e.eventTime) }
 
+    /** Where the first finger was on a captured touchpad, for its motion. */
+    private var padX = Float.NaN
+    private var padY = Float.NaN
+
+    /**
+     * Sends [e]'s pointer samples, oldest first: Android batches motion per
+     * frame, and its history keeps the device's rate, each sample with its
+     * own time. Mice and touchpads also report Android's relative motion.
+     * [captured]: Android's pointer capture, so there is no position; the
+     * motion is relative (a mouse's x/y, a touchpad's change of position).
+     */
+    private fun motion(e: MotionEvent, buttons: Int, captured: Boolean = false) {
+        val n = e.historySize + 1
+        val samples = FloatArray(n * 4)
+        val times = LongArray(n)
+        val relative = !captured && e.isFromSource(InputDevice.SOURCE_MOUSE)
+        val pad = captured && !e.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)
+        if (pad && e.actionMasked != MotionEvent.ACTION_MOVE) padX = Float.NaN
+        for (i in 0 until n) {
+            val old = i < n - 1
+            val x = if (old) e.getHistoricalX(i) else e.x
+            val y = if (old) e.getHistoricalY(i) else e.y
+            val axis = { a: Int -> if (old) e.getHistoricalAxisValue(a, i) else e.getAxisValue(a) }
+            val (dx, dy) = when {
+                pad -> if (padX.isNaN()) 0f to 0f else x - padX to y - padY
+                captured -> x to y
+                relative -> axis(MotionEvent.AXIS_RELATIVE_X) to axis(MotionEvent.AXIS_RELATIVE_Y)
+                else -> Float.NaN to Float.NaN
+            }
+            if (pad) {
+                padX = x
+                padY = y
+            }
+            samples[i * 4] = if (captured) Float.NaN else x
+            samples[i * 4 + 1] = if (captured) Float.NaN else y
+            samples[i * 4 + 2] = dx
+            samples[i * 4 + 3] = dy
+            times[i] = if (old) e.getHistoricalEventTimeNanos(i) else e.eventTimeNanos
+        }
+        call { session.motion(win, buttons, samples, times) }
+    }
+
+    /**
+     * A wheel scroll at ([x], [y]) (NaN: where the pointer is). A finger's
+     * (a touchpad that scrolls this way) is smooth, without a known end.
+     */
+    private fun scroll(e: MotionEvent, x: Float, y: Float) {
+        val source = if (e.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER) SCROLL_CONTINUOUS else SCROLL_WHEEL
+        val v = -e.getAxisValue(MotionEvent.AXIS_VSCROLL)
+        val h = e.getAxisValue(MotionEvent.AXIS_HSCROLL)
+        call { session.scroll(win, x, y, v, h, source, false, e.eventTimeNanos) }
+    }
+
+    /** A touchpad's two-finger scroll is under way. */
+    private var swiping = false
+
+    /**
+     * A touchpad's two-finger scroll, which Android sends as a fake finger
+     * dragged from the pointer: its scroll distances (px, already in the
+     * user's scrolling direction) go out as finger scrolling, and the lift
+     * as axis_stop, so clients scroll kinetically.
+     */
+    private fun swipe(e: MotionEvent) {
+        swiping = true
+        val n = e.historySize + 1
+        for (i in 0 until n) {
+            val old = i < n - 1
+            val axis = { a: Int -> if (old) e.getHistoricalAxisValue(a, i) else e.getAxisValue(a) }
+            val dx = axis(MotionEvent.AXIS_GESTURE_SCROLL_X_DISTANCE)
+            val dy = axis(MotionEvent.AXIS_GESTURE_SCROLL_Y_DISTANCE)
+            val t = if (old) e.getHistoricalEventTimeNanos(i) else e.eventTimeNanos
+            if (dx != 0f || dy != 0f) call { session.scroll(win, Float.NaN, Float.NaN, dy, dx, SCROLL_FINGER, false, t) }
+        }
+        if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) {
+            swiping = false
+            call { session.scroll(win, Float.NaN, Float.NaN, 0f, 0f, SCROLL_FINGER, true, e.eventTimeNanos) }
+        }
+    }
+
+    /** A client locked the pointer: capture it whenever the window has focus. */
+    private var wantCapture = false
+
+    /** Requests ([on]) or releases Android's pointer capture for a pointer lock. */
+    fun setCapture(on: Boolean) {
+        wantCapture = on
+        if (on && hasWindowFocus() && !hasPointerCapture()) {
+            capture()
+        } else if (!on && hasPointerCapture()) {
+            releasePointerCapture()
+        }
+    }
+
+    private fun capture() {
+        // Relative motion from touchpads too, where Android offers the choice.
+        if (Build.VERSION.SDK_INT >= 37) requestPointerCapture(POINTER_CAPTURE_MODE_RELATIVE) else requestPointerCapture()
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        // Android ends the capture when focus leaves; it comes back with focus.
+        if (hasWindowFocus && wantCapture && !hasPointerCapture()) capture()
+    }
+
+    override fun onPointerCaptureChange(hasCapture: Boolean) {
+        padX = Float.NaN
+        call { session.pointerCapture(win, hasCapture) }
+    }
+
+    override fun onCapturedPointerEvent(e: MotionEvent): Boolean {
+        if (e.actionMasked == MotionEvent.ACTION_SCROLL) scroll(e, Float.NaN, Float.NaN) else motion(e, e.buttonState, captured = true)
+        return true
+    }
+
     /** A move or resize in progress: edges, start bounds and pointer (display px). */
     private class Move(val edges: Int, val bounds: Rect, val x: Float, val y: Float, val update: (Rect) -> Unit)
 
@@ -279,6 +393,13 @@ class WaylandView(context: Context, private val session: IToplevelSession, priva
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        val end = e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL
+        if (e.classification == MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE || (swiping && end)) {
+            swipe(e)
+            return true
+        }
+        // A touchpad pinch has no Wayland meaning here (no pointer gestures).
+        if (e.classification == MotionEvent.CLASSIFICATION_PINCH) return true
         // Touch, stylus and injected mouse events carry no button bits; a
         // pointer that is down counts as the primary button.
         val down = e.actionMasked != MotionEvent.ACTION_UP && e.actionMasked != MotionEvent.ACTION_CANCEL
@@ -295,22 +416,17 @@ class WaylandView(context: Context, private val session: IToplevelSession, priva
             move = null
         }
         val state = if (isMouse(e)) e.buttonState else 0
-        send(e, 0, if (down && state == 0) 1 else state)
+        motion(e, if (down && state == 0) 1 else state)
         return true
     }
 
     override fun onGenericMotionEvent(e: MotionEvent): Boolean {
         when (e.actionMasked) {
-            MotionEvent.ACTION_SCROLL -> call {
-                session.pointer(
-                    win, 1, e.x, e.y, buttons(e),
-                    e.getAxisValue(MotionEvent.AXIS_VSCROLL), e.getAxisValue(MotionEvent.AXIS_HSCROLL), e.eventTime,
-                )
-            }
+            MotionEvent.ACTION_SCROLL -> scroll(e, e.x, e.y)
             // A hover exit also precedes every press; only a real exit leaves.
             MotionEvent.ACTION_HOVER_EXIT ->
                 if (e.x < 0 || e.y < 0 || e.x >= width || e.y >= height) send(e, 2)
-            else -> send(e, 0)
+            else -> motion(e, buttons(e))
         }
         return true
     }
@@ -393,4 +509,11 @@ class WaylandView(context: Context, private val session: IToplevelSession, priva
 
     override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? =
         icon ?: super.onResolvePointerIcon(event, pointerIndex)
+
+    private companion object {
+        // Scroll sources, as IToplevelSession.scroll takes them.
+        const val SCROLL_WHEEL = 0
+        const val SCROLL_FINGER = 1
+        const val SCROLL_CONTINUOUS = 2
+    }
 }

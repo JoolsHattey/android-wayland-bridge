@@ -51,6 +51,15 @@ object Native {
     /** [action]: 0 = move/buttons, 1 = scroll, 2 = pointer left the window. */
     @JvmStatic external fun pointer(win: Int, action: Int, x: Float, y: Float, buttons: Int, vscroll: Float, hscroll: Float, time: Long)
 
+    /** As [dev.awb.window.IToplevelSession.motion]. */
+    @JvmStatic external fun motion(win: Int, buttons: Int, samples: FloatArray, times: LongArray)
+
+    /** As [dev.awb.window.IToplevelSession.scroll]. */
+    @JvmStatic external fun scroll(win: Int, x: Float, y: Float, vscroll: Float, hscroll: Float, source: Int, stop: Boolean, time: Long)
+
+    /** As [dev.awb.window.IToplevelSession.pointerCapture]. */
+    @JvmStatic external fun pointerCapture(win: Int, captured: Boolean)
+
     /** [code] is a Linux evdev key code. */
     @JvmStatic external fun key(win: Int, code: Int, down: Boolean, time: Long)
 
@@ -91,6 +100,8 @@ interface NativeCallbacks {
     fun onExclusion(win: Int, rects: IntArray)
     /** [scale] maps image px to display px. */
     fun onCursor(win: Int, argb: IntArray?, width: Int, height: Int, hotX: Int, hotY: Int, scale: Float)
+    /** As [dev.awb.window.IToplevelHost.setPointerCapture]. */
+    fun onPointerCapture(win: Int, capture: Boolean)
     /** As [dev.awb.window.IToplevelHost.setTextInput]. */
     fun onTextInput(win: Int, enabled: Boolean, purpose: Int, hint: Int, text: String?, cursor: Int, anchor: Int, rect: IntArray?)
     /** A Linux app copied [text]. */
