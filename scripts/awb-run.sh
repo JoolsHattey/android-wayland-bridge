@@ -71,5 +71,32 @@ BUS=unix:path=/run/awb/bus
         sleep 0.3
     done'
 
+# Web links open in Android's browser: awb-open writes them to the app's open
+# fifo, and awb-launcher.sh hands them to Android. It is the chroot's default
+# http(s) handler (xdg-open) and $BROWSER.
+cat > $R/usr/local/bin/awb-open <<'SH'
+#!/bin/sh
+# Opens web links in Android's browser (see awb-run.sh, awb-launcher.sh).
+for url in "$@"; do
+    case "$url" in
+        http://*|https://*) printf '%s\n' "$url" | timeout 2 tee -a /run/awb/open >/dev/null ||
+            echo "awb-open: the Android launcher is not running" >&2 ;;
+        *) echo "awb-open: not a web link: $url" >&2 ;;
+    esac
+done
+SH
+chmod 755 $R/usr/local/bin/awb-open
+mkdir -p $R/usr/local/share/applications
+cat > $R/usr/local/share/applications/awb-android-browser.desktop <<'INI'
+[Desktop Entry]
+Type=Application
+Name=Android browser
+Exec=/usr/local/bin/awb-open %u
+MimeType=x-scheme-handler/http;x-scheme-handler/https;
+NoDisplay=true
+INI
+grep -q '^x-scheme-handler/https=awb-android-browser.desktop' $R/root/.config/mimeapps.list 2>/dev/null ||
+    /data/debian/enter xdg-mime default awb-android-browser.desktop x-scheme-handler/http x-scheme-handler/https
+
 exec /data/debian/enter env WAYLAND_DISPLAY=/run/awb/wayland-0 GDK_BACKEND=wayland DBUS_SESSION_BUS_ADDRESS=$BUS \
-    GTK_A11Y=none "$@"
+    GTK_A11Y=none BROWSER=/usr/local/bin/awb-open "$@"

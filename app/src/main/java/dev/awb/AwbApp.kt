@@ -296,7 +296,9 @@ class AwbApp : Application(), NativeCallbacks {
             if (hosts.remove(win) != null) Native.close(win)
         }.let {}
 
-        override fun launch(appId: String) = launchApp(appId)
+        override fun launch(appId: String) = launchApp(appId, null)
+
+        override fun open(appId: String, uri: String) = launchApp(appId, uri)
     }
 
     /** [win]'s activity process died (a crashed or killed stub): the window goes too. */
@@ -311,34 +313,47 @@ class AwbApp : Application(), NativeCallbacks {
     private val launchFifo get() = File(filesDir, "launch")
 
     /**
-     * The launch requests' channel to the root side (scripts/awb-launcher.sh),
-     * created here so that it carries this app's file label and owner.
+     * The channels to the root side (scripts/awb-launcher.sh), created here so
+     * that they carry this app's file label and owner: `launch` takes launch
+     * requests from here, `open` takes links from the chroot's apps (written
+     * by awb-open, see awb-run.sh) for Android to open.
      */
     private fun createLaunchFifo() {
-        val path = launchFifo.path
-        try {
-            if (!OsConstants.S_ISFIFO(Os.lstat(path).st_mode)) {
-                Os.remove(path)
-                Os.mkfifo(path, "600".toInt(8))
+        for (name in listOf("launch", "open")) {
+            val path = File(filesDir, name).path
+            try {
+                if (!OsConstants.S_ISFIFO(Os.lstat(path).st_mode)) {
+                    Os.remove(path)
+                    Os.mkfifo(path, "600".toInt(8))
+                }
+            } catch (_: ErrnoException) {
+                runCatching { Os.mkfifo(path, "600".toInt(8)) }.onFailure { Log.e(TAG, "mkfifo $path: $it") }
             }
-        } catch (_: ErrnoException) {
-            runCatching { Os.mkfifo(path, "600".toInt(8)) }.onFailure { Log.e(TAG, "mkfifo $path: $it") }
         }
     }
 
-    /** Hands desktop file id [appId] to the root launcher, which runs it in the chroot. */
-    private fun launchApp(appId: String) {
+    /**
+     * Hands desktop file id [appId] to the root launcher, which runs it in the
+     * chroot, with [uri] as its argument if given (a link from a browser).
+     */
+    private fun launchApp(appId: String, uri: String?) {
         if (!appId.matches(Regex("[A-Za-z0-9._-]+"))) return
+        // One request per line, the link as one word: no whitespace or
+        // control characters (a well-formed URI has none).
+        if (uri != null && !uri.matches(Regex("[A-Za-z][A-Za-z0-9+.-]*:[\\x21-\\x7e]*"))) {
+            Log.w(TAG, "launch $appId: malformed link")
+            return
+        }
         try {
             // Non-blocking: with no reader (launcher not running) this fails at once.
             val fd = Os.open(launchFifo.path, OsConstants.O_WRONLY or OsConstants.O_NONBLOCK, 0)
             try {
-                val line = "$appId\n".toByteArray()
+                val line = (if (uri != null) "$appId $uri\n" else "$appId\n").toByteArray()
                 Os.write(fd, line, 0, line.size)
             } finally {
                 Os.close(fd)
             }
-            Log.i(TAG, "launch $appId")
+            Log.i(TAG, "launch $appId${if (uri != null) " with a link" else ""}")
         } catch (e: ErrnoException) {
             Log.e(TAG, "launch $appId: root launcher not running ($e)")
             main.post {

@@ -425,6 +425,30 @@ takes that role (`native/src/portal.rs`):
 * With a session bus, GApplication apps also behave as on a desktop: they
   can be single-instance and are activatable.
 
+## Links
+
+* **Out of the chroot.** `awb-run.sh` installs `/usr/local/bin/awb-open`
+  as the chroot's default `http`/`https` handler (a desktop file plus
+  `xdg-mime default`) and as `$BROWSER`. It writes each web link to the
+  app's `open` fifo. `awb-launcher.sh` (root, Android side) reads the fifo
+  and runs `am start -a VIEW -d <link>`, so links open in Chrome. Only
+  `http(s)` links are passed on, and only as an intent's data.
+* **Back in.** A stub declares a `VIEW`/`BROWSABLE` intent filter for each
+  `x-scheme-handler/<scheme>` in its app's desktop file (`install-stub.sh`
+  reads `MimeType`; the stub build generates the filter). A link in such a
+  scheme reaches the stub's `LaunchActivity`, which calls
+  `IToplevelSession.open(appId, uri)`. dev.awb checks the link (one word of
+  printable ASCII) and writes `<id> <link>` to the `launch` fifo. The
+  launcher then runs `gtk-launch <id> <link>`, so the app gets it as `%U`.
+* **Claude Desktop** works this way. "Continue with Google" opens Chrome.
+  "Continue to Claude" follows a `claude://` link back to the stub, and
+  the running Claude gets it through Electron's single-instance handoff.
+  Electron as root needs `--no-sandbox`, and there's no X server, so
+  `/usr/local/bin/claude-desktop` in the chroot wraps it:
+  `exec /usr/bin/claude-desktop --no-sandbox --ozone-platform=wayland --enable-features=WaylandWindowDecorations "$@"`.
+  It comes before `/usr/bin` in the PATH, so the desktop file's `Exec` uses
+  it.
+
 ## Robustness
 
 * Every request handler runs in `guard()` (`catch_unwind`). A panic logs and

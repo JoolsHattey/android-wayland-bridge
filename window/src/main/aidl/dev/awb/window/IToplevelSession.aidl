@@ -40,4 +40,10 @@ interface IToplevelSession {
 
     /** Starts the Linux app with desktop file id [appId] (from a stub's launcher icon). */
     oneway void launch(String appId);
+
+    /**
+     * Opens [uri] with the Linux app [appId]: a link in one of the schemes its
+     * stub declares (claude://..., say), from a browser.
+     */
+    oneway void open(String appId, String uri);
 }

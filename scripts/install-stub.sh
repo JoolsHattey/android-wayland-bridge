@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds and installs the stub app of one Linux app (host side), so that it
-# gets a launcher icon and its windows open as that app's tasks:
+# gets a launcher icon, its windows open as that app's tasks, and links in its
+# URL schemes (the desktop file's x-scheme-handler types) open in it:
 #   scripts/install-stub.sh org.gnome.Adwaita1.Demo
 # Name and icon come from the chroot's desktop file. SVG icons are rendered
 # with a headless Chrome or Edge. ADB_SERIAL selects the device.
@@ -21,6 +22,7 @@ key() { printf '%s\n' "$DESKTOP" | sed -n '/^\[Desktop Entry\]/,/^\[/p' | grep -
 NAME=$(key Name)
 ICON=$(key Icon)
 [ -n "$NAME" ] || { echo "no Name in $ID.desktop" >&2; exit 1; }
+SCHEMES=$( (key MimeType || true) | tr ';' '\n' | sed -n 's|^x-scheme-handler/||p' | paste -sd, -)
 
 # The largest PNG in hicolor, else the scalable SVG.
 SRC=
@@ -55,7 +57,7 @@ case "$SRC" in
 esac
 [ -s "$PNG" ] || { echo "no icon rendered from $SRC" >&2; exit 1; }
 
-echo "$ID: '$NAME', icon $SRC"
+echo "$ID: '$NAME', icon $SRC${SCHEMES:+, links $SCHEMES}"
 ./gradlew.bat :stub:assembleDebug --console=plain -q \
-    "-Pstub.appId=$ID" "-Pstub.label=$NAME" "-Pstub.icon=$(path "$PWD/$PNG")"
+    "-Pstub.appId=$ID" "-Pstub.label=$NAME" "-Pstub.icon=$(path "$PWD/$PNG")" "-Pstub.schemes=$SCHEMES"
 "${A[@]}" install -r stub/build/outputs/apk/debug/stub-debug.apk

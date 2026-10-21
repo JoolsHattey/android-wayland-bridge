@@ -34,6 +34,12 @@ The icon starts the app through `awb-launcher.sh` (the root side, started by
 `deploy.sh`). The app's windows then open as the stub's tasks, so the
 taskbar and recents show them under that app.
 
+Links cross over both ways. Web links that a Linux app opens (`xdg-open`,
+`$BROWSER`) open in Android's browser. Links in an app's own URL schemes
+(the `x-scheme-handler` types in its desktop file, such as `claude://`)
+open in the app, through its stub. That is how a browser sign-in returns
+to the app.
+
 For GPU rendering in the apps, the chroot needs Mesa's drivers
 (`apt install mesa-vulkan-drivers libgl1-mesa-dri`). The compositor itself
 composites with Vulkan; `renderer=cpu` in the app's `files/awb.properties`
