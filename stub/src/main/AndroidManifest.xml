@@ -17,7 +17,7 @@
         android:appComponentFactory="dev.awb.stub.StubComponentFactory">
 
         <!-- What this manifest provides; dev.awb lists stubs below its own
-             format as outdated (scripts/sync-stubs.sh rebuilds them). -->
+             format as outdated (awb-stubs.sh sync remakes them). -->
         <meta-data android:name="dev.awb.stub_format" android:value="${stubFormat}" />
 
         <!-- The launcher icon: asks Wayland Bridge to start the Linux app. -->

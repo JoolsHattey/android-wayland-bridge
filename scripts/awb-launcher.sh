@@ -8,7 +8,9 @@
 #           awb-run.sh as their browser), opened by Android (Chrome).
 #   task:   window moves and resizes the apps asked for, carried out by
 #           dev.awb.TaskHelper from the app's APK (apps can't move tasks).
-# It also uninstalls the stub apps of Linux apps removed from the chroot.
+# It also keeps the stub apps in line (awb-stubs.sh sync): makes them for
+# apps that open windows without one or get installed in the chroot, and
+# remakes or removes them as the apps change or go.
 APPDIR=/data/user/10/dev.awb/files
 FIFO=$APPDIR/launch
 OPEN=$APPDIR/open
@@ -38,15 +40,27 @@ OPENER=$!
     done
 ) &
 MOVER=$!
-# Stubs whose desktop file is gone (apt remove): their icons go too.
+# Stub apps: synced when dev.awb asks for one (stub-requests) or the
+# chroot's desktop files change, and every two minutes (app updates, a new
+# dev.awb with another stub format). Logged to awb-stubs.log.
 (
+    LOG=/data/local/tmp/awb-stubs.log
+    state() { stat -c '%Y %s' $APPDIR/stub-requests /data/debian/usr/share/applications /data/debian/usr/local/share/applications 2>/dev/null; }
+    last=; n=0
     while :; do
-        /data/local/tmp/awb-stubs.sh prune >/dev/null 2>&1
-        sleep 120
+        now=$(state)
+        if [ "$now" != "$last" ] || [ $n -ge 24 ]; then
+            [ "$(stat -c %s $LOG 2>/dev/null || echo 0)" -lt 65536 ] || mv $LOG $LOG.old
+            /data/local/tmp/awb-stubs.sh sync >>$LOG 2>&1
+            # Its own changes (stub-requests) don't count.
+            last=$(state); n=0
+        fi
+        n=$((n + 1))
+        sleep 5
     done
 ) &
-PRUNER=$!
-trap 'kill $OPENER $MOVER $PRUNER; pkill -f "dev.awb.[T]askHelper"; exit' TERM INT
+STUBS=$!
+trap 'kill $OPENER $MOVER $STUBS; pkill -f "dev.awb.[T]askHelper"; exit' TERM INT
 
 while :; do
     # The app creates the fifo; wait for it (first start, reinstall).

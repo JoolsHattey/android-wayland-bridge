@@ -511,6 +511,11 @@ worst case before the copy) ran 16 out of 16 without a stall.
     wheels: `axis_source(wheel)`, `axis_value120` for v8+ clients, whole
     `axis_discrete` steps (fractions add up) for v5-7, and `axis` at 15
     logical px per notch.
+  - Axis events go out in a frame of their own, with a `motion` (in an
+    earlier frame) only if the pointer moved. GTK delivers a frame's
+    motion or crossing event instead of its scroll
+    (`gdk_wayland_seat_flush_frame_event`), so a scroll sharing a frame
+    with a motion never reached GTK apps (GNOME Console didn't scroll).
   - A touchpad's two-finger scroll reaches the view as a fake finger with
     `CLASSIFICATION_TWO_FINGER_SWIPE`. Its `AXIS_GESTURE_SCROLL_{X,Y}_DISTANCE`
     (px, already in the user's scrolling direction) become
@@ -802,7 +807,7 @@ launcher `LaunchActivity`, the `ToplevelActivity` that the compositor
 starts per window (found by the `dev.awb.action.TOPLEVEL` action and the
 `dev.awb.app_id` meta-data), and the app's URL schemes. Name and icon come
 from the chroot's desktop file. Windows of apps without a stub open in
-dev.awb itself.
+dev.awb itself, until the device has made the app its stub (seconds later).
 
 **Stubs carry no window code.** Until format 2, each stub compiled
 `window/` in, so every change to it (or to the AIDL) left the stubs on the
@@ -843,29 +848,83 @@ stubs.
 
 **Compatibility.** A format-1 stub (built before this) still runs its own
 copy of `window/`. That keeps working as long as the AIDL only grows by
-appending methods, but it lacks whatever came later; `sync-stubs.sh`
+appending methods, but it lacks whatever came later; a sync
 replaces it the next time it runs (the first deploy migrated the test
 device's three). A format-2 stub with an older dev.awb runs that dev.awb's
 window code, which has always lived in `dev.awb.window`. From format 2 on,
 a stub of an older format than dev.awb's runs today's code under its older
 manifest; a format bump is for changes where that would break.
 
-**Keeping them in line** is automatic where it can be:
+**Made on the device.** Only the manifest (package, label, app id,
+versionName, URL schemes) and the icon differ between stubs, so the device
+makes them from a template, with no build tools:
+
+* The stub module's `template` build type is a stub with placeholders: an
+  intent filter with the scheme `awb-template-scheme`, a PNG icon slot
+  (`linux_icon_png`, behind `mipmap/ic_launcher_png`) named by the
+  meta-data `dev.awb.template.icon_png`, and the default icon. dev.awb
+  ships it as `assets/stub-template.apk`.
+* `dev.awb.StubMaker`, run as root with `app_process` and dev.awb's APK as
+  the class path (as `TaskHelper` is), edits the template's binary
+  manifest (`BinaryXml`: a small reader and writer of aapt2's format; new
+  strings are appended to the pool, so the resource map stays valid). It
+  renames the package (resources keep theirs, as with aapt's
+  `--rename-manifest-package`), makes the label a literal string, sets
+  the app id meta-data and versionName, turns the placeholder scheme into
+  the app's (or drops the filter), and points the icon at the PNG slot
+  when there is an icon. It copies the other entries, replacing the slot's
+  PNG, drops `META-INF/` and signs (v2) with apksig, which also 4-byte
+  aligns the stored entries (`resources.arsc`). Under a second per stub.
+* Icons: a PNG as is; an SVG rendered to a 256 px PNG by `rsvg-convert` in
+  the chroot (`apt install librsvg2-bin`; Android has no SVG renderer, the
+  chroot already has librsvg). Without it the stub gets the default icon.
+* `awb-stubs.sh make <id>` does one stub and `pm install`s it.
+
+**The signing key.** `dev.awb.permission.WINDOWS` is a signature
+permission, so stubs must be signed with dev.awb's key, the debug key.
+deploy.sh exports it (`:app:stubKey`: PKCS#8 key and DER certificate, read
+from the debug keystore) to `/data/adb/awb`, which only root can read.
+The alternatives were worse:
+
+* Embedding the key in dev.awb's APK would make it public: any app can
+  read any APK, and with the key could sign a replacement for dev.awb
+  itself, not only claim the permission.
+* A separate stub key with a `knownSigner` permission (`knownCerts`) limits
+  a leaked key to the permission, but the certificate must be in dev.awb's
+  manifest at build time, so the key would still come from the host, and
+  host-built and device-made stubs would no longer update each other.
+  Kept root-only, the key is no exposure on a device where root can do
+  anything anyway.
+
+With one key, a stub made on the device and one built by `install-stub.sh`
+replace each other with `pm install -r` / `adb install -r`.
+
+**Keeping them in line** is automatic:
 
 * `scripts/awb-stubs.sh` (on the device, as root) is the one place that
   maps desktop files to stub packages: `info` (name, icon, schemes, stamp),
-  `list` (installed stubs, their versions and desktop ids) and `prune`.
-* `scripts/sync-stubs.sh` (host, run by `deploy.sh`) removes stubs whose
-  desktop file is gone, rebuilds those of an older format or a changed
-  desktop file or icon (an app update), and builds stubs for the apps that
-  opened windows without one: dev.awb notes their app ids in
-  `files/stub-requests` when it maps such a window. Only apps with a
-  desktop file get one, so helpers and portals don't.
-* `awb-launcher.sh` (root, always running) prunes every two minutes, so
-  `apt remove` takes the icon away without the host.
-* Building still needs the host (aapt2, d8, the signing key).
-  SVG icons become vector drawables with Android Studio's converter
-  (`Svg2Vector`, on AGP's classpath), so no SVG renderer is needed.
+  `list` (installed stubs, their versions and desktop ids), `prune`, `make`
+  and `sync`.
+* `sync` removes stubs whose desktop file is gone (`apt remove`), remakes
+  those of an older format than the template's (a new dev.awb) or of a
+  changed desktop file or icon (an app update), and makes stubs for:
+  * the apps that opened windows without one: dev.awb notes their app ids
+    in `files/stub-requests` when it maps such a window. Only apps with a
+    desktop file get one, so helpers and portals don't; their ids stay in
+    the file, so dev.awb does not add them again.
+  * apps installed in the chroot since the last sync: desktop files that
+    `/data/adb/awb/known-apps` does not list yet, and that a launcher
+    would show (`Type=Application`, not `NoDisplay`, `Hidden`, `Terminal`
+    or `OnlyShowIn`). The first sync only takes note of what is there, so
+    the apps of an existing chroot get stubs as they are used.
+* `awb-launcher.sh` (root, always running) syncs within five seconds of a
+  change to `stub-requests` or to the applications directories, and every
+  two minutes; it logs to `/data/local/tmp/awb-stubs.log`. A sync takes a
+  lock, so `scripts/sync-stubs.sh` (host, run by `deploy.sh`: the same sync,
+  now) can run alongside. On the test device, a first GTK Demo window got
+  its stub 7 s after it opened.
+* `scripts/install-stub.sh` still builds one stub on the host with Gradle
+  (an SVG becomes a vector drawable there, with AGP's `Svg2Vector`).
 
 ## Robustness
 

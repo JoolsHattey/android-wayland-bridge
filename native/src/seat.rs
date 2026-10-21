@@ -196,17 +196,24 @@ pub fn handle_pointer(st: &mut State, ev: PointerEvent) {
         st.surface_at(w, x, y)
     };
     let time = ev.time;
+    let before = (st.seat.ptr_focus.clone(), st.seat.surface_pos);
     set_pointer_focus(st, target.clone().map(|(s, lx, ly)| (s, win, lx, ly)));
     let Some((sid, lx, ly)) = target else {
         st.seat.buttons = buttons;
         return;
     };
+    let entered = before.0.as_ref().map(|(s, _)| s) != Some(&sid);
+    let moved = entered || before.1 != (lx, ly);
     if !locked {
         st.seat.surface_pos = (lx, ly);
     }
     crate::constraints::check(st, &sid, win, lx, ly);
     let pointers = st.seat.pointers_for(&sid);
-    if positioned {
+    // A scroll goes out in a frame of its own: GTK's frame handling
+    // (gdk_wayland_seat_flush_frame_event) delivers a frame's motion or
+    // crossing event *instead of* its scroll, which then never arrives. So
+    // a scroll sends motion only if the pointer moved, framed before it.
+    if positioned && (ev.action != 1 || moved) {
         for p in &pointers {
             p.motion(time, lx, ly);
         }
@@ -216,6 +223,13 @@ pub fn handle_pointer(st: &mut State, ev: PointerEvent) {
     }
 
     if ev.action == 1 {
+        if moved {
+            for p in &pointers {
+                if p.version() >= 5 {
+                    p.frame();
+                }
+            }
+        }
         scroll(st, &pointers, &ev);
     }
 

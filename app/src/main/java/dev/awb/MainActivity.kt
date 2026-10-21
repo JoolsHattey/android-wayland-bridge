@@ -9,7 +9,7 @@ import dev.awb.window.Window
 /** The installed stubs, one line each, flagging those whose manifest is outdated. */
 private fun stubs(app: AwbApp): String =
     app.stubs().sortedBy { it.first }.joinToString("") { (id, _, format) ->
-        "\n  $id" + if (format < Window.STUB_FORMAT) " (outdated: run scripts/sync-stubs.sh)" else ""
+        "\n  $id" + if (format < Window.STUB_FORMAT) " (outdated: the root launcher remakes it)" else ""
     }.ifEmpty { "\n  none" }
 
 /** Status page; opening it starts the compositor and keeps it alive. */
@@ -28,8 +28,8 @@ class MainActivity : Activity() {
                 Scale here: ${app.scale120(display?.displayId ?: Display.DEFAULT_DISPLAY) / 120f}
 
                 In the Debian chroot: scripts/awb-run.sh <app>
-                Linux app icons: scripts/install-stub.sh <desktop id>, or
-                scripts/sync-stubs.sh (run by deploy.sh) for the apps used here.
+                Linux app icons: made here for each app that opens a window
+                or is installed in the chroot (by awb-launcher.sh, as root).
 
                 Stub apps:
             """.trimIndent() + stubs(app)
