@@ -399,7 +399,50 @@ worst case before the copy) ran 16 out of 16 without a stall.
   touch have no button bits, so a pressed pointer counts as the primary
   button. There is an implicit grab while a button is held. A press outside
   grabbing popups sends `popup_done` and is consumed.
-* Scroll maps to `axis` + `axis_discrete`, 15 units per detent.
+* Motion keeps the device's rate. Android batches a MotionEvent per frame;
+  the view sends its history too (`IToplevelSession.motion`), and each
+  sample becomes `wl_pointer.motion` + `frame` with its own timestamp.
+* Scrolling (`wl_seat` v8):
+  - A wheel (`ACTION_SCROLL`) gives notches, fractional on high-resolution
+    wheels: `axis_source(wheel)`, `axis_value120` for v8+ clients, whole
+    `axis_discrete` steps (fractions add up) for v5-7, and `axis` at 15
+    logical px per notch.
+  - A touchpad's two-finger scroll reaches the view as a fake finger with
+    `CLASSIFICATION_TWO_FINGER_SWIPE`. Its `AXIS_GESTURE_SCROLL_{X,Y}_DISTANCE`
+    (px, already in the user's scrolling direction) become
+    `axis_source(finger)` + `axis` in logical px, and the lift
+    `axis_stop`, so GTK and others scroll kinetically. The pointer stays
+    where it was. Pinches are dropped (no `pointer-gestures` yet).
+  - An `ACTION_SCROLL` from a finger tool (a touchpad that scrolls that
+    way) is `continuous`: smooth, but with no known end, so no
+    `axis_stop`.
+* Relative motion (`zwp_relative_pointer_manager_v1`) goes with every
+  motion: Android's `AXIS_RELATIVE_X/Y` for mice and touchpads (sub-pixel),
+  else the change in position. Android has already accelerated it, so the
+  "unaccelerated" values are the same, except under pointer capture, where
+  a mouse reports raw counts.
+* Pointer constraints (`zwp_pointer_constraints_v1`), with oneshot and
+  persistent lifetimes, active only while their surface has pointer focus
+  and the pointer is in their region:
+  - **Lock.** The compositor asks the window for Android pointer capture
+    (`IToplevelHost.setPointerCapture` → `View.requestPointerCapture`,
+    relative mode on API 37). It sends `locked` once Android reports the
+    capture (`IToplevelSession.pointerCapture`). Captured events
+    (`onCapturedPointerEvent`) carry only relative motion, buttons and
+    scrolling; the pointer stays put. Android needs window focus to
+    capture, so the view asks again when focus returns. Focus leaving
+    (Meta, Alt+Tab) ends the capture: `unlocked`, and a oneshot lock is
+    spent. A persistent one asks again on the next pointer event over its
+    surface, i.e. a click back into the window relocks. Destroying the lock
+    or the surface releases the capture. A captured touchpad without
+    relative mode gives positions; their changes are used as px.
+  - **Confine** (best-effort). Android can't hold its cursor in a region,
+    so the compositor clamps the position it reports to the region's
+    bounding box and keeps the pointer on the surface while it is in the
+    window. The visible cursor can still leave; leaving the window ends the
+    confinement.
+  - `set_cursor_position_hint` is ignored (Android can't warp the
+    pointer), and `set_region` applies at once rather than on commit.
 * Keys use `KeyEvent.scanCode`, which is the Linux evdev code on real
   keyboards. Synthetic events fall back to a keycode table. Android's key
   repeats are dropped (clients repeat themselves per
@@ -670,7 +713,8 @@ Working on the device:
 * Per-window pacing, explicit sync (`wp_linux_drm_syncobj_v1`) and zero-copy
   direct mode for single-surface windows.
 * Popups and tooltips.
-* Keyboard and mouse input.
+* Keyboard and mouse input, with high-resolution and touchpad (kinetic)
+  scrolling, relative motion and pointer lock.
 * Client cursors.
 * libadwaita header bar in the transparent caption with the system controls
   on top.

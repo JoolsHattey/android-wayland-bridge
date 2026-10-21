@@ -19,7 +19,7 @@ pub enum RegionOp {
     Sub(i32, i32, i32, i32),
 }
 
-fn region_contains(ops: &[RegionOp], x: i32, y: i32) -> bool {
+pub fn region_contains(ops: &[RegionOp], x: i32, y: i32) -> bool {
     let inside = |rx: i32, ry: i32, rw: i32, rh: i32| x >= rx && y >= ry && x < rx.saturating_add(rw) && y < ry.saturating_add(rh);
     let mut r = false;
     for op in ops {
@@ -349,6 +349,7 @@ fn destroy_surface(st: &mut State, sid: &ObjectId) {
         }
     }
     st.seat.surface_gone(sid);
+    crate::constraints::surface_gone(st, sid);
     release_texture(st, s.texture, None);
     if let Some(r) = &mut st.gpu {
         r.forget_surface(sid);

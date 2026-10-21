@@ -134,6 +134,7 @@ pub struct State {
     pub seat: Seat,
     pub data: crate::data::Data,
     pub text_inputs: crate::text_input::TextInputs,
+    pub constraints: crate::constraints::Constraints,
     pub outputs: Outputs,
     /// The Vulkan renderer; None draws on the CPU (and offers no dmabuf).
     pub gpu: Option<crate::gpu::Renderer>,
@@ -178,6 +179,7 @@ impl State {
             seat: Seat::default(),
             data: Default::default(),
             text_inputs: Default::default(),
+            constraints: Default::default(),
             outputs: Outputs::default(),
             gpu: None,
             drm: None,

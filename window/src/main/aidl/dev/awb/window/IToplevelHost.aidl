@@ -53,4 +53,11 @@ oneway interface IToplevelHost {
      * token ("k") to report with [IToplevelSession.presented].
      */
     void present(in Bundle frame);
+
+    /**
+     * A client locked the pointer: capture it (View.requestPointerCapture)
+     * while the window has focus, or with false, release it. Each change is
+     * reported through [IToplevelSession.pointerCapture].
+     */
+    void setPointerCapture(boolean capture);
 }

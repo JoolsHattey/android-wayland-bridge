@@ -196,6 +196,16 @@ impl Host {
         });
     }
 
+    /// Asks the window's view for Android pointer capture (a client locked
+    /// the pointer), or releases it. The outcome comes back as
+    /// `Native.pointerCapture`.
+    pub fn pointer_capture(&self, win: u32, on: bool) {
+        self.with_env(|env, cb| {
+            env.call_method(cb, "onPointerCapture", "(IZ)V", &[JValue::Int(win as i32), JValue::Bool(on as u8)])?;
+            Ok(())
+        });
+    }
+
     /// A client copied text: put it on Android's clipboard.
     pub fn clipboard(&self, text: &str) {
         self.with_env(|env, cb| {

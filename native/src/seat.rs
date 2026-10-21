@@ -31,6 +31,13 @@ pub struct Seat {
     pub locked: u32,
     pub cursor: Option<(ObjectId, i32, i32)>,
     cursor_hash: u64,
+    /// Where the pointer is: its window and logical position there.
+    last: Option<(u32, f64, f64)>,
+    /// The pointer's position on the focused surface.
+    pub surface_pos: (f64, f64),
+    /// Wheel scrolling in 120ths not yet sent as whole notches to
+    /// wl_pointer v5-7 clients (axis_discrete), vertical and horizontal.
+    discrete: [i32; 2],
 }
 
 impl Seat {
@@ -49,6 +56,9 @@ impl Seat {
     pub fn window_gone(&mut self, win: u32) {
         if self.ptr_focus.as_ref().is_some_and(|(_, w)| *w == win) {
             self.ptr_focus = None;
+        }
+        if self.last.is_some_and(|(w, _, _)| w == win) {
+            self.last = None;
         }
         if self.kb_window == Some(win) {
             self.kb_window = None;
@@ -90,6 +100,7 @@ fn set_pointer_focus(st: &mut State, target: Option<(ObjectId, u32, f64, f64)>) 
         }
     }
     st.seat.ptr_focus = None;
+    st.seat.discrete = [0; 2];
     if let Some((sid, win, x, y)) = target {
         let serial = st.next_serial();
         if let Some(surf) = st.surfaces.get(&sid).map(|s| s.res.clone()) {
@@ -97,8 +108,10 @@ fn set_pointer_focus(st: &mut State, target: Option<(ObjectId, u32, f64, f64)>) 
                 p.enter(serial, &surf, x, y);
             }
             st.seat.ptr_focus = Some((sid, win));
+            st.seat.surface_pos = (x, y);
         }
     }
+    crate::constraints::focus_changed(st);
 }
 
 /// Whether `sid` is (part of) one of the window's popups.
@@ -130,24 +143,54 @@ pub fn pointer_grabbed(st: &mut State) {
 
 pub fn handle_pointer(st: &mut State, ev: PointerEvent) {
     let win = ev.win;
-    let (x, y) = window_point(st, win, ev.x, ev.y);
+    let buttons = if ev.buttons < 0 { st.seat.buttons } else { ev.buttons };
     if st.data.dragging() {
         // Android runs the drag; the pointer comes back once it ends.
-        st.seat.buttons = ev.buttons;
+        st.seat.buttons = buttons;
         return;
     }
     if ev.action == 2 {
         if st.seat.buttons == 0 {
             set_pointer_focus(st, None);
+            st.seat.last = None;
         }
         return;
     }
     let Some(w) = st.windows.get(&win) else { return };
 
-    // While a button is held, the pressed surface keeps the pointer.
-    let grabbed = st.seat.buttons != 0 && st.seat.ptr_focus.as_ref().is_some_and(|(_, fw)| *fw == win);
-    let target = if grabbed {
-        let (sid, _) = st.seat.ptr_focus.clone().unwrap();
+    // A locked pointer stays put, and so does one without a position
+    // (captured, or a touchpad scroll).
+    let scale = st.window_scale(win);
+    let locked = crate::constraints::locked(st);
+    let positioned = !ev.x.is_nan() && !ev.y.is_nan() && !locked;
+    let last = st.seat.last.filter(|(lw, _, _)| *lw == win);
+    let (x, y) = if positioned {
+        window_point(st, win, ev.x, ev.y)
+    } else if let Some((_, lx, ly)) = last {
+        (lx, ly)
+    } else {
+        st.seat.buttons = buttons;
+        return;
+    };
+    // Relative motion: Android's own (sub-pixel, and the only motion of a
+    // captured pointer), else the change in position. Android accelerates
+    // both, except under capture, so the two values sent are the same.
+    // (Injected mouse events report none, as zero.)
+    let rel = match (ev.rel.filter(|(dx, dy)| *dx != 0.0 || *dy != 0.0), last) {
+        (Some((dx, dy)), _) => Some((to_logical(dx as f64, scale), to_logical(dy as f64, scale))),
+        (None, Some((_, lx, ly))) if positioned => Some((x - lx, y - ly)),
+        _ => None,
+    }
+    .filter(|(dx, dy)| *dx != 0.0 || *dy != 0.0);
+    st.seat.last = Some((win, x, y));
+
+    // While a button is held, the pressed surface keeps the pointer, as
+    // does a locked or confined one, and one without a position.
+    let focus = st.seat.ptr_focus.clone().filter(|(_, fw)| *fw == win).map(|(s, _)| s);
+    let confined = focus.as_ref().and_then(|sid| crate::constraints::confinement(st, sid).map(|b| (sid.clone(), b)));
+    let target = if let Some((sid, (x0, y0, x1, y1))) = confined {
+        surface_origin(st, win, &sid).map(|(ox, oy)| (sid, (x - ox as f64).clamp(x0, x1), (y - oy as f64).clamp(y0, y1)))
+    } else if let Some(sid) = focus.filter(|_| st.seat.buttons != 0 || locked || !positioned) {
         surface_origin(st, win, &sid).map(|(ox, oy)| (sid, x - ox as f64, y - oy as f64))
     } else {
         st.surface_at(w, x, y)
@@ -155,40 +198,34 @@ pub fn handle_pointer(st: &mut State, ev: PointerEvent) {
     let time = ev.time;
     set_pointer_focus(st, target.clone().map(|(s, lx, ly)| (s, win, lx, ly)));
     let Some((sid, lx, ly)) = target else {
-        st.seat.buttons = ev.buttons;
+        st.seat.buttons = buttons;
         return;
     };
+    if !locked {
+        st.seat.surface_pos = (lx, ly);
+    }
+    crate::constraints::check(st, &sid, win, lx, ly);
     let pointers = st.seat.pointers_for(&sid);
-    for p in &pointers {
-        p.motion(time, lx, ly);
+    if positioned {
+        for p in &pointers {
+            p.motion(time, lx, ly);
+        }
+    }
+    if let Some(d) = rel {
+        crate::constraints::relative_motion(st, &sid, ev.time_us, d, d);
     }
 
     if ev.action == 1 {
-        for p in &pointers {
-            if p.version() >= 5 {
-                p.axis_source(wl_pointer::AxisSource::Wheel);
-            }
-            for (axis, amount) in [
-                (wl_pointer::Axis::VerticalScroll, -ev.vscroll),
-                (wl_pointer::Axis::HorizontalScroll, ev.hscroll),
-            ] {
-                if amount != 0.0 {
-                    if p.version() >= 5 {
-                        p.axis_discrete(axis, amount.round() as i32);
-                    }
-                    p.axis(time, axis, amount as f64 * 15.0);
-                }
-            }
-        }
+        scroll(st, &pointers, &ev);
     }
 
-    let changed = st.seat.buttons ^ ev.buttons;
-    st.seat.buttons = ev.buttons;
+    let changed = st.seat.buttons ^ buttons;
+    st.seat.buttons = buttons;
     for (bit, code) in BUTTONS {
         if changed & bit == 0 {
             continue;
         }
-        let pressed = ev.buttons & bit != 0;
+        let pressed = buttons & bit != 0;
         if pressed {
             // A press outside the open popups dismisses them and is eaten.
             let has_grab = st.windows.get(&win).is_some_and(|w| w.popups.iter().any(|p| st.popups.get(p).is_some_and(|p| p.grab)));
@@ -207,6 +244,58 @@ pub fn handle_pointer(st: &mut State, ev: PointerEvent) {
     for p in &pointers {
         if p.version() >= 5 {
             p.frame();
+        }
+    }
+}
+
+/// Logical px per wheel notch, as libinput reports it (15 degrees).
+const NOTCH: f64 = 15.0;
+
+/// A scroll's axis events: axis_source, then per axis the notches
+/// (axis_value120 from v8, whole axis_discrete steps for v5-7) and the
+/// distance, or axis_stop when touchpad fingers lift. The frame follows.
+fn scroll(st: &mut State, pointers: &[wl_pointer::WlPointer], ev: &PointerEvent) {
+    use crate::ScrollSource;
+    let scale = st.window_scale(ev.win);
+    let axes = [(wl_pointer::Axis::VerticalScroll, ev.vscroll), (wl_pointer::Axis::HorizontalScroll, ev.hscroll)];
+    let v120 = |amount: f32| (amount as f64 * 120.0).round() as i32;
+    // Whole notches for v5-7 clients; high-resolution wheels add up to them.
+    let mut discrete = [0; 2];
+    if ev.source == ScrollSource::Wheel {
+        for (i, (_, amount)) in axes.iter().enumerate() {
+            let acc = &mut st.seat.discrete[i];
+            *acc += v120(*amount);
+            discrete[i] = *acc / 120;
+            *acc -= discrete[i] * 120;
+        }
+    }
+    let source = match ev.source {
+        ScrollSource::Wheel => wl_pointer::AxisSource::Wheel,
+        ScrollSource::Finger => wl_pointer::AxisSource::Finger,
+        ScrollSource::Continuous => wl_pointer::AxisSource::Continuous,
+    };
+    for p in pointers {
+        let v = p.version();
+        if v >= 5 {
+            p.axis_source(source);
+        }
+        for (i, (axis, amount)) in axes.iter().enumerate() {
+            if *amount != 0.0 {
+                let distance = match ev.source {
+                    ScrollSource::Finger => to_logical(*amount as f64, scale),
+                    ScrollSource::Wheel | ScrollSource::Continuous => *amount as f64 * NOTCH,
+                };
+                if ev.source == ScrollSource::Wheel {
+                    if v >= 8 {
+                        p.axis_value120(*axis, v120(*amount));
+                    } else if v >= 5 && discrete[i] != 0 {
+                        p.axis_discrete(*axis, discrete[i]);
+                    }
+                }
+                p.axis(ev.time, *axis, distance);
+            } else if ev.stop && v >= 5 {
+                p.axis_stop(ev.time, *axis);
+            }
         }
     }
 }

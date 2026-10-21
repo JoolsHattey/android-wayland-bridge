@@ -215,6 +215,8 @@ class AwbApp : Application(), NativeCallbacks {
 
     override fun onExclusion(win: Int, rects: IntArray) = host(win) { it.setExclusion(rects) }
 
+    override fun onPointerCapture(win: Int, capture: Boolean) = host(win) { it.setPointerCapture(capture) }
+
     /** Caption geometry in logical px: system rects at the start and end, band height. */
     private data class CaptionCss(val start: Float, val end: Float, val height: Float)
 
@@ -374,6 +376,13 @@ class AwbApp : Application(), NativeCallbacks {
 
         override fun pointer(win: Int, action: Int, x: Float, y: Float, buttons: Int, vscroll: Float, hscroll: Float, time: Long) =
             Native.pointer(win, action, x, y, buttons, vscroll, hscroll, time)
+
+        override fun motion(win: Int, buttons: Int, samples: FloatArray, times: LongArray) = Native.motion(win, buttons, samples, times)
+
+        override fun scroll(win: Int, x: Float, y: Float, vscroll: Float, hscroll: Float, source: Int, stop: Boolean, time: Long) =
+            Native.scroll(win, x, y, vscroll, hscroll, source, stop, time)
+
+        override fun pointerCapture(win: Int, captured: Boolean) = Native.pointerCapture(win, captured)
 
         override fun key(win: Int, code: Int, down: Boolean, time: Long) = Native.key(win, code, down, time)
 

@@ -10,6 +10,8 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_m
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
+use wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1;
 use wayland_protocols::wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1;
@@ -51,7 +53,8 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
     dh.create_global::<State, wl_compositor::WlCompositor, ()>(6, ());
     dh.create_global::<State, wl_subcompositor::WlSubcompositor, ()>(1, ());
     dh.create_global::<State, wl_shm::WlShm, ()>(1, ());
-    dh.create_global::<State, wl_seat::WlSeat, ()>(7, ());
+    // v8: high-resolution scrolling (axis_value120).
+    dh.create_global::<State, wl_seat::WlSeat, ()>(8, ());
     // wl_output globals come and go with Android displays (output.rs).
     dh.create_global::<State, zxdg_output_manager_v1::ZxdgOutputManagerV1, ()>(3, ());
     dh.create_global::<State, WpViewporter, ()>(1, ());
@@ -60,6 +63,8 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
     dh.create_global::<State, XdgWmBase, ()>(6, ());
     dh.create_global::<State, ZxdgDecorationManagerV1, ()>(1, ());
     dh.create_global::<State, ZwpTextInputManagerV3, ()>(1, ());
+    dh.create_global::<State, ZwpRelativePointerManagerV1, ()>(1, ());
+    dh.create_global::<State, ZwpPointerConstraintsV1, ()>(1, ());
 
     // `renderer=cpu` in awb.properties keeps the CPU compositor.
     let gpu = if setting(&cfg.socket_path, "renderer").as_deref() == Some("cpu") {
@@ -225,6 +230,7 @@ fn handle_cmd(st: &mut State, cmd: Cmd) {
             }
         }
         Cmd::Pointer(ev) => crate::seat::handle_pointer(st, ev),
+        Cmd::PointerCapture(win, on) => crate::constraints::captured(st, win, on),
         Cmd::Clipboard(text) => crate::data::android_clipboard(st, text),
         Cmd::Drag(ev) => crate::data::android_drag(st, ev),
         Cmd::Ime(win, edit) => crate::text_input::edit(st, win, edit),

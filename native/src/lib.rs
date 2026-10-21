@@ -3,6 +3,7 @@
 //! thread, everything Wayland lives on one compositor thread (see `server`).
 
 mod android;
+mod constraints;
 mod data;
 mod direct;
 mod dmabuf;
@@ -44,6 +45,8 @@ pub enum Cmd {
     OwnsLayer(u32),
     Focus(u32, bool),
     Pointer(PointerEvent),
+    /// Android's pointer capture of the window began or ended.
+    PointerCapture(u32, bool),
     Key { win: u32, code: u32, down: bool, time: u32 },
     /// The user closed the Android window.
     Close(u32),
@@ -132,18 +135,41 @@ pub struct Caption {
     pub maximized: bool,
 }
 
+/// Where a scroll comes from (wl_pointer.axis_source).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScrollSource {
+    /// A mouse wheel, in notches (fractions from high-resolution wheels).
+    Wheel,
+    /// Touchpad fingers, in px; ends with `stop`.
+    Finger,
+    /// Smooth scrolling without a known end, in notches.
+    Continuous,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PointerEvent {
     pub win: u32,
     /// 0 = move/button change, 1 = scroll, 2 = left the window
     pub action: i32,
+    /// View px. NaN: no position (a captured pointer, a touchpad scroll),
+    /// the pointer stays where it is.
     pub x: f32,
     pub y: f32,
-    /// Android MotionEvent button state bits
+    /// Android MotionEvent button state bits; negative: unchanged (the
+    /// earlier samples of a batch).
     pub buttons: i32,
+    /// Scroll in Wayland's direction (positive: down, right), in the
+    /// source's units.
     pub vscroll: f32,
     pub hscroll: f32,
+    pub source: ScrollSource,
+    /// Finger scrolling ended (wl_pointer.axis_stop).
+    pub stop: bool,
+    /// Relative motion in px, where Android reports it (mice, touchpads).
+    pub rel: Option<(f32, f32)>,
+    /// Milliseconds (wl_pointer) and microseconds (relative motion).
     pub time: u32,
+    pub time_us: u64,
 }
 
 pub struct Shared {
@@ -317,6 +343,8 @@ pub extern "system" fn Java_dev_awb_Native_focus(_env: JNIEnv, _cls: JClass, win
     push(Cmd::Focus(win as u32, focused != 0));
 }
 
+/// The original pointer call, still used by stubs built before `motion`
+/// and `scroll`: one sample, wheel scrolling in Android's direction.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_awb_Native_pointer(
     _env: JNIEnv,
@@ -336,10 +364,98 @@ pub extern "system" fn Java_dev_awb_Native_pointer(
         x,
         y,
         buttons,
+        vscroll: -vscroll,
+        hscroll,
+        source: ScrollSource::Wheel,
+        stop: false,
+        rel: None,
+        time: time as u32,
+        time_us: time as u64 * 1000,
+    }));
+}
+
+/// Pointer samples of one MotionEvent, oldest first (its history, then the
+/// event): `samples` holds x, y, dx, dy per sample (view px; NaN x/y: no
+/// position, NaN dx/dy: no relative motion), `times` their event times in
+/// ns. `buttons` applies from the last sample on.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_motion(
+    env: JNIEnv,
+    _cls: JClass,
+    win: jint,
+    buttons: jint,
+    samples: jni::objects::JFloatArray,
+    times: jni::objects::JLongArray,
+) {
+    ffi_guard("motion", (), || {
+        let n = env.get_array_length(&times).unwrap_or(0).clamp(0, 256) as usize;
+        let mut t = vec![0i64; n];
+        let mut xy = vec![0f32; n * 4];
+        if env.get_long_array_region(&times, 0, &mut t).is_err() || env.get_float_array_region(&samples, 0, &mut xy).is_err() {
+            return;
+        }
+        let Some(shared) = SHARED.get() else { return };
+        for (i, (s, ns)) in xy.chunks_exact(4).zip(t).enumerate() {
+            let rel = (!s[2].is_nan() && !s[3].is_nan()).then_some((s[2], s[3]));
+            shared.push(Cmd::Pointer(PointerEvent {
+                win: win as u32,
+                action: 0,
+                x: s[0],
+                y: s[1],
+                buttons: if i + 1 == n { buttons } else { -1 },
+                vscroll: 0.0,
+                hscroll: 0.0,
+                source: ScrollSource::Wheel,
+                stop: false,
+                rel,
+                time: (ns / 1_000_000) as u32,
+                time_us: (ns / 1000) as u64,
+            }));
+        }
+    })
+}
+
+/// A scroll at view px (`x`, `y`; NaN: where the pointer is), in Wayland's
+/// direction: `source` 0 = wheel (notches), 1 = touchpad fingers (px; `stop`
+/// when they lift), 2 = continuous (notches). `time` in ns.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_scroll(
+    _env: JNIEnv,
+    _cls: JClass,
+    win: jint,
+    x: jfloat,
+    y: jfloat,
+    vscroll: jfloat,
+    hscroll: jfloat,
+    source: jint,
+    stop: jboolean,
+    time: jlong,
+) {
+    let source = match source {
+        1 => ScrollSource::Finger,
+        2 => ScrollSource::Continuous,
+        _ => ScrollSource::Wheel,
+    };
+    push(Cmd::Pointer(PointerEvent {
+        win: win as u32,
+        action: 1,
+        x,
+        y,
+        buttons: -1,
         vscroll,
         hscroll,
-        time: time as u32,
+        source,
+        stop: stop != 0,
+        rel: None,
+        time: (time / 1_000_000) as u32,
+        time_us: (time / 1000) as u64,
     }));
+}
+
+/// Android's pointer capture of window `win` began or ended.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_awb_Native_pointerCapture(_env: JNIEnv, _cls: JClass, win: jint, captured: jboolean) {
+    push(Cmd::PointerCapture(win as u32, captured != 0));
 }
 
 #[unsafe(no_mangle)]

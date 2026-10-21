@@ -96,4 +96,24 @@ interface IToplevelSession {
      * [attach], before the surface exists.
      */
     void ownsLayer(int win);
+
+    /**
+     * Pointer samples of one MotionEvent, oldest first (its history, then
+     * the event itself): x, y, dx, dy per sample in [samples] (view px; NaN
+     * x and y: no position, as under pointer capture; NaN dx and dy: no
+     * relative motion), their event times in ns in [times]. [buttons]
+     * (MotionEvent button state) applies from the last sample on.
+     */
+    oneway void motion(int win, int buttons, in float[] samples, in long[] times);
+
+    /**
+     * A scroll at [x], [y] (view px; NaN: where the pointer is), in Wayland's
+     * direction (positive: down, right). [source] 0 = wheel (notches,
+     * fractional for high-resolution wheels), 1 = touchpad fingers (px;
+     * [stop] when they lift), 2 = continuous (notches). [time] in ns.
+     */
+    oneway void scroll(int win, float x, float y, float vscroll, float hscroll, int source, boolean stop, long time);
+
+    /** Android's pointer capture of [win]'s view began or ended ([IToplevelHost.setPointerCapture]). */
+    oneway void pointerCapture(int win, boolean captured);
 }
