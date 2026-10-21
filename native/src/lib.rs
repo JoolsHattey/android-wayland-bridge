@@ -11,6 +11,7 @@ mod gpu;
 mod host;
 mod output;
 mod portal;
+mod presentation;
 mod render;
 mod seat;
 mod server;
@@ -59,7 +60,9 @@ pub enum Cmd {
     WindowDisplay(u32, i32),
     /// SurfaceFlinger completed a direct-mode transaction (binder thread);
     /// `fence` releases the buffer it replaced (-1: already released).
-    DirectDone { win: u32, token: u64, fence: i32 },
+    /// `latch` (ns, 0: unknown) is when SurfaceFlinger latched it, and
+    /// `present` (-1: none) the display's present fence for it.
+    DirectDone { win: u32, token: u64, fence: i32, latch: i64, present: i32 },
     /// Android's clipboard text changed.
     Clipboard(String),
     Drag(DragEvent),
@@ -335,7 +338,7 @@ pub extern "system" fn Java_dev_awb_Native_ownsLayer(_env: JNIEnv, _cls: JClass,
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_awb_Native_presented(_env: JNIEnv, _cls: JClass, win: jint, token: jlong) {
     // Presented: the buffer it replaced is off screen, so no release fence.
-    push(Cmd::DirectDone { win: win as u32, token: token as u64, fence: -1 });
+    push(Cmd::DirectDone { win: win as u32, token: token as u64, fence: -1, latch: 0, present: -1 });
 }
 
 #[unsafe(no_mangle)]

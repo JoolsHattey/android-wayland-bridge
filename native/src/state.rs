@@ -140,6 +140,11 @@ pub struct State {
     pub gpu: Option<crate::gpu::Renderer>,
     /// The render node, for explicit sync (wp_linux_drm_syncobj_v1).
     pub drm: Option<Arc<crate::syncobj::Drm>>,
+    /// Per window, since when its surfaces have had frame callbacks it did
+    /// not draw (`render::starved`).
+    pub starved: HashMap<u32, Instant>,
+    /// When the next starved window's callbacks are due, in ms.
+    pub fallback_ms: Option<i32>,
 }
 
 /// Runs a request handler, turning a panic into a disconnect of the client
@@ -183,6 +188,8 @@ impl State {
             outputs: Outputs::default(),
             gpu: None,
             drm: None,
+            starved: HashMap::new(),
+            fallback_ms: None,
         }
     }
 

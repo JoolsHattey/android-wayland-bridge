@@ -6,6 +6,7 @@ use wayland_server::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_output, wl_region, wl_subcompositor, wl_subsurface, wl_surface,
 };
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1;
+use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::WpPresentationFeedback;
 use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
@@ -41,6 +42,8 @@ pub struct SurfState {
     /// None = unchanged; Some(None) = infinite.
     pub input: Option<Option<Vec<RegionOp>>>,
     pub frame_cbs: Vec<wl_callback::WlCallback>,
+    /// wp_presentation feedback for this commit.
+    pub feedback: Vec<WpPresentationFeedback>,
     /// wp_viewport source (x, y, w, h in surface units); Some(None) = unset.
     pub vp_src: Option<Option<[f64; 4]>>,
     /// wp_viewport destination size; Some(None) = unset.
@@ -57,6 +60,7 @@ impl SurfState {
     fn merge(&mut self, newer: SurfState) {
         if newer.buffer.is_some() {
             // The older cached buffer is never shown: give it back.
+            crate::presentation::discard(self.feedback.drain(..));
             if let Some(Some(old)) = &self.buffer {
                 if newer.buffer.as_ref().is_none_or(|b| b.as_ref() != Some(old)) && old.is_alive() {
                     old.release();
@@ -82,6 +86,7 @@ impl SurfState {
             self.vp_dst = newer.vp_dst;
         }
         self.frame_cbs.extend(newer.frame_cbs);
+        self.feedback.extend(newer.feedback);
         self.damage = rect_union(self.damage, newer.damage);
         self.surface_damage = rect_union(self.surface_damage, newer.surface_damage);
     }
@@ -139,6 +144,8 @@ pub struct Surface {
     pub buffer_scale: i32,
     pub input: Option<Vec<RegionOp>>,
     pub frame_cbs: Vec<wl_callback::WlCallback>,
+    /// Presentation feedback of commits not drawn yet.
+    pub feedback: Vec<WpPresentationFeedback>,
     pub role: Role,
     /// The xdg_surface object, if one was created for this surface.
     pub xdg: Option<ObjectId>,
@@ -225,6 +232,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for State {
                         buffer_scale: 1,
                         input: None,
                         frame_cbs: Vec::new(),
+                        feedback: Vec::new(),
                         role: Role::None,
                         xdg: None,
                         sub: None,
@@ -335,7 +343,9 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
 
 fn destroy_surface(st: &mut State, sid: &ObjectId) {
     st.mark_dirty(sid);
-    let Some(s) = st.surfaces.remove(sid) else { return };
+    let Some(mut s) = st.surfaces.remove(sid) else { return };
+    let cached = s.cached.take().map(|c| c.feedback).unwrap_or_default();
+    crate::presentation::discard(s.feedback.drain(..).chain(s.pending.feedback.drain(..)).chain(cached));
     // Detach from the parent and orphan the children.
     if let Some(sub) = &s.sub {
         if let Some(p) = st.surfaces.get_mut(&sub.parent) {
@@ -498,6 +508,11 @@ fn apply(st: &mut State, sid: &ObjectId, mut state: SurfState) {
         s.vp_dst = dst;
     }
     s.frame_cbs.extend(state.frame_cbs);
+    // A new buffer replaces content that was never drawn.
+    if state.buffer.is_some() {
+        crate::presentation::discard(s.feedback.drain(..));
+    }
+    s.feedback.extend(state.feedback);
     let children: Vec<ObjectId> = s.below.iter().chain(s.above.iter()).cloned().collect();
     let is_cursor = matches!(s.role, Role::Cursor);
     let xdg = s.xdg.clone();
@@ -527,6 +542,7 @@ fn apply(st: &mut State, sid: &ObjectId, mut state: SurfState) {
             for cb in s.frame_cbs.drain(..) {
                 cb.done(now);
             }
+            crate::presentation::discard(s.feedback.drain(..));
         }
     }
 }

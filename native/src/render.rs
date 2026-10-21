@@ -1,9 +1,14 @@
 //! CPU compositing of a window's surfaces into its Android surface, and the
 //! caption analysis both renderers share.
 
+use std::time::{Duration, Instant};
+
+use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+
 use crate::Caption;
 use crate::android::Frame;
 use crate::output::to_px;
+use crate::presentation::{Owed, Shown, now_ns};
 use crate::shm::Texture;
 use crate::state::State;
 
@@ -213,12 +218,46 @@ pub fn caption_feedback(st: &mut State, id: u32, info: CaptionInfo) {
 
 pub fn render_dirty(st: &mut State) {
     if st.gpu.is_some() {
-        return crate::gpu::render_dirty(st);
+        crate::gpu::render_dirty(st);
+    } else {
+        let dirty: Vec<u32> = st.windows.values().filter(|w| w.dirty && w.mapped && w.px.0 > 0).map(|w| w.id).collect();
+        for id in dirty {
+            render_window(st, id);
+        }
     }
-    let dirty: Vec<u32> = st.windows.values().filter(|w| w.dirty && w.mapped && w.px.0 > 0).map(|w| w.id).collect();
-    for id in dirty {
-        render_window(st, id);
+    st.fallback_ms = starved(st);
+}
+
+/// How long a window's surfaces wait for frame callbacks while it draws
+/// nothing (hidden, minimised, unmapped, or its display showing no frames)
+/// before they get them anyway. Such clients keep running, at this rate.
+pub const CALLBACK_FALLBACK: Duration = Duration::from_millis(100);
+
+/// Sends the frame callbacks of windows that have not drawn their surfaces'
+/// commits for `CALLBACK_FALLBACK`. Returns when the next are due, in ms.
+fn starved(st: &mut State) -> Option<i32> {
+    let now = Instant::now();
+    let mut next: Option<Duration> = None;
+    let ids: Vec<u32> = st.windows.keys().copied().collect();
+    st.starved.retain(|id, _| ids.contains(id));
+    for id in ids {
+        let list = st.paint_list(&st.windows[&id]);
+        let waiting = list.iter().any(|(sid, _, _)| st.surfaces.get(sid).is_some_and(|s| !s.frame_cbs.is_empty()));
+        if !waiting {
+            st.starved.remove(&id);
+            continue;
+        }
+        let since = *st.starved.entry(id).or_insert(now);
+        let due = CALLBACK_FALLBACK.saturating_sub(now - since);
+        if due.is_zero() {
+            let ms = st.now_ms();
+            Owed::take(st, &list).done(ms);
+            st.starved.remove(&id);
+        } else {
+            next = Some(next.map_or(due, |n| n.min(due)));
+        }
     }
+    next.map(|d| d.as_millis() as i32 + 1)
 }
 
 fn render_window(st: &mut State, id: u32) {
@@ -277,14 +316,11 @@ fn render_window(st: &mut State, id: u32) {
     if !drawn {
         return;
     }
-    let now = st.now_ms();
-    for (sid, _, _) in &list {
-        if let Some(s) = st.surfaces.get_mut(sid) {
-            for cb in s.frame_cbs.drain(..) {
-                cb.done(now);
-            }
-        }
-    }
+    // Posted: the next vsync shows it at the earliest (an estimate).
+    let mut owed = Owed::take(st, &list);
+    owed.done(st.now_ms());
+    let shown = Shown { ns: now_ns(), refresh_ns: 0, flags: Kind::empty() };
+    crate::presentation::presented(st, id, owed.feedback, shown);
     let Some(w) = st.windows.get_mut(&id) else { return };
     w.dirty = false;
     if let Some(info) = info {

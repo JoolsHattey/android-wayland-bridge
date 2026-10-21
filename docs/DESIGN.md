@@ -113,10 +113,15 @@ disconnect itself.
   over the pool and the client is disconnected.
 * Each window is a `SurfaceView`. The compositor draws the toplevel tree
   (subsurfaces with sync/desync semantics, then popups) into its
-  `ANativeWindow`, presents, then sends frame callbacks. Normally this runs
-  through a Vulkan swapchain. The CPU fallback locks the window instead
-  (RGBA_8888, window-sized) and posts it. Either way, swapchain or
-  `unlockAndPost` back-pressure paces the clients.
+  `ANativeWindow` and presents. Normally this runs through a Vulkan
+  swapchain, and frame callbacks follow the display (see
+  [Pacing](#gpu)). The CPU fallback locks the window instead
+  (RGBA_8888, window-sized), posts it and sends the callbacks;
+  `unlockAndPost` back-pressure paces the clients there.
+* A window that draws nothing (minimised, hidden, unmapped, or its display
+  showing none of its frames) still sends its surfaces' frame callbacks,
+  100 ms (`CALLBACK_FALLBACK`) after they were committed. Such clients keep
+  running at 10 Hz instead of blocking for good.
 * The renderer honours `wp_viewporter` (source crop and destination
   size). A buffer whose size matches its on-screen pixel rect is copied 1:1.
   That is what fractional-scale clients produce. Anything else, such as a
@@ -189,6 +194,30 @@ through its `/dev` bind mount.
     the refresh period and when the display last showed one of its frames
     (polling every 1–2 ms only shortly after a vsync, when the timing may
     still lag, or without display timing).
+  - **Frame callbacks** follow the display, so clients render just in
+    time. A frame's callbacks go out when the display has shown the frame
+    before it, i.e. when this one is next to be latched (`Renderer::pace`).
+    That is when the timing says so, or at that frame's predicted vsync
+    plus 2 ms (one refresh after the last frame shown, if that was
+    recent), whichever comes first: the timing lags the vsync by a few ms.
+    A frame drawn with nothing else queued sends them at once. The
+    client's next frame then reaches the queue while this one is latched,
+    and is the only one waiting there: `MAX_QUEUED` is only a backstop
+    now.
+  - *Latency, by reasoning* (period P = 11.1 ms at 90 Hz; SurfaceFlinger
+    latches a frame about a vsync before showing it). Before, callbacks
+    went out when a frame was submitted, while the frame before it still
+    waited in the queue; a continuously animating client ran a frame ahead
+    and its frame was shown about 3P after its callback (about 30 ms).
+    Now it is about 2P (about 20 ms): one period less. What is left is
+    SurfaceFlinger's own pipeline (latch, then show) and the client's
+    render up to the latch. A client now has about P minus a few ms to
+    render and commit; one that takes longer drops to every other vsync,
+    as on other compositors.
+  - Without display timing, callbacks go out at submit as before.
+  - Callbacks wait at most `PACE_FALLBACK` (100 ms) for the display; a
+    frame never reported shown is given up after a second. A new
+    swapchain (resize) counts every frame of the old one as done.
   - **Per surface:** one quad, blended as premultiplied alpha, with a
     bilinear sampler. A quad that lands 1:1 on pixel centres samples
     exactly, so fractional-scale clients stay pixel-exact.
@@ -291,7 +320,10 @@ an integer-scale client on a fractional display (vkcube at scale 2 on
     buffer. Each dmabuf is wrapped once, on first direct use.
 * **Pacing.** One transaction in flight per window. Its `OnComplete` (on a
   binder thread) becomes `Cmd::DirectDone`, and the window's next frame
-  waits for it.
+  waits for it. Frame callbacks go out as a transaction is applied, so
+  the client renders its next frame while SurfaceFlinger latches this
+  one, which keeps a frame of slack: the window process's `presented`
+  comes only after the present fence.
 * **Buffer release.** `OnComplete` also carries the previous buffer's
   release fence. A dmabuf counts its SurfaceFlinger holds, and is released
   (wl_buffer and syncobj point) only when both the GPU and every hold are
@@ -317,6 +349,34 @@ Verified on the device:
 * Opening the menu popover switches it to composited, and closing the
   popover switches it back to direct.
 * vkcube at `scale=1` is direct with explicit sync and keeps animating.
+
+### Presentation time
+
+`wp_presentation` v2 (`presentation.rs`) tells clients when a commit
+reached the screen, on `CLOCK_MONOTONIC`.
+
+* Feedback rides with a commit like a frame callback (pending, cached for
+  synced subsurfaces, then current until a frame draws it). A commit with
+  a new buffer before the last was drawn, a surface destroyed first, a
+  surface in no window, and frames dropped during a synced resize get
+  `discarded`.
+* **Composited:** the present id's `actualPresentTime` from
+  `VK_GOOGLE_display_timing`, with `get_refresh_cycle_duration` as the
+  refresh; flags `vsync | hw_clock | hw_completion`. A frame the display
+  skipped (a later id shown, no time for it) is `discarded`.
+* **Direct, our layer:** the present fence from `OnComplete`
+  (`ASurfaceTransactionStats_getPresentFenceFd`); its signal time is read
+  with `SYNC_IOC_FILE_INFO`, waiting in the event loop if it is still
+  pending. Flags add `zero_copy`. Without a fence: the latch time plus one
+  refresh, an estimate, without `hw_*`.
+* **Direct, the window's layer:** the window process reports a frame
+  after its present fence signalled, so the time is when that report
+  arrives (an estimate, a binder hop late).
+* **CPU fallback and no display timing:** the submit or post time, flags
+  0 (an estimate: shown at the next vsync at the earliest).
+* The refresh is the display's period where the swapchain gives none.
+  `seq` is 0 (no vblank counter). `sync_output` names the window's
+  display.
 
 ### Synced resizes
 
@@ -749,7 +809,8 @@ Working on the device:
   resize→configure and close.
 * wl_shm and dmabuf rendering, composited with Vulkan (CPU fallback).
 * GPU clients: GTK's GL renderer, EGL/GLES and Vulkan on the Arc.
-* Per-window pacing, explicit sync (`wp_linux_drm_syncobj_v1`) and zero-copy
+* Per-window pacing with display-timed frame callbacks,
+  `wp_presentation`, explicit sync (`wp_linux_drm_syncobj_v1`) and zero-copy
   direct mode for single-surface windows.
 * Popups and tooltips.
 * Keyboard and mouse input, with high-resolution and touchpad (kinetic)
@@ -845,8 +906,15 @@ es2gears_wayland.
   SurfaceFlinger holds (direct mode) are still signalled from the CPU once
   its release fence signals; merging that fence with the GPU's would hand
   those to the kernel too.
-* **Pacing wakeups.** A window waiting for its display wakes the
-  compositor around each vsync. A Choreographer callback would be exact.
+* **Pacing wakeups.** A window waiting for its display, or with frame
+  callbacks waiting for its last frame (every animating composited
+  window), wakes the compositor around each vsync and polls 1–2 ms until
+  the timing arrives or the predicted vsync passes. A Choreographer
+  callback would be exact.
+* **Pacing budget.** Callbacks go out about when a frame is latched, so a
+  client has a little less than a refresh to render its next one. Direct
+  mode keeps the earlier callbacks (a frame of slack), since the window
+  process reports frames only after the present fence.
 
 ## Roadmap
 

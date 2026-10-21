@@ -80,6 +80,8 @@ unsafe extern "C" {
     fn ASurfaceTransaction_setZOrder(t: *mut ASurfaceTransaction, sc: *mut ASurfaceControl, z: i32);
     fn ASurfaceTransaction_setBufferTransparency(t: *mut ASurfaceTransaction, sc: *mut ASurfaceControl, transparency: i8);
     fn ASurfaceTransactionStats_getPreviousReleaseFenceFd(stats: *mut ASurfaceTransactionStats, sc: *mut ASurfaceControl) -> i32;
+    fn ASurfaceTransactionStats_getLatchTime(stats: *mut ASurfaceTransactionStats) -> i64;
+    fn ASurfaceTransactionStats_getPresentFenceFd(stats: *mut ASurfaceTransactionStats) -> i32;
     fn AHardwareBuffer_toHardwareBuffer(env: *mut jni::sys::JNIEnv, buffer: *mut AHardwareBuffer) -> jni::sys::jobject;
 }
 
@@ -385,11 +387,14 @@ struct Done {
     token: u64,
 }
 
-/// On a binder thread: hands the previous buffer's release fence to the
-/// compositor thread.
+/// On a binder thread: hands the previous buffer's release fence, the latch
+/// time and the present fence (for wp_presentation) to the compositor
+/// thread.
 extern "C" fn on_complete(ctx: *mut c_void, stats: *mut ASurfaceTransactionStats) {
     let ctx = unsafe { Box::from_raw(ctx as *mut Done) };
     let fence = unsafe { ASurfaceTransactionStats_getPreviousReleaseFenceFd(stats, ctx.sc) };
+    let latch = unsafe { ASurfaceTransactionStats_getLatchTime(stats) };
+    let present = unsafe { ASurfaceTransactionStats_getPresentFenceFd(stats) };
     unsafe { ASurfaceControl_release(ctx.sc) };
-    ctx.shared.push(Cmd::DirectDone { win: ctx.win, token: ctx.token, fence });
+    ctx.shared.push(Cmd::DirectDone { win: ctx.win, token: ctx.token, fence, latch, present });
 }

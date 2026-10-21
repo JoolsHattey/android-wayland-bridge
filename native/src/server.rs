@@ -13,6 +13,7 @@ use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_man
 use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
 use wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1;
 use wayland_protocols::wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
+use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1;
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -65,6 +66,7 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
     dh.create_global::<State, ZwpTextInputManagerV3, ()>(1, ());
     dh.create_global::<State, ZwpRelativePointerManagerV1, ()>(1, ());
     dh.create_global::<State, ZwpPointerConstraintsV1, ()>(1, ());
+    dh.create_global::<State, WpPresentation, ()>(2, ());
 
     // `renderer=cpu` in awb.properties keeps the CPU compositor.
     let gpu = if setting(&cfg.socket_path, "renderer").as_deref() == Some("cpu") {
@@ -122,8 +124,11 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
             libc::pollfd { fd: shared.wake_fd, events: libc::POLLIN, revents: 0 },
         ];
         // Also wake when the GPU or a client's buffer is done, or after the
-        // renderer's timeout.
-        let (waits, timeout) = st.gpu.as_ref().map_or((Vec::new(), -1), |g| g.waits());
+        // renderer's timeout or the frame-callback fallback's.
+        let (waits, mut timeout) = st.gpu.as_ref().map_or((Vec::new(), -1), |g| g.waits());
+        if let Some(ms) = st.fallback_ms {
+            timeout = if timeout < 0 { ms } else { timeout.min(ms) };
+        }
         fds.extend(waits.into_iter().map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }));
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
         if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
@@ -225,11 +230,13 @@ fn handle_cmd(st: &mut State, cmd: Cmd) {
                 st.configure_window(win);
             }
         }
-        Cmd::DirectDone { win, token, fence } => {
-            use std::os::fd::FromRawFd;
-            let fence = (fence >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fence) });
-            if let Some(r) = &mut st.gpu {
-                r.direct_done(win, token, fence);
+        Cmd::DirectDone { win, token, fence, latch, present } => {
+            use std::os::fd::{FromRawFd, OwnedFd};
+            let fence = (fence >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fence) });
+            let present = (present >= 0).then(|| unsafe { OwnedFd::from_raw_fd(present) });
+            if let Some(mut r) = st.gpu.take() {
+                r.direct_done(st, win, token, fence, (latch > 0).then_some(latch as u64), present);
+                st.gpu = Some(r);
             }
         }
         Cmd::Pointer(ev) => crate::seat::handle_pointer(st, ev),

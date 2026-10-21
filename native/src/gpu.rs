@@ -14,8 +14,10 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ash::vk;
+use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::{Kind, WpPresentationFeedback};
 use wayland_server::Resource;
 use wayland_server::backend::ObjectId;
 use wayland_server::protocol::wl_buffer::WlBuffer;
@@ -23,6 +25,7 @@ use wayland_server::protocol::wl_buffer::WlBuffer;
 use crate::android::{ANativeWindow, NativeSlot, TargetLock};
 use crate::direct::{AHardwareBuffer, Layer};
 use crate::output::to_px;
+use crate::presentation::{Fence, Owed, Shown, discard, fence_time, now_ns, presented};
 use crate::render::Band;
 use crate::shm::{Rect, Texture, rect_clamp, rect_empty, rect_union};
 use crate::state::{SYNC_TIMEOUT, State};
@@ -52,8 +55,20 @@ const BACKGROUND: [f32; 4] = [0x20 as f32 / 255.0, 0x20 as f32 / 255.0, 0x20 as 
 const MAX_DRAWS: u32 = 128;
 
 /// Frames a window may have queued for its display: enough to keep it busy,
-/// few enough that clients are not paced frames ahead of the screen.
+/// few enough that clients are not paced frames ahead of the screen. A
+/// backstop: display-timed frame callbacks (`pace`) keep one waiting.
 const MAX_QUEUED: u32 = 2;
+
+/// Whether present id `id` is at or before `shown` (ids wrap).
+fn seen(id: u32, shown: u32) -> bool {
+    shown.wrapping_sub(id) < 1 << 31
+}
+
+/// How long a frame's callbacks wait for the display to show the frame
+/// before it, and its feedback for the frame itself, before they give up:
+/// a hidden window's display may show nothing.
+const PACE_FALLBACK: Duration = crate::render::CALLBACK_FALLBACK;
+const PACE_STALE: Duration = Duration::from_secs(1);
 
 static VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.vert.spv"));
 static FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.frag.spv"));
@@ -820,8 +835,13 @@ pub struct Target {
     /// The swapchain must be recreated before the next frame.
     stale: bool,
     /// Present ids: the last one queued, and the last the display showed.
+    /// They run on across swapchains, so an id names one frame of the
+    /// Target.
     presented: u32,
     shown: u32,
+    /// Shown frames not yet taken by the Renderer (`pace`): present id and
+    /// when it was shown (CLOCK_MONOTONIC ns).
+    timings: Vec<(u32, u64)>,
     /// The display's refresh period and when it last showed one of our
     /// frames (CLOCK_MONOTONIC ns; 0 if unknown), to wait for its next
     /// vsync instead of polling.
@@ -899,6 +919,7 @@ impl Target {
                 stale: true,
                 presented: 0,
                 shown: 0,
+                timings: Vec::new(),
                 refresh_ns: 0,
                 last_shown_ns: 0,
                 layer: None,
@@ -975,7 +996,9 @@ impl Target {
                 self.rendered.push(err("semaphore", gpu.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))?);
             }
             self.stale = false;
-            (self.presented, self.shown) = (0, 0);
+            // The old swapchain's frames will not be reported.
+            self.shown = self.presented;
+            self.timings.clear();
             log::info!("gpu: swapchain {}x{} {:?}, {} images", extent.width, extent.height, pick.format, self.images.len());
             Ok(())
         }
@@ -1060,15 +1083,8 @@ impl Target {
             // the others. It is retried after the next vsync (`retry_ms`).
             // With display timing we know how many frames are still queued
             // and don't even ask; Android logs every acquire that would block.
-            if let Some(timing) = &gpu.timing_fn {
-                if let Ok(past) = timing.get_past_presentation_timing(self.swapchain) {
-                    if let Some(id) = past.iter().map(|t| t.present_id).max() {
-                        self.shown = self.shown.max(id);
-                    }
-                    if let Some(t) = past.iter().map(|t| t.actual_present_time).max() {
-                        self.last_shown_ns = self.last_shown_ns.max(t);
-                    }
-                }
+            if gpu.timing_fn.is_some() {
+                self.poll_timing();
                 if self.presented.wrapping_sub(self.shown) >= MAX_QUEUED {
                     return Ok(None);
                 }
@@ -1268,6 +1284,27 @@ struct BandRows {
 }
 
 impl Target {
+    /// Collects which frames the display has shown since the last call.
+    fn poll_timing(&mut self) {
+        let Some(timing) = &self.gpu.timing_fn else { return };
+        if self.swapchain == vk::SwapchainKHR::null() {
+            return;
+        }
+        let Ok(past) = (unsafe { timing.get_past_presentation_timing(self.swapchain) }) else { return };
+        for t in past {
+            if seen(t.present_id, self.shown) {
+                continue;
+            }
+            self.shown = t.present_id;
+            self.last_shown_ns = self.last_shown_ns.max(t.actual_present_time);
+            self.timings.push((t.present_id, t.actual_present_time));
+        }
+        // Nobody takes them while no frame waits (`Renderer::pace`).
+        if self.timings.len() > 64 {
+            self.timings.drain(..self.timings.len() - 64);
+        }
+    }
+
     /// When to try again after `record` found no image free: just after the
     /// display's next vsync, when it may have shown a frame. Shortly after
     /// a vsync the timing may still lag, so then it polls (as without
@@ -1558,6 +1595,32 @@ pub struct Renderer {
     sf_fences: Vec<(OwnedFd, Rc<Dmabuf>)>,
     placeholder: *mut AHardwareBuffer,
     next_token: u64,
+    /// Per window, composited frames not yet known shown (display timing
+    /// only).
+    queued: HashMap<u32, Vec<Queued>>,
+    /// Direct-mode frames whose present fence has not signalled yet.
+    present_waits: Vec<PresentWait>,
+}
+
+/// A composited frame not yet known shown, and what it owes its surfaces'
+/// clients: the callbacks until the frame before it is shown, the feedback
+/// until it is.
+struct Queued {
+    /// The Target and present id that name the frame.
+    generation: u64,
+    id: u32,
+    at: Instant,
+    owed: Owed,
+}
+
+/// A direct-mode frame SurfaceFlinger completed, waiting for its present
+/// fence.
+struct PresentWait {
+    win: u32,
+    fence: OwnedFd,
+    feedback: Vec<WpPresentationFeedback>,
+    latch: Option<u64>,
+    at: Instant,
 }
 
 /// A window's direct-mode layer, as last told to SurfaceFlinger.
@@ -1575,6 +1638,8 @@ struct Direct {
     /// Per outstanding transaction, the buffer it took off the layer
     /// (released by that transaction's previous-release fence).
     replaced: HashMap<u64, Option<Rc<Dmabuf>>>,
+    /// Per outstanding transaction, its commits' presentation feedback.
+    feedback: HashMap<u64, Vec<WpPresentationFeedback>>,
 }
 
 impl Direct {
@@ -1584,6 +1649,7 @@ impl Direct {
         for d in self.shown.take().into_iter().chain(self.replaced.drain().filter_map(|(_, d)| d)) {
             d.sf_holds.set(d.sf_holds.get().saturating_sub(1));
         }
+        discard(self.feedback.drain().flat_map(|(_, f)| f));
         self.in_flight = None;
     }
 }
@@ -1611,6 +1677,8 @@ impl Renderer {
             sf_fences: Vec::new(),
             placeholder: if direct_enabled { crate::direct::placeholder() } else { std::ptr::null_mut() },
             next_token: 1,
+            queued: HashMap::new(),
+            present_waits: Vec::new(),
         })
     }
 
@@ -1626,6 +1694,7 @@ impl Renderer {
     /// and a timeout in ms (-1: none) for what has no fd.
     pub fn waits(&self) -> (Vec<RawFd>, i32) {
         let mut fds: Vec<RawFd> = self.sf_fences.iter().map(|(f, _)| f.as_raw_fd()).collect();
+        fds.extend(self.present_waits.iter().map(|p| p.fence.as_raw_fd()));
         fds.extend(self.acquire_waits.values().map(|f| f.as_raw_fd()));
         fds.extend(self.implicit_waits.iter().map(|d| d.poll_fd.as_raw_fd()));
         let mut timeout = self.retry.unwrap_or(-1);
@@ -1657,11 +1726,32 @@ impl Renderer {
         }
     }
 
-    /// SurfaceFlinger completed a direct-mode transaction (`Cmd::DirectDone`).
-    pub fn direct_done(&mut self, win: u32, token: u64, fence: Option<OwnedFd>) {
+    /// SurfaceFlinger completed a direct-mode transaction (`Cmd::DirectDone`):
+    /// `fence` releases the buffer it replaced; `latch` and `present` time
+    /// its feedback.
+    pub fn direct_done(
+        &mut self,
+        st: &State,
+        win: u32,
+        token: u64,
+        fence: Option<OwnedFd>,
+        latch: Option<u64>,
+        present: Option<OwnedFd>,
+    ) {
         let Some(state) = self.direct.get_mut(&win) else { return };
         if state.in_flight == Some(token) {
             state.in_flight = None;
+        }
+        if let Some(feedback) = state.feedback.remove(&token).filter(|f| !f.is_empty()) {
+            match present {
+                Some(fence) => {
+                    let wait = PresentWait { win, fence, feedback, latch, at: Instant::now() };
+                    if let Some(wait) = direct_presented(st, wait) {
+                        self.present_waits.push(wait);
+                    }
+                }
+                None => direct_estimate(st, win, feedback, latch),
+            }
         }
         let Some(Some(replaced)) = state.replaced.remove(&token) else { return };
         match fence {
@@ -1791,6 +1881,8 @@ impl Renderer {
         self.gpu.collect();
         let done = self.gpu.completed();
         self.fences.retain(|(s, _)| *s > done);
+        let waits = std::mem::take(&mut self.present_waits);
+        self.present_waits = waits.into_iter().filter_map(|w| direct_presented(st, w)).collect();
         self.sf_fences.retain(|(fence, d)| {
             let mut p = libc::pollfd { fd: fence.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             let signalled = unsafe { libc::poll(&mut p, 1, 0) } == 1;
@@ -1845,14 +1937,9 @@ impl Renderer {
                 answer_sync(st, id, None, "timed out");
             }
             Some((false, false)) => {
-                let now = st.now_ms();
-                for (sid, _, _) in &list {
-                    if let Some(s) = st.surfaces.get_mut(sid) {
-                        for cb in s.frame_cbs.drain(..) {
-                            cb.done(now);
-                        }
-                    }
-                }
+                let mut owed = Owed::take(st, &list);
+                owed.done(st.now_ms());
+                discard(owed.feedback);
                 self.retry_in(5);
                 return;
             }
@@ -1998,7 +2085,6 @@ impl Renderer {
             state.replaced.insert(token, state.shown.take());
             log::info!("toplevel {id}: composited");
         }
-        let now = st.now_ms();
         for (sid, _, _) in list {
             if let Some(t) = self.shm.get_mut(sid) {
                 if t.dirty.take().is_some() {
@@ -2006,13 +2092,29 @@ impl Renderer {
                 }
                 t.last_use = serial;
             }
-            if let Some(s) = st.surfaces.get_mut(sid) {
-                if let Some((_, d)) = s.texture.as_ref().and_then(|t| t.dmabuf.as_ref()) {
-                    d.last_use.set(serial);
+            if let Some((_, d)) = st.surfaces.get(sid).and_then(|s| s.texture.as_ref()).and_then(|t| t.dmabuf.as_ref()) {
+                d.last_use.set(serial);
+            }
+        }
+        let mut owed = Owed::take(st, list);
+        match lock.target().as_ref().filter(|_| self.gpu.timing_fn.is_some()) {
+            Some(t) => {
+                // The client draws its next frame once this one is next to be
+                // latched, i.e. once the display has shown the one before
+                // (now, if it has). Its frame then makes the vsync after this
+                // one's, with no frame of its own waiting in the queue (`pace`).
+                if seen(t.presented.wrapping_sub(1), t.shown) {
+                    owed.done(st.now_ms());
                 }
-                for cb in s.frame_cbs.drain(..) {
-                    cb.done(now);
-                }
+                let q = Queued { generation: t.generation, id: t.presented, at: Instant::now(), owed };
+                self.queued.entry(id).or_default().push(q);
+                self.retry_in(t.retry_ms());
+            }
+            None => {
+                // Without timing, paced by the swapchain alone; the time is a
+                // guess (submitted, not shown).
+                owed.done(st.now_ms());
+                presented(st, id, owed.feedback, Shown { ns: now_ns(), refresh_ns: 0, flags: Kind::empty() });
             }
         }
         if let Some(w) = st.windows.get_mut(&id) {
@@ -2118,7 +2220,9 @@ impl Renderer {
         if let Some(state) = self.direct.get_mut(&id).filter(|s| s.in_flight.is_some()) {
             if state.in_flight_since.is_some_and(|t| t.elapsed() > DIRECT_WATCHDOG) {
                 log::warn!("toplevel {id}: direct transaction {:?} never completed", state.in_flight);
-                state.in_flight = None;
+                if let Some(token) = state.in_flight.take() {
+                    discard(state.feedback.remove(&token).unwrap_or_default());
+                }
             } else {
                 // `Cmd::DirectDone` wakes us; this only runs the watchdog.
                 self.retry_in(100);
@@ -2192,13 +2296,13 @@ impl Renderer {
                 st.host.present(id, Some((ahb, src, d.opaque)), dst, token);
             }
         }
-        let now = st.now_ms();
-        for (sid, _, _) in list {
-            if let Some(s) = st.surfaces.get_mut(sid) {
-                for cb in s.frame_cbs.drain(..) {
-                    cb.done(now);
-                }
-            }
+        // Callbacks go out as the transaction is applied: the next frame
+        // waits here for this one's completion, so a client renders while
+        // SurfaceFlinger latches.
+        let mut owed = Owed::take(st, list);
+        owed.done(st.now_ms());
+        if let Some(state) = self.direct.get_mut(&id) {
+            state.feedback.insert(token, owed.feedback);
         }
         if let Some(w) = st.windows.get_mut(&id) {
             w.dirty = false;
@@ -2293,6 +2397,131 @@ impl Renderer {
     }
 }
 
+impl Renderer {
+    /// Pays what composited frames owe once the display has shown them
+    /// (`VK_GOOGLE_display_timing`): a frame's callbacks when the frame
+    /// before it is shown, its feedback when it is, or `discarded` if a
+    /// later one was shown instead. Timings arrive a few ms after the
+    /// vsync, so the frame before is also taken as shown at its predicted
+    /// vsync (`PACE_MARGIN` after it). A window whose display shows nothing
+    /// (hidden) gets its callbacks after `PACE_FALLBACK`.
+    fn pace(&mut self, st: &mut State) {
+        let wins: Vec<u32> = self.queued.keys().copied().collect();
+        for win in wins {
+            let Some(mut queue) = self.queued.remove(&win) else { continue };
+            let slot = st.shared.slots.lock().ok().and_then(|s| s.get(&win).cloned());
+            let target = slot
+                .and_then(|s| {
+                    s.with_target(|_, t| {
+                        t.as_mut().map(|t| {
+                            t.poll_timing();
+                            Pacing {
+                                generation: t.generation,
+                                shown: t.shown,
+                                shown_ns: t.last_shown_ns,
+                                refresh_ns: t.refresh_ns,
+                                timings: std::mem::take(&mut t.timings),
+                                retry: t.retry_ms(),
+                            }
+                        })
+                    })
+                })
+                .flatten();
+            let (now, now_ns) = (st.now_ms(), now_ns());
+            let hw = Kind::Vsync | Kind::HwClock | Kind::HwCompletion;
+            let mut wake: Option<u64> = None;
+            queue.retain_mut(|q| {
+                let age = q.at.elapsed();
+                let Some(t) = target.as_ref().filter(|t| t.generation == q.generation) else {
+                    // The Target (and its swapchain) is gone.
+                    q.owed.done(now);
+                    discard(q.owed.feedback.drain(..));
+                    return false;
+                };
+                if let Some(&(_, ns)) = t.timings.iter().find(|(id, _)| *id == q.id) {
+                    q.owed.done(now);
+                    presented(st, win, std::mem::take(&mut q.owed.feedback), Shown { ns, refresh_ns: t.refresh_ns, flags: hw });
+                    return false;
+                }
+                if seen(q.id, t.shown) || age >= PACE_STALE {
+                    q.owed.done(now);
+                    discard(q.owed.feedback.drain(..));
+                    return false;
+                }
+                if !q.owed.callbacks.is_empty() {
+                    let before = q.id.wrapping_sub(1);
+                    let due = t.predict(before, now_ns).map(|ns| ns + PACE_MARGIN);
+                    if seen(before, t.shown) || due.is_some_and(|d| now_ns >= d) || age >= PACE_FALLBACK {
+                        q.owed.done(now);
+                    } else if let Some(d) = due {
+                        wake = Some(wake.map_or(d, |w| w.min(d)));
+                    }
+                }
+                true
+            });
+            if !queue.is_empty() {
+                // Look again at the predicted vsync, else just after the
+                // display's next one.
+                let retry = target.map_or(2, |t| t.retry);
+                let due = wake.map(|d| (d.saturating_sub(now_ns)).div_ceil(1_000_000).max(1) as i32);
+                self.retry_in(due.map_or(retry, |d| d.min(retry)));
+                self.queued.insert(win, queue);
+            }
+        }
+    }
+}
+
+/// How late after its predicted vsync a frame is taken as shown without
+/// its timing: present fences signal around the vsync, give or take.
+const PACE_MARGIN: u64 = 2_000_000;
+
+/// A Target's display timing, as `pace` reads it.
+struct Pacing {
+    generation: u64,
+    /// The last present id shown, when, and the refresh period (ns).
+    shown: u32,
+    shown_ns: u64,
+    refresh_ns: u64,
+    /// Newly shown frames: present id and time (ns).
+    timings: Vec<(u32, u64)>,
+    retry: i32,
+}
+
+impl Pacing {
+    /// When the display should show present id `id` (ns): one refresh after
+    /// the last frame it showed, if `id` comes right after it and that was
+    /// recent. Anything further is a guess a stalled display would make
+    /// wrong for good.
+    fn predict(&self, id: u32, now_ns: u64) -> Option<u64> {
+        let (last, refresh) = (self.shown_ns, self.refresh_ns);
+        let next = id.wrapping_sub(self.shown) == 1 && refresh > 0 && last > 0 && now_ns < last + 3 * refresh;
+        next.then_some(last + refresh)
+    }
+}
+
+/// Sends a direct frame's feedback once its present fence has signalled
+/// (or failed); else gives the wait back.
+fn direct_presented(st: &State, w: PresentWait) -> Option<PresentWait> {
+    match fence_time(w.fence.as_fd()) {
+        Fence::Signalled(ns) => {
+            let flags = Kind::Vsync | Kind::HwClock | Kind::HwCompletion | Kind::ZeroCopy;
+            presented(st, w.win, w.feedback, Shown { ns, refresh_ns: 0, flags });
+        }
+        Fence::Failed => direct_estimate(st, w.win, w.feedback, w.latch),
+        Fence::Pending if w.at.elapsed() >= PACE_STALE => discard(w.feedback),
+        Fence::Pending => return Some(w),
+    }
+    None
+}
+
+/// Feedback for a direct frame without a present time: a refresh after
+/// SurfaceFlinger latched it, or now (a window process that set the buffer
+/// itself reports it once its present fence signalled).
+fn direct_estimate(st: &State, win: u32, feedback: Vec<WpPresentationFeedback>, latch: Option<u64>) {
+    let ns = latch.map_or_else(now_ns, |l| l + crate::presentation::refresh_ns(st, win));
+    presented(st, win, feedback, Shown { ns, refresh_ns: 0, flags: Kind::Vsync | Kind::ZeroCopy });
+}
+
 /// How long a direct transaction may stay incomplete before the window draws
 /// again anyway (a window process may never apply one it was handed).
 const DIRECT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(1);
@@ -2310,6 +2539,7 @@ pub fn render_dirty(st: &mut State) {
     r.collect(st);
     r.retry = None;
     r.implicit_waits.clear();
+    r.pace(st);
     let dirty: Vec<u32> = st.windows.values().filter(|w| w.dirty && w.mapped && w.px.0 > 0).map(|w| w.id).collect();
     // Every window is recorded first, then all go out in one submit. Each
     // recorded window's slot stays locked until then (see `Recorded`).
