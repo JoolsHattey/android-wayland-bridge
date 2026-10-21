@@ -4,7 +4,8 @@
 # URL schemes (the desktop file's x-scheme-handler types) open in it:
 #   scripts/install-stub.sh org.gnome.Adwaita1.Demo
 # Name and icon come from the chroot's desktop file. SVG icons are rendered
-# with a headless Chrome or Edge. ADB_SERIAL selects the device.
+# with rsvg-convert or cairosvg, else a headless Chrome or Edge. ADB_SERIAL
+# selects the device.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
@@ -40,18 +41,25 @@ case "$SRC" in
     *.png) "${A[@]}" pull "$SRC" "$PNG" >/dev/null ;;
     *.svg)
         "${A[@]}" pull "$SRC" "$OUT/$ID.svg" >/dev/null
-        printf '<html><body style="margin:0"><img src="%s.svg" style="width:256px;height:256px;display:block"></body></html>' \
-            "$ID" > "$OUT/$ID.html"
-        BROWSER=
-        for b in "/c/Program Files/Google/Chrome/Application/chrome.exe" \
-                 "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" \
-                 "$(command -v chromium || true)" "$(command -v google-chrome || true)"; do
-            [ -n "$b" ] && [ -x "$b" ] && { BROWSER=$b; break; }
-        done
-        [ -n "$BROWSER" ] || { echo "no Chrome/Edge to render $SRC" >&2; exit 1; }
-        "$BROWSER" --headless --disable-gpu --hide-scrollbars --window-size=256,256 \
-            --default-background-color=00000000 --screenshot="$(path "$PWD/$PNG")" \
-            "file:///$(path "$PWD/$OUT/$ID.html")" >/dev/null 2>&1
+        # A plain SVG renderer if there is one (Linux hosts), else a browser.
+        if command -v rsvg-convert >/dev/null; then
+            rsvg-convert -w 256 -h 256 -o "$PNG" "$OUT/$ID.svg"
+        elif command -v cairosvg >/dev/null; then
+            cairosvg -W 256 -H 256 -o "$PNG" "$OUT/$ID.svg"
+        else
+            printf '<html><body style="margin:0"><img src="%s.svg" style="width:256px;height:256px;display:block"></body></html>' \
+                "$ID" > "$OUT/$ID.html"
+            BROWSER=
+            for b in "/c/Program Files/Google/Chrome/Application/chrome.exe" \
+                     "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" \
+                     "$(command -v chromium || true)" "$(command -v google-chrome || true)"; do
+                [ -n "$b" ] && [ -x "$b" ] && { BROWSER=$b; break; }
+            done
+            [ -n "$BROWSER" ] || { echo "no rsvg-convert, cairosvg or Chrome/Edge to render $SRC" >&2; exit 1; }
+            "$BROWSER" --headless --disable-gpu --hide-scrollbars --window-size=256,256 \
+                --default-background-color=00000000 --screenshot="$(path "$PWD/$PNG")" \
+                "file:///$(path "$PWD/$OUT/$ID.html")" >/dev/null 2>&1
+        fi
         ;;
     *) echo "unsupported icon $SRC" >&2; exit 1 ;;
 esac
