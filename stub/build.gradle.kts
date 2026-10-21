@@ -10,17 +10,20 @@ plugins {
 //   gradlew :stub:assembleDebug -Pstub.appId=<desktop id> -Pstub.label=<name> -Pstub.icon=<png or svg> \
 //       -Pstub.schemes=<scheme,...> -Pstub.stamp=<stamp>
 // scripts/install-stub.sh fills these in from the chroot's desktop file.
+// The template build type (assembleTemplate, which dev.awb ships as an
+// asset) is the one stubs are made from on the device instead: see
+// dev.awb.StubMaker and src/template.
 //
 // It has no window code of its own: its activities are dev.awb's (:window),
 // loaded at run time from the installed dev.awb (StubComponentFactory), so
 // stubs follow dev.awb's updates. Only a change to what this manifest
 // declares needs new stubs: bump stubFormat (and Window.STUB_FORMAT), and
-// scripts/sync-stubs.sh (run by deploy.sh) rebuilds the installed ones.
+// the device remakes the installed ones (awb-stubs.sh sync).
 val stubFormat = 2
 val linuxAppId = providers.gradleProperty("stub.appId").getOrElse("org.gnome.Adwaita1.Demo")
 val label = providers.gradleProperty("stub.label").getOrElse(linuxAppId)
 val icon = providers.gradleProperty("stub.icon").orNull
-/** What the stub was built from (desktop file and icon): sync-stubs.sh rebuilds it when this changes. */
+/** What the stub was built from (desktop file and icon): the device remakes it when this changes. */
 val stamp = providers.gradleProperty("stub.stamp").getOrElse("")
 /** The app's x-scheme-handler types: links in these open in the Linux app. */
 val schemes = providers.gradleProperty("stub.schemes").getOrElse("")
@@ -56,6 +59,9 @@ android {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("debug")
         }
+        create("template") {
+            initWith(getByName("debug"))
+        }
     }
 
     // The schemes' intent filter, merged into the launcher activity.
@@ -63,9 +69,13 @@ android {
         sourceSets[type].manifest.srcFile(layout.buildDirectory.file("generated/stubManifest/AndroidManifest.xml").get().asFile)
     }
 
-    sourceSets["main"].res.directories.add(
-        if (icon != null) layout.buildDirectory.dir("generated/stubIcon").get().asFile.path else "src/default/res",
-    )
+    for (type in listOf("debug", "release")) {
+        sourceSets[type].res.directories.add(
+            if (icon != null) layout.buildDirectory.dir("generated/stubIcon").get().asFile.path else "src/default/res",
+        )
+    }
+    // The default icon, plus the PNG icon slot and the placeholder scheme.
+    sourceSets["template"].res.directories.add("src/default/res")
 }
 
 // The Linux app's icon, as the foreground of the adaptive icon: a PNG as is,

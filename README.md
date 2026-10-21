@@ -23,19 +23,21 @@ On the device, as root, run any Wayland app from the Debian chroot:
 adb shell /data/local/tmp/awb-run.sh adwaita-1-demo
 ```
 
-To give a Linux app its own launcher icon, build and install its stub app
-(name and icon come from the chroot's desktop file):
+Each Linux app gets its own launcher icon, a stub app that the device makes
+itself (name and icon from the chroot's desktop file): within seconds of
+the app first opening a window, or of its installation in the chroot.
+The root launcher (`awb-launcher.sh`) also remakes stubs when an app or
+dev.awb changes and removes them with their app. It signs them with the
+debug key, which `deploy.sh` puts in `/data/adb/awb` (root only). For SVG
+icons the chroot needs librsvg's renderer (`apt install librsvg2-bin`),
+else the stub gets a default icon. Stubs carry no window code: they run
+dev.awb's, so updating dev.awb updates every stub. To build one on the host
+instead (Gradle):
 
 ```bash
 ./scripts/install-stub.sh org.gnome.Adwaita1.Demo
 ```
 
-Or let `deploy.sh` do it: it runs `./scripts/sync-stubs.sh`, which builds
-stubs for the apps that opened windows without one (and have a desktop
-file), rebuilds stubs whose desktop file or icon changed, and removes those
-whose app is gone (the root launcher also removes these on its own within
-two minutes of an `apt remove`). Stubs carry no window code: they run
-dev.awb's, so updating dev.awb updates every stub, with nothing to rebuild.
 See [Stub apps](docs/DESIGN.md#stub-apps).
 
 The icon starts the app through `awb-launcher.sh` (the root side, started by
@@ -58,8 +60,8 @@ Games and 3D apps can lock the pointer (`zwp_pointer_constraints_v1`):
 the window then takes Android's pointer capture, which ends when it loses
 focus (Meta or Alt+Tab); a click back into the window locks it again.
 Stub apps built before stubs ran dev.awb's code (format 1) lack pointer
-lock, touchpad scrolling and full-rate motion until `sync-stubs.sh` (run by
-`deploy.sh`) replaces them.
+lock, touchpad scrolling and full-rate motion until the root launcher
+remakes them (`deploy.sh` has it sync at once).
 
 Electron apps lay their title bar out around Electron's own buttons, not
 Android's. For Claude Desktop, `./scripts/patch-claude-desktop.sh` patches
@@ -74,8 +76,9 @@ Claude Desktop updates.
 - `window/`: the window activity (insets, input, surface), shared by `app/`
   and the stubs; it talks to the compositor over binder.
 - `stub/`: the app of one Linux app (launcher icon, window tasks); its
-  activities' code is loaded from dev.awb at run time.
-- `scripts/`: deploy loop, chroot and app launchers, stub installer and
-  sync (`awb-stubs.sh` is their device side).
+  activities' code is loaded from dev.awb at run time. Its template build,
+  shipped in dev.awb, is what the device makes stubs from.
+- `scripts/`: deploy loop, chroot and app launchers, stub making and sync
+  (`awb-stubs.sh`, on the device) and the host stub build.
 - `tools/torture/`: a misbehaving client for robustness tests. Build it with
   `cargo build --release --target x86_64-unknown-linux-musl`.

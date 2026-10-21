@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The launcher icon of generated stubs with an icon: linux_icon_png,
+     replaced by the Linux app's icon (dev.awb.StubMaker). -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/icon_background" />
+    <foreground>
+        <inset android:drawable="@drawable/linux_icon_png" android:inset="25%" />
+    </foreground>
+</adaptive-icon>

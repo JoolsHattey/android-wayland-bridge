@@ -6,10 +6,12 @@
 # Name and icon come from the chroot's desktop file (SVG icons become vector
 # drawables in the build). ADB_SERIAL selects the device.
 #
-# Stubs run dev.awb's window code (see stub/build.gradle.kts), so there is
-# no need to rerun this after changing dev.awb: scripts/sync-stubs.sh (run
-# by deploy.sh) rebuilds a stub only when its desktop file or icon changed or
-# its manifest format is outdated, and adds stubs for the apps used.
+# The device makes stubs itself (awb-stubs.sh, dev.awb.StubMaker), for the
+# apps used or installed, and remakes them when needed; this is the host
+# build of one, from stub/ with Gradle. Both sign with the debug key, so
+# either kind replaces the other. Stubs run dev.awb's window code (see
+# stub/build.gradle.kts), so there is no need to rerun this after changing
+# dev.awb.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."

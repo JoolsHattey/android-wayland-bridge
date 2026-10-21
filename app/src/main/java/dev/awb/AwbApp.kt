@@ -193,8 +193,8 @@ class AwbApp : Application(), NativeCallbacks {
 
     /**
      * Notes a Linux app whose window opened without a stub app, in
-     * files/stub-requests: scripts/sync-stubs.sh (run by deploy.sh) builds
-     * stubs for the ones with a desktop file.
+     * files/stub-requests: the root launcher (awb-stubs.sh sync) makes
+     * stubs for the ones with a desktop file within seconds.
      */
     private fun requestStub(appId: String) {
         if (appId.isEmpty() || !appId.matches(Regex("[A-Za-z0-9._-]+"))) return
