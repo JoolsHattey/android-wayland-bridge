@@ -82,3 +82,7 @@ Claude Desktop updates.
   (`awb-stubs.sh`, on the device) and the host stub build.
 - `tools/torture/`: a misbehaving client for robustness tests. Build it with
   `cargo build --release --target x86_64-unknown-linux-musl`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

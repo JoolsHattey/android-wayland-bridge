@@ -8,7 +8,7 @@
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
-A=(adb -s "${ADB_SERIAL:-192.168.0.40:5555}")
+A=(adb ${ADB_SERIAL:+-s "$ADB_SERIAL"})
 RES=/data/debian/usr/lib/claude-desktop/resources
 W=build/claude-asar
 ASAR=(npx --yes @electron/asar@3.2.17)

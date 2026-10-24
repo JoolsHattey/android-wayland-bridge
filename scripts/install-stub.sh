@@ -16,7 +16,7 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 ID=${1:?usage: install-stub.sh <desktop file id>}
-A=(adb -s "${ADB_SERIAL:-192.168.0.40:5555}")
+A=(adb ${ADB_SERIAL:+-s "$ADB_SERIAL"})
 OUT=build/stub-icons
 mkdir -p "$OUT"
 # Native paths for Windows tools (Gradle) under Git Bash.

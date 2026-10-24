@@ -4,12 +4,12 @@
 # the stub apps in line (sync-stubs.sh; AWB_SYNC_STUBS=0 skips it). Stubs run
 # the window code installed here, so they need no rebuild for it. Also puts
 # the signing key in /data/adb/awb (root only), with which the device makes
-# stubs itself (dev.awb.StubMaker). ADB_SERIAL
-# selects the device (default 192.168.0.40:5555).
+# stubs itself (dev.awb.StubMaker). ADB_SERIAL selects the device (else
+# adb's default).
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
-A=(adb -s "${ADB_SERIAL:-192.168.0.40:5555}")
+A=(adb ${ADB_SERIAL:+-s "$ADB_SERIAL"})
 ./gradlew :app:assembleDebug :app:stubKey --console=plain -q
 "${A[@]}" install -r app/build/outputs/apk/debug/app-debug.apk
 "${A[@]}" shell 'mkdir -p /data/adb/awb && chmod 700 /data/adb/awb'

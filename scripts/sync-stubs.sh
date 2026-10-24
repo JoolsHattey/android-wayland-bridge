@@ -8,6 +8,6 @@
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
-A=(adb -s "${ADB_SERIAL:-192.168.0.40:5555}")
+A=(adb ${ADB_SERIAL:+-s "$ADB_SERIAL"})
 "${A[@]}" push scripts/awb-stubs.sh /data/local/tmp/awb-stubs.sh >/dev/null
 "${A[@]}" shell 'chmod 755 /data/local/tmp/awb-stubs.sh && /data/local/tmp/awb-stubs.sh sync' | tr -d '\r'

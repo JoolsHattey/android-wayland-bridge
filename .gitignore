@@ -1,7 +1,12 @@
-.gradle/
+# Build output
 build/
-local.properties
+.gradle/
+.kotlin/
 native/target/
-*.apk
-.idea/
 tools/torture/target/
+*.apk
+
+# Local machine settings
+local.properties
+.idea/
+.claude/
