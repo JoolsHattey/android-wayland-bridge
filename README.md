@@ -4,6 +4,12 @@ A Wayland compositor as an Android app. Each Linux toplevel opens as its own
 Android desktop window, and apps draw their header bar into Android's
 transparent caption. See [docs/DESIGN.md](docs/DESIGN.md).
 
+![Adwaita Demo, GNOME Console and GTK Demo from a Debian chroot, each in its own window on a Googlebook's Android desktop](docs/desktop.png)
+
+Popovers and menus open from the header bar like on any Linux desktop:
+
+![The Adwaita Demo's main menu open from its header bar](docs/header-popover.png)
+
 ## Build and run
 
 Requirements: Android SDK (platform 37), NDK r30, Rust with
