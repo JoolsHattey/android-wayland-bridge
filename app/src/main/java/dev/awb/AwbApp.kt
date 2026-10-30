@@ -259,13 +259,17 @@ class AwbApp : Application(), NativeCallbacks {
      * they sit under Android's controls and size libadwaita's edge padding.
      * Maximised windows (`window.maximized`) get their own rules, so each
      * window matches its caption. GTK reads the file at start-up.
+     * The controls' width leaves out the header bar's edge padding and the
+     * spacing to the next widget ([HEADER_GAPS]), so the header's own content
+     * starts right where Android's caption rect ends.
      */
     private fun writeGtkCss() {
         val rules = { selector: String, c: CaptionCss ->
             val px = { v: Float -> v.roundToInt() }
+            val controls = { v: Float -> px((v - HEADER_GAPS).coerceAtLeast(0f)) }
             """
-            ${selector}windowcontrols.start { min-width: ${px(c.start)}px; }
-            ${selector}windowcontrols.end { min-width: ${px(c.end)}px; }
+            ${selector}windowcontrols.start { min-width: ${controls(c.start)}px; }
+            ${selector}windowcontrols.end { min-width: ${controls(c.end)}px; }
             ${selector}headerbar { min-height: ${px(c.height)}px; }
             """.trimIndent()
         }
@@ -548,6 +552,10 @@ class AwbApp : Application(), NativeCallbacks {
 
     companion object {
         const val TAG = "awb"
+
+        /** Logical px GTK adds beside its window controls: header bar padding plus box spacing (6 + 6). */
+        private const val HEADER_GAPS = 12f
+
         lateinit var instance: AwbApp
             private set
     }
