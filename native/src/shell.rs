@@ -437,8 +437,11 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ObjectId> for State {
                     }
                 }
                 xdg_toplevel::Request::SetAppId { app_id } => {
+                    // The VM's apps have their own stubs (dev.awb.vm.*, app
+                    // id vm:<desktop id>), apart from the chroot's same apps.
+                    let vm = client.get_data::<crate::server::ClientState>().is_some_and(|c| c.vm);
                     if let Some(w) = st.windows.get_mut(&win) {
-                        w.app_id = app_id;
+                        w.app_id = if vm && !app_id.is_empty() { format!("vm:{app_id}") } else { app_id };
                     }
                 }
                 xdg_toplevel::Request::Move { .. } => {

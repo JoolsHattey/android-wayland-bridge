@@ -30,11 +30,26 @@ pub struct Config {
     pub socket_path: String,
 }
 
-struct ClientState;
+pub struct ClientState {
+    /// A client of the VM: its connection comes from our own uid (the
+    /// waypipe client we run, or crosvm), the chroot's from root's.
+    pub vm: bool,
+}
+
+impl ClientState {
+    fn new(stream: &std::os::unix::net::UnixStream) -> Self {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ok = unsafe {
+            libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &mut len)
+        } == 0;
+        ClientState { vm: ok && cred.uid == unsafe { libc::getuid() } }
+    }
+}
 
 impl ClientData for ClientState {
     fn initialized(&self, id: ClientId) {
-        log::info!("client connected: {id:?}");
+        log::info!("client connected: {id:?}{}", if self.vm { " (VM)" } else { "" });
     }
 
     fn disconnected(&self, id: ClientId, reason: DisconnectReason) {
@@ -137,7 +152,8 @@ pub fn run(cfg: Config, shared: Arc<Shared>, host: Host) {
         }
         if fds[0].revents & libc::POLLIN != 0 {
             while let Ok(Some(stream)) = listener.accept() {
-                if let Err(e) = display.handle().insert_client(stream, Arc::new(ClientState)) {
+                let data = Arc::new(ClientState::new(&stream));
+                if let Err(e) = display.handle().insert_client(stream, data) {
                     log::warn!("cannot add client: {e}");
                 }
             }
