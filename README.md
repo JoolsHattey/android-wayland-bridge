@@ -16,19 +16,25 @@ Android's own Linux Terminal now has an experimental setting, "Wayland GUI
 apps in multi-window", that also opens each Linux window as an Android
 window. It needs no root and ships with the OS, so try it first. Tested on
 a Googlebook 14 (Terminal build CL3B.260622.276, October 2026), it differs
-from this bridge in these ways:
+from this bridge, which runs Linux either in a chroot (root) or in its own
+VM (no root, see [Linux in a VM](#linux-in-a-vm-no-root)), in these ways:
 
-| | Linux Terminal | This bridge |
-|---|---|---|
-| Linux runs in | A VM (crosvm, Debian) | A chroot on the device (needs root) |
-| Buffers | Shared memory only | Shared memory and dmabuf, with explicit sync (`linux-dmabuf`, `linux-drm-syncobj`) |
-| App rendering | Software (llvmpipe) | GPU (Mesa's Vulkan and GL drivers) |
-| Scaling | Integer only, so GTK3 draws at 1x | Fractional (`wp_fractional_scale_v1`), pixel-exact |
-| Decorations | A second title bar under Android's | Header bars drawn into Android's caption (`xdg-decoration`) |
-| On-screen keyboard and IME | No `text-input` | `text-input-v3` |
-| Pointer lock for games | No | `pointer-constraints`, `relative-pointer` |
-| Launcher icons | One Terminal icon for every window | One icon per Linux app (stub apps) |
-| Escape key | Acts as Back and closes the window | Sent to the app |
+| | Linux Terminal | This bridge: chroot | This bridge: VM |
+|---|---|---|---|
+| Needs root | No | Yes | No (three adb commands) |
+| Buffers | Shared memory only | Shared memory and dmabuf, with explicit sync (`linux-dmabuf`, `linux-drm-syncobj`) | Shared memory, through waypipe over vsock |
+| App rendering | Software (llvmpipe) | GPU (Mesa's Vulkan and GL drivers) | Software (llvmpipe) |
+| Scaling | Integer only, so GTK3 draws at 1x | Fractional (`wp_fractional_scale_v1`), pixel-exact | Fractional |
+| Decorations | A second title bar under Android's | Header bars drawn into Android's caption (`xdg-decoration`) | Header bars in Android's caption |
+| On-screen keyboard and IME | No `text-input` | `text-input-v3` | `text-input-v3` |
+| Pointer lock for games | No | `pointer-constraints`, `relative-pointer` | Yes |
+| Launcher icons | One Terminal icon for every window | One icon per Linux app (stub apps) | One icon per app (installing them needs root) |
+| Escape key | Acts as Back and closes the window | Sent to the app | Sent to the app |
+
+Both modes reach the display's 90 fps with `weston-simple-egl` on that
+device, as the Terminal does. The VM mode cannot use the Terminal's faster
+path into crosvm (its Wayland socket): SELinux lets crosvm connect only to
+the Terminal's own socket.
 
 The Terminal's bridge also leaks one file descriptor per frame and crashes
 after about six minutes of animation (with the VM), and every window opens
@@ -40,7 +46,9 @@ in software.
 ## Build and run
 
 Requirements: Android SDK (platform 37), NDK r30, Rust with
-`x86_64-linux-android`, and `cargo-ndk`.
+`x86_64-linux-android` and `x86_64-unknown-linux-gnu` (the VM's guest
+agent), `cargo-ndk`, and Python 3 and curl (the build fetches and builds
+waypipe).
 
 ```bash
 ./scripts/deploy.sh
@@ -101,6 +109,41 @@ Android's. For Claude Desktop, `./scripts/patch-claude-desktop.sh` patches
 its `app.asar` to keep clear of Android's caption controls; rerun it after
 Claude Desktop updates.
 
+## Linux in a VM (no root)
+
+Without root, dev.awb runs Linux in its own VM through Android's
+Virtualization Framework, the same Debian image as the Linux Terminal's.
+Grant it the VM permissions (development permissions, so adb can, without
+root) and let it call the framework's system APIs:
+
+```bash
+adb shell pm grant --user 10 dev.awb android.permission.MANAGE_VIRTUAL_MACHINE
+adb shell pm grant --user 10 dev.awb android.permission.USE_CUSTOM_VIRTUAL_MACHINE
+adb shell settings put global hidden_api_policy 1
+```
+
+(`--user 10` is the desktop user on a Googlebook; use your own.) Then
+open Wayland Bridge: it downloads the image (about 620 MB, from
+`dl.google.com`), and starts and stops the VM; the page lists any of the
+steps above that are missing. On first boot the guest installs
+`awb-display`, dev.awb's guest agent, and waypipe.
+
+Run apps in the VM with `awb-run`:
+
+```bash
+awb-run gnome-text-editor
+```
+
+Their windows come over vsock through waypipe (Android drops connections
+from the VM to apps, so the app connects in, and the guest agent pairs each
+app with a waiting connection). The guest agent also gives them Android's
+dark mode and accent colour (a settings portal), the caption's header bar
+spacing, and Android's browser for web links. With root, each VM app also
+gets its own launcher icon (`dev.awb.vm.*` stubs, apart from the chroot's),
+which starts the VM if needed. To log in over SSH, put a public key line in
+`files/awb.properties` as `vm_ssh_key=` before the first boot. See
+[VM guest agent](docs/DESIGN.md#vm-guest-agent).
+
 ## Layout
 
 - `native/`: the compositor (Rust, `wayland-server`), built as `libawb.so`.
@@ -112,7 +155,10 @@ Claude Desktop updates.
   activities' code is loaded from dev.awb at run time. Its template build,
   shipped in dev.awb, is what the device makes stubs from.
 - `scripts/`: deploy loop, chroot and app launchers, stub making and sync
-  (`awb-stubs.sh`, on the device) and the host stub build.
+  (`awb-stubs.sh`, on the device), the host stub build and the waypipe
+  build.
+- `vm/`: the VM guest's side: `awb-display`, the guest agent (Rust), and
+  `awb-run`.
 - `tools/torture/`: a misbehaving client for robustness tests. Build it with
   `cargo build --release --target x86_64-unknown-linux-musl`.
 
