@@ -10,6 +10,33 @@ Popovers and menus open from the header bar like on any Linux desktop:
 
 ![The Adwaita Demo's main menu open from its header bar](docs/header-popover.png)
 
+## Compared with Android's Linux Terminal
+
+Android's own Linux Terminal now has an experimental setting, "Wayland GUI
+apps in multi-window", that also opens each Linux window as an Android
+window. It needs no root and ships with the OS, so try it first. Tested on
+a Googlebook 14 (Terminal build CL3B.260622.276, October 2026), it differs
+from this bridge in these ways:
+
+| | Linux Terminal | This bridge |
+|---|---|---|
+| Linux runs in | A VM (crosvm, Debian) | A chroot on the device (needs root) |
+| Buffers | Shared memory only | Shared memory and dmabuf, with explicit sync (`linux-dmabuf`, `linux-drm-syncobj`) |
+| App rendering | Software (llvmpipe) | GPU (Mesa's Vulkan and GL drivers) |
+| Scaling | Integer only, so GTK3 draws at 1x | Fractional (`wp_fractional_scale_v1`), pixel-exact |
+| Decorations | A second title bar under Android's | Header bars drawn into Android's caption (`xdg-decoration`) |
+| On-screen keyboard and IME | No `text-input` | `text-input-v3` |
+| Pointer lock for games | No | `pointer-constraints`, `relative-pointer` |
+| Launcher icons | One Terminal icon for every window | One icon per Linux app (stub apps) |
+| Escape key | Acts as Back and closes the window | Sent to the app |
+
+The Terminal's bridge also leaks one file descriptor per frame and crashes
+after about six minutes of animation (with the VM), and every window opens
+at the same spot. The Terminal does have a hidden gfxstream mode
+(`acceleration_type`) that gives the VM the host GPU through Vulkan, but
+only for off-screen work: with no dmabuf in the bridge, windows still draw
+in software.
+
 ## Build and run
 
 Requirements: Android SDK (platform 37), NDK r30, Rust with
