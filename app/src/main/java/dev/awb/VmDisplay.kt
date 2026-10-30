@@ -4,12 +4,15 @@ import android.content.Context
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Carries the VM's Wayland apps to the compositor over vsock, for devices
@@ -29,10 +32,16 @@ object VmDisplay {
 
     private var waypipe: Process? = null
     @Volatile private var running = false
+    /** Bumped on each start, so spares of an earlier VM give up. */
+    @Volatile private var generation = 0
+    private var onConnected: () -> Unit = {}
 
-    fun start(context: Context, connect: (Int) -> ParcelFileDescriptor) {
+    /** [onConnected] runs whenever a spare connects: the guest's awb-display is up. */
+    fun start(context: Context, onConnected: () -> Unit, connect: (Int) -> ParcelFileDescriptor) {
         if (running) return
         running = true
+        this.onConnected = onConnected
+        generation++
         val sock = File(context.filesDir, "waypipe.sock")
         sock.delete()
         waypipe = ProcessBuilder(
@@ -43,13 +52,28 @@ object VmDisplay {
             redirectErrorStream(true)
             redirectOutput(File(context.filesDir, "vm/waypipe.log"))
         }.start()
-        spare(sock, connect)
+        spare(sock, connect, generation)
     }
 
+    /**
+     * Closes every relay too: when the VM dies its vsock connections may not
+     * see EOF, and each waypipe client child (orphaned by [Process.destroy])
+     * would keep its app's windows open.
+     */
     fun stop() {
         running = false
         waypipe?.destroy()
         waypipe = null
+        open.forEach { it() }
+    }
+
+    /** Closers of the open spares and relays. */
+    private val open = ConcurrentHashMap.newKeySet<() -> Unit>()
+
+    /** Shuts a socket down (waking threads blocked reading it), then closes it. */
+    private fun shut(fd: ParcelFileDescriptor) {
+        runCatching { Os.shutdown(fd.fileDescriptor, OsConstants.SHUT_RDWR) }
+        runCatching { fd.close() }
     }
 
     /**
@@ -57,17 +81,23 @@ object VmDisplay {
      * up) and waits on it; when a Linux app starts, its first bytes arrive,
      * and the spare becomes that app's connection while a new spare opens.
      */
-    private fun spare(sock: File, connect: (Int) -> ParcelFileDescriptor): Unit = Thread({
+    private fun spare(sock: File, connect: (Int) -> ParcelFileDescriptor, gen: Int): Unit = Thread({
         var vm: ParcelFileDescriptor? = null
-        while (running && vm == null) {
+        while (running && gen == generation && vm == null) {
             vm = runCatching { connect(PORT) }.getOrNull() ?: run { Thread.sleep(1000); null }
         }
         vm ?: return@Thread
+        val closeSpare = { shut(vm) }
+        open += closeSpare
+        if (!running || gen != generation) return@Thread closeSpare()
+        onConnected()
         val input = FileInputStream(vm.fileDescriptor)
         val output = FileOutputStream(vm.fileDescriptor)
         val buffer = ByteArray(1 shl 16)
         val n = runCatching { input.read(buffer) }.getOrDefault(-1)
-        spare(sock, connect)
+        open -= closeSpare
+        if (!running || gen != generation) return@Thread closeSpare()
+        spare(sock, connect, gen)
         if (n <= 0) {
             vm.close()
             return@Thread
@@ -82,11 +112,15 @@ object VmDisplay {
             local.close()
             return@Thread
         }
-        val close = {
-            runCatching { vm.close() }
+        lateinit var close: () -> Unit
+        close = {
+            open -= close
+            shut(vm)
+            runCatching { local.shutdownInput() }
+            runCatching { local.shutdownOutput() }
             runCatching { local.close() }
-            Unit
         }
+        open += close
         pump(input, local.outputStream, close)
         pump(local.inputStream, output, close)
     }, "awb-vm-spare").apply { isDaemon = true }.start()

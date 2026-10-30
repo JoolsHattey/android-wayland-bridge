@@ -1,6 +1,7 @@
 package dev.awb
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.os.ParcelFileDescriptor
@@ -9,6 +10,7 @@ import android.system.OsConstants
 import android.util.Log
 import java.io.File
 import java.lang.reflect.Proxy
+import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
 
 /**
@@ -19,8 +21,9 @@ import java.util.concurrent.Executors
  * development permissions (`pm grant`), and the AVF classes are system
  * APIs, called by reflection (`settings put global hidden_api_policy 1`).
  *
- * The image (vmlinuz, initrd.img, root_part, cidata.iso) is the Terminal's
- * Debian image, in files/vm.
+ * The image (vmlinuz, initrd.img, root_part) is the Terminal's Debian image
+ * in files/vm ([VmImage]), with our own cidata disk ([VmCiData]), from which
+ * the guest sets itself up. [state] is for the UI and the notification.
  */
 object VmLauncher {
     private const val TAG = "awb-vm"
@@ -30,11 +33,71 @@ object VmLauncher {
     /** O_PATH: virtmgr opens the socket from the fd's /proc path. Not in OsConstants. */
     private const val O_PATH = 0x200000
 
+    enum class State { STOPPED, STARTING, RUNNING, READY }
+
+    @Volatile var state = State.STOPPED
+        private set
+    /** Why the last start failed or the VM last stopped, for the UI. */
+    @Volatile var lastExit: String? = null
+        private set
+    private val listeners = CopyOnWriteArraySet<() -> Unit>()
+
+    fun observe(listener: () -> Unit) = listeners.add(listener)
+    fun unobserve(listener: () -> Unit) = listeners.remove(listener)
+
+    private fun set(s: State, exit: String? = lastExit) {
+        state = s
+        lastExit = exit
+        listeners.forEach { it() }
+    }
+
     private var vm: Any? = null
 
-    fun start(context: Context) {
+    /**
+     * What stops us starting a VM here, as the adb commands that fix it:
+     * the permissions are development ones, and the AVF classes system APIs
+     * that apps may reach only with hidden API checks off. Empty when none.
+     */
+    fun problems(context: Context): List<String> {
+        val user = android.os.Process.myUid() / 100_000
+        val out = mutableListOf<String>()
+        if (!context.packageManager.hasSystemFeature("android.software.virtualization_framework")) {
+            return listOf("This device has no Android Virtualization Framework.")
+        }
+        for (p in listOf("MANAGE_VIRTUAL_MACHINE", "USE_CUSTOM_VIRTUAL_MACHINE")) {
+            if (context.checkSelfPermission("android.permission.$p") != PackageManager.PERMISSION_GRANTED) {
+                out += "adb shell pm grant --user $user ${context.packageName} android.permission.$p"
+            }
+        }
+        val reachable = runCatching {
+            cls("VirtualMachineCustomImageConfig\$Builder").methods.any { it.name == "setKernelPath" }
+        }.getOrDefault(false)
+        if (!reachable) out += "adb shell settings put global hidden_api_policy 1"
+        return out
+    }
+
+    /** Starts the VM on a thread of its own (it waits for the compositor). */
+    fun startAsync(context: Context) {
+        if (state != State.STOPPED) return
+        set(State.STARTING, null)
+        Thread({
+            runCatching { start(context) }.onFailure {
+                Log.e(TAG, "start failed", it)
+                vm = null
+                VmDisplay.stop()
+                VmAgent.stop()
+                set(State.STOPPED, "Start failed: ${(it.cause ?: it).message ?: it}")
+            }
+        }, "awb-vm-start").start()
+    }
+
+    @Synchronized private fun start(context: Context) {
         if (vm != null) return
-        val dir = File(context.filesDir, "vm")
+        problems(context).takeIf { it.isNotEmpty() }?.let { error("needs ${it.joinToString("; ")}") }
+        if (!VmImage.installed(context)) error("no VM image installed")
+        val dir = VmImage.dir(context)
+        val cidataFile = File(dir, "awb-cidata.iso")
+        VmCiData.write(context, cidataFile)
         val crossDomain = AwbApp.instance.setting("vm_transport", "vsock") == "crossdomain"
         val root = cls("VirtualMachineCustomImageConfig\$Disk")
             .getDeclaredConstructor(Boolean::class.java, String::class.java, String::class.java)
@@ -47,7 +110,7 @@ object VmLauncher {
                     "ROOT", File(dir, "root_part").path, true, "FD202E72-0241-4C3B-953D-FFE506AE6CFC",
                 ),
             )
-        val cidata = static("VirtualMachineCustomImageConfig\$Disk", "RODisk", File(dir, "cidata.iso").path)
+        val cidata = static("VirtualMachineCustomImageConfig\$Disk", "RODisk", cidataFile.path)
         var image = new("VirtualMachineCustomImageConfig\$Builder")
             .call("setName", NAME)
             .call("setKernelPath", File(dir, "vmlinuz").path)
@@ -76,8 +139,9 @@ object VmLauncher {
         machine.call("setCallback", Executors.newSingleThreadExecutor(), callback())
         machine.call("run")
         vm = machine
+        set(State.RUNNING)
         val connect = { port: Int -> machine.call("connectVsock", port.toLong()) as ParcelFileDescriptor }
-        if (!crossDomain) VmDisplay.start(context, connect)
+        if (!crossDomain) VmDisplay.start(context, { if (vm === machine && state != State.READY) set(State.READY) }, connect)
         VmAgent.start(context, connect)
         Log.i(TAG, "started; status ${machine.call("getStatus")}")
         capture(machine.call("getConsoleOutput") as java.io.InputStream, File(dir, "console.log"))
@@ -131,24 +195,37 @@ object VmLauncher {
     }
 
     fun stop() {
-        vm?.let { runCatching { it.call("stop") } }
+        val machine = vm ?: return
         vm = null
+        runCatching { machine.call("stop") }
         VmDisplay.stop()
         VmAgent.stop()
+        set(State.STOPPED, null)
     }
 
+    /** Also hears the VM stop on its own (guest poweroff, crash, killed crosvm). */
     private fun callback(): Any {
         val iface = cls("VirtualMachineCallback")
-        return Proxy.newProxyInstance(iface.classLoader, arrayOf(iface)) { _, method, args ->
+        lateinit var proxy: Any
+        proxy = Proxy.newProxyInstance(iface.classLoader, arrayOf(iface)) { _, method, args ->
+            when (method.name) {
+                "equals" -> return@newProxyInstance args?.get(0) === proxy
+                "hashCode" -> return@newProxyInstance System.identityHashCode(proxy)
+                "toString" -> return@newProxyInstance "awb-vm-callback"
+            }
             Log.i(TAG, "${method.name}(${args?.drop(1)?.joinToString()})")
-            if (method.name == "onStopped" || method.name == "onDied") {
+            val machine = args?.getOrNull(0)
+            if ((method.name == "onStopped" || method.name == "onDied") && machine != null && machine === vm) {
                 vm = null
                 // Their connections are to this machine; the next start brings new ones.
                 VmDisplay.stop()
                 VmAgent.stop()
+                set(State.STOPPED, "VM stopped (reason ${args.getOrNull(1)})")
             }
+            if (method.name == "onError") lastExit = "VM error ${args?.drop(1)?.joinToString()}"
             null
         }
+        return proxy
     }
 
     private fun capture(input: java.io.InputStream, file: File) = Thread {
