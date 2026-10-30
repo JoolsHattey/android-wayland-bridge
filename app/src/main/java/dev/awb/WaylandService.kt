@@ -30,8 +30,8 @@ class WaylandService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private companion object {
-        const val CHANNEL = "compositor"
+    companion object {
+        private const val CHANNEL = "compositor"
         const val ACTION_START_VM = "dev.awb.action.START_VM"
         const val ACTION_STOP_VM = "dev.awb.action.STOP_VM"
     }

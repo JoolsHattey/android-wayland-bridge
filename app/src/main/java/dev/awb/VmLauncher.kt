@@ -76,9 +76,9 @@ object VmLauncher {
         machine.call("setCallback", Executors.newSingleThreadExecutor(), callback())
         machine.call("run")
         vm = machine
-        if (!crossDomain) {
-            VmDisplay.start(context) { port -> machine.call("connectVsock", port.toLong()) as ParcelFileDescriptor }
-        }
+        val connect = { port: Int -> machine.call("connectVsock", port.toLong()) as ParcelFileDescriptor }
+        if (!crossDomain) VmDisplay.start(context, connect)
+        VmAgent.start(context, connect)
         Log.i(TAG, "started; status ${machine.call("getStatus")}")
         capture(machine.call("getConsoleOutput") as java.io.InputStream, File(dir, "console.log"))
         capture(machine.call("getLogOutput") as java.io.InputStream, File(dir, "log.txt"))
@@ -134,13 +134,19 @@ object VmLauncher {
         vm?.let { runCatching { it.call("stop") } }
         vm = null
         VmDisplay.stop()
+        VmAgent.stop()
     }
 
     private fun callback(): Any {
         val iface = cls("VirtualMachineCallback")
         return Proxy.newProxyInstance(iface.classLoader, arrayOf(iface)) { _, method, args ->
             Log.i(TAG, "${method.name}(${args?.drop(1)?.joinToString()})")
-            if (method.name == "onStopped" || method.name == "onDied") vm = null
+            if (method.name == "onStopped" || method.name == "onDied") {
+                vm = null
+                // Their connections are to this machine; the next start brings new ones.
+                VmDisplay.stop()
+                VmAgent.stop()
+            }
             null
         }
     }

@@ -102,6 +102,7 @@ class AwbApp : Application(), NativeCallbacks {
         // Material You's accent; libadwaita derives its own shades from it.
         val accent = runCatching { getColor(android.R.color.system_accent1_500) }.getOrDefault(0)
         Native.appearance(dark, accent)
+        VmAgent.appearance(dark, accent)
     }
 
     /**
@@ -197,6 +198,8 @@ class AwbApp : Application(), NativeCallbacks {
      * stubs for the ones with a desktop file within seconds.
      */
     private fun requestStub(appId: String) {
+        // The VM's apps all have stubs made, from its agent's list (VmAgent).
+        if (appId.startsWith(VmAgent.PREFIX)) return
         if (appId.isEmpty() || !appId.matches(Regex("[A-Za-z0-9._-]+"))) return
         val file = File(filesDir, "stub-requests")
         val known = runCatching { file.readLines() }.getOrDefault(emptyList())
@@ -287,8 +290,12 @@ class AwbApp : Application(), NativeCallbacks {
         writeShared("caption.json", """{"normal":${json(normal)},"maximized":${json(captions[true] ?: normal)}}""" + "\n")
     }
 
-    /** Writes a file the chroot's apps read (as /run/awb/[name]), if it changed. */
+    /**
+     * Writes a file the chroot's apps read (as /run/awb/[name]), if it
+     * changed; the VM's get it in ~/.config/awb.
+     */
     private fun writeShared(name: String, text: String) {
+        VmAgent.file(name, text)
         val file = File(filesDir, name)
         if (runCatching { file.readText() }.getOrNull() != text) {
             file.writeText(text)
@@ -522,15 +529,22 @@ class AwbApp : Application(), NativeCallbacks {
 
     /**
      * Hands desktop file id [appId] to the root launcher, which runs it in the
-     * chroot, with [uri] as its argument if given (a link from a browser).
+     * chroot, with [uri] as its argument if given (a link from a browser);
+     * a VM app's id (`vm:<desktop id>`) goes to the VM's agent instead.
      */
     private fun launchApp(appId: String, uri: String?) {
-        if (!appId.matches(Regex("[A-Za-z0-9._-]+"))) return
+        val vm = appId.startsWith(VmAgent.PREFIX)
+        val id = appId.removePrefix(VmAgent.PREFIX)
+        if (!id.matches(Regex("[A-Za-z0-9._-]+"))) return
         // One request per line, the link as one word: no whitespace or
         // control characters (a well-formed URI has none).
         if (uri != null && !uri.matches(Regex("[A-Za-z][A-Za-z0-9+.-]*:[\\x21-\\x7e]*"))) {
             Log.w(TAG, "launch $appId: malformed link")
             return
+        }
+        if (vm) {
+            Log.i(TAG, "launch $appId in the VM${if (uri != null) " with a link" else ""}")
+            return VmAgent.launch(this, id, uri)
         }
         try {
             // Non-blocking: with no reader (launcher not running) this fails at once.
