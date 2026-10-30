@@ -4,6 +4,7 @@ build/
 .kotlin/
 native/target/
 tools/torture/target/
+vm/awb-display/target/
 *.apk
 
 # Local machine settings

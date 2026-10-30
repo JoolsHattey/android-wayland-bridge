@@ -26,6 +26,9 @@ android {
     }
 
     sourceSets["main"].jniLibs.directories.add(layout.buildDirectory.dir("rustJniLibs").get().asFile.path)
+    sourceSets["main"].jniLibs.directories.add(layout.buildDirectory.dir("waypipe/jniLibs").get().asFile.path)
+    // Extracted to the native library directory, so libwaypipe.so can run.
+    packaging.jniLibs.useLegacyPackaging = true
     sourceSets["main"].assets.directories.add(layout.buildDirectory.dir("generated/stubTemplate").get().asFile.path)
 }
 
@@ -38,6 +41,19 @@ val cargoBuild by tasks.registering(Exec::class) {
     inputs.file(nativeDir.file("Cargo.toml"))
     outputs.dir(outDir)
     commandLine("cargo", "ndk", "-t", "x86_64", "--platform", "35", "-o", outDir.get().asFile.path, "build", "--release")
+}
+
+// waypipe for Android, which carries the VM's windows (scripts/build-waypipe.sh).
+val waypipeBuild by tasks.registering(Exec::class) {
+    val script = rootProject.layout.projectDirectory.file("scripts/build-waypipe.sh")
+    val outDir = layout.buildDirectory.dir("waypipe/jniLibs")
+    inputs.file(script)
+    outputs.dir(outDir)
+    val ndk = androidComponents.sdkComponents.ndkDirectory
+    executable("bash")
+    argumentProviders.add(CommandLineArgumentProvider {
+        listOf(script.asFile.path, ndk.get().asFile.path, outDir.get().asFile.path)
+    })
 }
 
 // The template that StubMaker makes stubs from on the device: the stub
@@ -76,4 +92,4 @@ dependencies {
     implementation("com.android.tools.build:apksig:9.3.2")
 }
 
-tasks.named("preBuild") { dependsOn(cargoBuild, stubTemplate) }
+tasks.named("preBuild") { dependsOn(cargoBuild, waypipeBuild, stubTemplate) }

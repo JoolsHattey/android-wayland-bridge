@@ -13,9 +13,9 @@ import java.util.concurrent.Executors
 
 /**
  * Runs a Debian VM through Android's Virtualization Framework, with its
- * Wayland apps on our compositor: crosvm's cross-domain context connects
- * the guest's sommelier to [AwbApp.socketPath], as the Linux Terminal does
- * with its own bridge. Needs no root, only adb: the VM permissions are
+ * Wayland apps on our compositor: over vsock and waypipe ([VmDisplay]), or
+ * with `vm_transport=crossdomain` in files/awb.properties, through crosvm's
+ * cross-domain channel ([crossDomain]). Needs no root, only adb: the VM permissions are
  * development permissions (`pm grant`), and the AVF classes are system
  * APIs, called by reflection (`settings put global hidden_api_policy 1`).
  *
@@ -35,24 +35,7 @@ object VmLauncher {
     fun start(context: Context) {
         if (vm != null) return
         val dir = File(context.filesDir, "vm")
-        awaitCompositor()
-        val socket = Os.open(AwbApp.instance.socketPath, O_PATH or OsConstants.O_CLOEXEC, 0)
-        val socketFd = ParcelFileDescriptor.dup(socket).also { Os.close(socket) }
-
-        val gpu = new("VirtualMachineCustomImageConfig\$GpuConfig\$Builder")
-            .call("setContextTypes", arrayOf("cross-domain"))
-            .call("setRendererUseEgl", true)
-            .call("setRendererUseGles", true)
-            .call("setRendererUseSurfaceless", true)
-            .call("setWaylandSocketFd", socketFd)
-            .call("build")
-        val display = new("VirtualMachineCustomImageConfig\$DisplayConfig\$Builder")
-            .call("setWidth", 1280)
-            .call("setHeight", 720)
-            .call("setHorizontalDpi", 160)
-            .call("setVerticalDpi", 160)
-            .call("setRefreshRate", 60)
-            .call("build")
+        val crossDomain = AwbApp.instance.setting("vm_transport", "vsock") == "crossdomain"
         val root = cls("VirtualMachineCustomImageConfig\$Disk")
             .getDeclaredConstructor(Boolean::class.java, String::class.java, String::class.java)
             .apply { isAccessible = true }
@@ -72,13 +55,10 @@ object VmLauncher {
             .call("addDisk", root)
             .call("addDisk", cidata)
             .call("useNetwork", true)
-            .call("setGpuConfig", gpu)
-            // Unused, but without a display crosvm takes our socket for its
-            // own display, fails, and the guest gets no cross-domain context.
-            .call("setDisplayConfig", display)
+        // Without a GPU, virtmgr runs crosvm_minimal, which has no network.
+        image = if (crossDomain) crossDomain(image) else image.call("setGpuConfig", gpu(null))
         for (p in listOf(
-            "root=/dev/vda1", "ds=nocloud", "8250.nr_uarts=4", "console=ttyS0",
-            "wayland_bridge=true", "hostname=awb-debian",
+            "root=/dev/vda1", "ds=nocloud", "8250.nr_uarts=4", "console=ttyS0", "hostname=awb-debian",
         )) image = image.call("addParam", p)
 
         val config = new("VirtualMachineConfig\$Builder", context)
@@ -96,9 +76,44 @@ object VmLauncher {
         machine.call("setCallback", Executors.newSingleThreadExecutor(), callback())
         machine.call("run")
         vm = machine
+        if (!crossDomain) {
+            VmDisplay.start(context) { port -> machine.call("connectVsock", port.toLong()) as ParcelFileDescriptor }
+        }
         Log.i(TAG, "started; status ${machine.call("getStatus")}")
         capture(machine.call("getConsoleOutput") as java.io.InputStream, File(dir, "console.log"))
         capture(machine.call("getLogOutput") as java.io.InputStream, File(dir, "log.txt"))
+    }
+
+    /**
+     * crosvm's cross-domain channel, as the Linux Terminal uses: the guest's
+     * sommelier (started by the `wayland_bridge=true` parameter) reaches our
+     * socket through the VM's virtio-gpu. Fastest, but SELinux lets crosvm
+     * connect only to the Terminal's socket, so only on permissive devices.
+     */
+    private fun crossDomain(image: Any): Any {
+        awaitCompositor()
+        val socket = Os.open(AwbApp.instance.socketPath, O_PATH or OsConstants.O_CLOEXEC, 0)
+        val socketFd = ParcelFileDescriptor.dup(socket).also { Os.close(socket) }
+        // Unused (crosvm also shows it as a window), but without a display
+        // the guest gets no cross-domain context.
+        val display = new("VirtualMachineCustomImageConfig\$DisplayConfig\$Builder")
+            .call("setWidth", 1280)
+            .call("setHeight", 720)
+            .call("setHorizontalDpi", 160)
+            .call("setVerticalDpi", 160)
+            .call("setRefreshRate", 60)
+            .call("build")
+        return image.call("setGpuConfig", gpu(socketFd)).call("setDisplayConfig", display).call("addParam", "wayland_bridge=true")
+    }
+
+    private fun gpu(waylandSocket: ParcelFileDescriptor?): Any {
+        var gpu = new("VirtualMachineCustomImageConfig\$GpuConfig\$Builder")
+            .call("setContextTypes", arrayOf("cross-domain"))
+            .call("setRendererUseEgl", true)
+            .call("setRendererUseGles", true)
+            .call("setRendererUseSurfaceless", true)
+        if (waylandSocket != null) gpu = gpu.call("setWaylandSocketFd", waylandSocket)
+        return gpu.call("build")
     }
 
     /**
@@ -118,6 +133,7 @@ object VmLauncher {
     fun stop() {
         vm?.let { runCatching { it.call("stop") } }
         vm = null
+        VmDisplay.stop()
     }
 
     private fun callback(): Any {

@@ -1,0 +1,11 @@
+[package]
+name = "awb-display"
+version = "0.1.0"
+edition = "2024"
+description = "Guest side of dev.awb's VM display: pairs waypipe servers with the app's vsock connections"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true

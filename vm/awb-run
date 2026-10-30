@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs a Linux app in the VM on dev.awb's compositor: awb-run <command...>
+# (through awb-display, see there).
+# GTK's window buttons, as scripts/awb-run.sh sets them in the chroot: one
+# on each side, so header bars leave room for Android's caption controls.
+command -v gsettings >/dev/null && gsettings set org.gnome.desktop.wm.preferences button-layout close:close 2>/dev/null
+exec waypipe --compress none --socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/awb-display.sock" server -- "$@"
