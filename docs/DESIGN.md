@@ -567,6 +567,57 @@ the Android side. It bind-mounts that directory into the chroot at
 `/run/awb`, then runs the command via `/data/debian/enter` with
 `WAYLAND_DISPLAY=/run/awb/wayland-0`. The Terminal app's socket is left alone.
 
+## The Debian VM: install and provisioning
+
+Without root, Linux apps come from a VM the app runs itself through AVF
+(`VmLauncher`), with its windows carried over vsock and waypipe
+(`VmDisplay`, guest broker `vm/awb-display`). Setting it up takes no shell in
+the guest:
+
+* **Image** (`VmImage`). The Linux Terminal's Debian image, from the URL the
+  Terminal itself uses: `ImageArchive.HOST_URL` in its APK is a constant,
+  `https://dl.google.com/android/ferrochrome/5100000`, to which it appends
+  `/<x86_64|aarch64>/images.tar.gz` (~620 MB). The archive is flat:
+  `vmlinuz`, `initrd.img`, `root_part` (ext4, a bare partition the VM sees as
+  `/dev/vda1`, ~3 GB with 1.5 GB free), `vm_config.json` (the Terminal's VM
+  config: 4 GiB, auto memory balloon, `root=/dev/vda1 ds=nocloud`) and
+  `build_id`. It has no cidata: the Terminal ships `cidata.iso` in its APK.
+  The download resumes with HTTP Range (If-Range on the ETag), gzip's CRC
+  validates it, and it unpacks (zero blocks as holes) to `files/vm.new`,
+  renamed to `files/vm` once whole. `root_part` is then extended, sparse, to
+  32 GiB, and a marker file (`awb-grow-root`) has cloud-init's
+  `resize_rootfs` grow the file system on boot. An image copied from the
+  Terminal (which sizes it its own way, with resize off in its cidata) has
+  no marker and is left alone.
+* **Provisioning** (`VmCiData`, `app/src/main/assets/vm/provision.sh`). The
+  image runs cloud-init NoCloud from the disk labelled `cidata`. Instead of
+  the Terminal's (which installs its own guest agent), each start writes our
+  own: a minimal ISO 9660 image (one directory, no Rock Ridge: Linux shows
+  the plain names as written) holding user-data, meta-data, network-config
+  and `assets/vm`: awb-display (built from `vm/awb-display` for
+  x86_64-unknown-linux-gnu by the `awbDisplayBuild` Gradle task), awb-run,
+  `awb-display.service` and provision.sh. user-data creates `droid` (uid
+  1000, groups sudo, video, render) and runs provision.sh from the mounted
+  disk, which installs the binaries and the unit (a global user unit, with
+  droid lingering so it runs from boot without a login) and waypipe (apt,
+  with retries while the network comes up). awb-display sets up the rest
+  (GTK, portals) itself. meta-data's instance-id is a hash of the whole
+  content, so cloud-init provisions again exactly when the APK's guest side
+  changes. `vm_ssh_key=<public key>` in `files/awb.properties` adds an SSH
+  key for droid (the image's sshd is on port 22).
+* **Running** (`MainActivity`, `WaylandService`). The main page downloads the
+  image (with progress), starts and stops the VM and shows its state, which
+  the service's notification also shows, with a start/stop button. The VM is
+  "running" once a vsock connection to the guest's awb-display succeeds.
+  `onStopped`/`onDied` from AVF reset the state, stop waypipe and close the
+  relays (a dead VM's vsock connections need not see EOF). The adb
+  actions `dev.awb.action.START_VM` / `STOP_VM` still work.
+* **Still needed over adb** (no root): `pm grant --user 10 dev.awb
+  android.permission.MANAGE_VIRTUAL_MACHINE` and `USE_CUSTOM_VIRTUAL_MACHINE`
+  (development permissions), and `settings put global hidden_api_policy 1`
+  (the AVF classes are system APIs, reached by reflection). The main page
+  checks for each and lists the commands still missing.
+
 ## Headers in the title bar
 
 1. `ToplevelActivity` sets `APPEARANCE_TRANSPARENT_CAPTION_BAR_BACKGROUND`.
