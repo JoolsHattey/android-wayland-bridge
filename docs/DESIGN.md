@@ -930,6 +930,100 @@ replace each other with `pm install -r` / `adb install -r`.
 * `scripts/install-stub.sh` still builds one stub on the host with Gradle
   (an SVG becomes a vector drawable there, with AGP's `Svg2Vector`).
 
+## VM guest agent
+
+Apps in dev.awb's own Debian VM (`VmLauncher`, windows over vsock and
+waypipe through `VmDisplay`) get what the chroot's get from the root side:
+Android's appearance, the caption CSS, links out to Android's browser and
+launcher icons. The guest's `awb-display` (vm/awb-display, one binary, a
+systemd user unit; the user needs lingering, `loginctl enable-linger`, or
+it runs only while someone is logged in) is also the agent for these.
+
+**Channel.** Android drops the VM's connections to apps and apps can't
+listen on vsock, so, as for the display, the app connects:
+`VmAgent` opens vsock port 7006 (`VirtualMachine.connectVsock`), retrying
+every second while the guest boots, and keeps the connection; a new one
+replaces the last. Messages are lines of space-separated ASCII words; a
+message with a payload ends in its byte lengths and the payloads follow:
+
+| Direction | Message | |
+|---|---|---|
+| app → guest | `appearance <0\|1> <rrggbb\|->` | dark mode, accent |
+| app → guest | `file <gtk.css\|caption.json> <len>` | for `~/.config/awb` |
+| app → guest | `launch <desktop id> [<link>]` | runs the app under `awb-run` |
+| guest → app | `hello 1` | protocol version, on connecting |
+| guest → app | `open <link>` | an http(s) link for Android's browser |
+| guest → app | `apps begin`, `app <id> <info len> <png len>`…, `apps end` | the app list |
+
+The app sends its state (appearance, both files, launches asked for
+before the guest was up) on each connection; the guest sends its app
+list on each connection and when it changes.
+
+**Appearance.** The guest's Debian has xdg-desktop-portal, which owns
+`org.freedesktop.portal.Desktop`, so the agent serves
+`org.freedesktop.impl.portal.Settings` as a backend
+(`org.freedesktop.impl.portal.desktop.awb`), with the chroot portal's
+settings (vm/awb-display/src/portal.rs: color-scheme, accent-color,
+button-layout `close:close`) and `SettingChanged`, which the frontend
+passes on. xdg-desktop-portal finds backends by `.portal` file in
+`$XDG_DATA_DIRS` (since 1.20.1), so a drop-in for its user unit puts
+`~/.local/share/awb` first there, and `~/.config/xdg-desktop-portal/portals.conf`
+selects `awb` for Settings and nothing else (`default=none`): the GTK
+backend needs a display, which user services lack, and its activation
+fails so slowly (25 s per interface) that xdg-desktop-portal never came up
+at all; apps now use their own file dialogs. A portals.conf of the user's
+own is left alone. Without xdg-desktop-portal the agent owns the portal
+name itself, as the compositor does on the chroot's bus. Verified:
+`ReadOne` through the frontend answers in 65 ms; `cmd uimode night no`
+reaches a running Text Editor (libadwaita) as `SettingChanged` and it
+turns light.
+
+**Caption CSS.** `AwbApp.writeShared` also hands `gtk.css` and
+`caption.json` to `VmAgent`, which sends them whenever they change; the
+agent writes them to `~/.config/awb` (through a rename). At start it sets
+up GTK 3 and 4 as `awb-run.sh` does in the chroot: `settings.ini`
+`gtk-decoration-layout=close:close` and an `@import` of that gtk.css;
+`vm/awb-run` sets GSettings' button-layout.
+
+**Links.** The agent links `~/.local/bin/awb-open` to itself (run as
+`awb-open`, or `awb-display open <url>`, it is the client), installs
+`awb-android-browser.desktop` and makes it the `http`/`https` handler
+with `xdg-mime`; `awb-run` sets `$BROWSER` to it. `awb-open` checks the
+link (http(s), one word of printable ASCII) and passes it over
+`$XDG_RUNTIME_DIR/awb-agent.sock` to the agent, which sends `open`; the
+app checks it again and starts `ACTION_VIEW` (SYSTEM_ALERT_WINDOW
+allows the background start). `xdg-open` (in an app, where it sees a
+display), `gio open` and `$BROWSER` all reach Chrome.
+
+**Launcher icons.** The agent lists the desktop files a launcher would
+show (as `awb-stubs.sh` decides; `$XDG_DATA_HOME` then `$XDG_DATA_DIRS`,
+first id wins), with Name, `x-scheme-handler` schemes (minus http(s),
+which stay Android's browser's) and the icon as PNG: a path, else the
+largest hicolor PNG, else the scalable SVG rendered by `rsvg-convert` at
+256 px, or, as the image lacks librsvg2-bin, by `gtk4-image-tool convert`
+at its own size (128 px for GNOME's icons). It checks the desktop files'
+times every 5 s and sends the list when it differs. `VmAgent` mirrors it
+to `files/vm-apps` (`<id>.info`: name, schemes and a stamp hashing them
+and the icon; `<id>.png`), writing only changed files. The root side's
+`awb-stubs.sh sync` (run by `awb-launcher.sh` when that directory
+changes) makes every listed app a stub `dev.awb.vm.<id>` with app id
+`vm:<id>`, remakes it on a new stamp or format and removes it when the
+app leaves the list. All of them: a VM app has no other way to start.
+Making and installing stubs still needs root (the key is root-only, and
+installing without root would take the user's consent per stub); without
+it the VM's windows open in dev.awb.
+
+**Their windows.** The VM's clients reach the compositor from our own uid
+(our waypipe client, or crosvm), the chroot's from root's, so the
+compositor (`ClientState.vm`, from `SO_PEERCRED`) prefixes a VM client's
+app id with `vm:`. `AwbApp.onMap` then finds the VM stub, so the same app
+in both has two stubs and its windows land in the right one.
+`launch(vm:<id>)` from a stub goes to `VmAgent`, starting the VM first if
+it isn't running; the agent finds the desktop file by id (never a command
+from the app), expands its Exec (quoting, `%u`/`%f` as the link) and runs
+it under `awb-run`. On the test device a stub click with the VM stopped
+had GTK Demo's window up in its stub's task 3.4 s later.
+
 ## Robustness
 
 * Every request handler runs in `guard()` (`catch_unwind`). A panic logs and
