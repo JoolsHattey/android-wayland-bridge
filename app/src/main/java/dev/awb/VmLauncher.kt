@@ -118,6 +118,9 @@ object VmLauncher {
             .call("addDisk", root)
             .call("addDisk", cidata)
             .call("useNetwork", true)
+            // As the Terminal: virtio-balloon free page reporting, so memory
+            // the guest frees goes back to Android.
+            .call("useAutoMemoryBalloon", true)
         // Without a GPU, virtmgr runs crosvm_minimal, which has no network.
         image = if (crossDomain) crossDomain(image) else image.call("setGpuConfig", gpu(null))
         for (p in listOf(
