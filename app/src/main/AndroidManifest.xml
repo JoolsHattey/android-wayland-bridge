@@ -7,6 +7,12 @@
     <!-- Lets the compositor open a window when a Linux app maps a toplevel
          while none of our windows is in front (background activity start). -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- The Debian VM (VmLauncher). Development permissions: granted with
+         adb shell pm grant, no root. -->
+    <uses-permission android:name="android.permission.MANAGE_VIRTUAL_MACHINE" />
+    <uses-permission android:name="android.permission.USE_CUSTOM_VIRTUAL_MACHINE" />
+    <!-- The VM's network (a TAP interface). -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- Held by window activities, here and in the stub apps (same signing key). -->
     <permission

@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import android.util.Log
 
 /** Keeps the process (and so the compositor) alive while no window is open. */
 class WaylandService : Service() {
@@ -19,6 +20,11 @@ class WaylandService : Service() {
             .setContentText(AwbApp.instance.socketPath)
             .build()
         startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        // The Debian VM (see VmLauncher), started and stopped from adb for now.
+        when (intent?.action) {
+            ACTION_START_VM -> runCatching { VmLauncher.start(this) }.onFailure { Log.e("awb-vm", "start failed", it) }
+            ACTION_STOP_VM -> VmLauncher.stop()
+        }
         return START_STICKY
     }
 
@@ -26,5 +32,7 @@ class WaylandService : Service() {
 
     private companion object {
         const val CHANNEL = "compositor"
+        const val ACTION_START_VM = "dev.awb.action.START_VM"
+        const val ACTION_STOP_VM = "dev.awb.action.STOP_VM"
     }
 }
