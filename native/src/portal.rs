@@ -2,7 +2,8 @@
 //! is the source of appearance settings. It connects to the chroot's session
 //! bus (a socket in our files dir, /run/awb/bus inside the chroot) and serves
 //! org.freedesktop.portal.Settings there, so GTK and libadwaita follow
-//! Android's dark mode and accent colour, live.
+//! Android's dark mode and accent colour, live, and lay out their window
+//! buttons for Android's caption.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -15,6 +16,7 @@ use zbus::zvariant::{OwnedValue, Value};
 const PATH: &str = "/org/freedesktop/portal/desktop";
 const IFACE: &str = "org.freedesktop.portal.Settings";
 const APPEARANCE: &str = "org.freedesktop.appearance";
+const WM_PREFERENCES: &str = "org.gnome.desktop.wm.preferences";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Appearance {
@@ -44,22 +46,25 @@ impl Portal {
     }
 }
 
-/// The settings we publish: namespace -> key -> value.
-fn settings(a: Option<Appearance>) -> Vec<(&'static str, Value<'static>)> {
-    let Some(a) = a else { return Vec::new() };
+/// The settings we publish: (namespace, key, value).
+fn settings(a: Option<Appearance>) -> Vec<(&'static str, &'static str, Value<'static>)> {
+    // Sandboxed GTK (Flatpak) takes its window buttons from here; the rest
+    // from GSettings (set by awb-run.sh). A button on both sides gives each
+    // side a windowcontrols box, whose gtk.css min-width keeps the header
+    // clear of Android's caption controls (see AwbApp.writeGtkCss).
+    let mut v = vec![(WM_PREFERENCES, "button-layout", Value::from("close:close"))];
+    let Some(a) = a else { return v };
     // color-scheme: 0 = no preference, 1 = prefer dark, 2 = prefer light.
-    let mut v = vec![("color-scheme", Value::U32(if a.dark { 1 } else { 2 }))];
+    v.push((APPEARANCE, "color-scheme", Value::U32(if a.dark { 1 } else { 2 })));
     if let Some(rgb) = a.accent {
-        v.push(("accent-color", Value::from(rgb)));
+        v.push((APPEARANCE, "accent-color", Value::from(rgb)));
     }
     v
 }
 
 fn lookup(portal: &Portal, namespace: &str, key: &str) -> Result<OwnedValue, PortalError> {
-    let found = (namespace == APPEARANCE)
-        .then(|| settings(portal.get()).into_iter().find(|(k, _)| *k == key))
-        .flatten();
-    let (_, value) = found.ok_or_else(|| PortalError::NotFound(format!("{namespace}.{key}")))?;
+    let found = settings(portal.get()).into_iter().find(|(n, k, _)| *n == namespace && *k == key);
+    let (_, _, value) = found.ok_or_else(|| PortalError::NotFound(format!("{namespace}.{key}")))?;
     OwnedValue::try_from(value).map_err(|e| PortalError::ZBus(e.into()))
 }
 
@@ -85,13 +90,14 @@ struct Settings(Arc<Portal>);
 #[zbus::interface(name = "org.freedesktop.portal.Settings")]
 impl Settings {
     fn read_all(&self, namespaces: Vec<String>) -> HashMap<String, HashMap<String, OwnedValue>> {
-        let mut out = HashMap::new();
-        if matches(&namespaces, APPEARANCE) {
-            let values = settings(self.0.get())
-                .into_iter()
-                .filter_map(|(k, v)| Some((k.to_string(), OwnedValue::try_from(v).ok()?)))
-                .collect();
-            out.insert(APPEARANCE.to_string(), values);
+        let mut out: HashMap<String, HashMap<String, OwnedValue>> = HashMap::new();
+        for (namespace, key, value) in settings(self.0.get()) {
+            if !matches(&namespaces, namespace) {
+                continue;
+            }
+            if let Ok(value) = OwnedValue::try_from(value) {
+                out.entry(namespace.to_string()).or_default().insert(key.to_string(), value);
+            }
         }
         out
     }
@@ -161,11 +167,11 @@ pub fn run(address: String, portal: Arc<Portal>) {
             }
             let old = settings(published);
             let mut ok = true;
-            for (key, value) in settings(current) {
-                if old.iter().any(|(k, v)| *k == key && *v == value) {
+            for (namespace, key, value) in settings(current) {
+                if old.iter().any(|(n, k, v)| *n == namespace && *k == key && *v == value) {
                     continue;
                 }
-                ok &= conn.emit_signal(None::<()>, PATH, IFACE, "SettingChanged", &(APPEARANCE, key, value)).is_ok();
+                ok &= conn.emit_signal(None::<()>, PATH, IFACE, "SettingChanged", &(namespace, key, value)).is_ok();
             }
             if !ok {
                 break;

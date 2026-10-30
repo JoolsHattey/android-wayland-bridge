@@ -70,6 +70,12 @@ BUS=unix:path=/run/awb/bus
             string:org.freedesktop.portal.Desktop 2>/dev/null | grep -q true && break
         sleep 0.3
     done'
+# Where GSettings has GNOME's window preferences (dconf), GTK takes its
+# button layout from there, not from settings.ini; the default appmenu:close
+# gives the start side no button, and so no room for Android's app chip.
+# Needs gsettings (libglib2.0-bin).
+/data/debian/enter env DBUS_SESSION_BUS_ADDRESS=$BUS sh -c \
+    'command -v gsettings >/dev/null && gsettings set org.gnome.desktop.wm.preferences button-layout close:close' 2>/dev/null
 
 # Web links open in Android's browser: awb-open writes them to the app's open
 # fifo, and awb-launcher.sh hands them to Android. It is the chroot's default

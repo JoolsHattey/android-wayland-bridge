@@ -582,9 +582,13 @@ the Android side. It bind-mounts that directory into the chroot at
    offsets the surface and pointer by that `top` and configures the client
    that much shorter.
 4. **GTK.** The app writes `files/gtk.css` from those rects.
-   `awb-run.sh` sets `gtk-decoration-layout=close:close` and imports the CSS.
-   A real button is needed on both sides: with `menu:` the start box is
-   hidden and its `min-width` reserves nothing.
+   `awb-run.sh` sets the button layout to `close:close` and imports the CSS.
+   A real button is needed on both sides: with `menu:` (or GNOME's default
+   `appmenu:close`) the start box is empty, hidden, and its `min-width`
+   reserves nothing. GTK on Wayland reads the layout from GSettings
+   (`org.gnome.desktop.wm.preferences button-layout`) whenever that schema
+   is installed, and ignores `settings.ini` then, so `awb-run.sh` sets both;
+   sandboxed GTK reads it from the settings portal, which serves it too.
    GTK's own controls stay in the layout but are invisible and sized to the
    system rects (`windowcontrols.start/end { min-width }`). Libadwaita's split
    header bars therefore leave exactly the right room at the outer edges, and
