@@ -18,11 +18,18 @@
 #              that opened windows without one (dev.awb notes them in
 #              files/stub-requests) and for apps installed in the chroot
 #              since the last sync. awb-launcher.sh runs this.
+#   vm-make <id>  makes and installs the stub of the VM's app <id>.
+# The VM's apps (dev.awb's own Debian VM) get stubs too, dev.awb.vm.<id>
+# with app id vm:<id>: dev.awb mirrors its guest agent's app list (name,
+# schemes, stamp and PNG icon per desktop id) to files/vm-apps, and sync
+# makes, remakes and removes them to match that list, all of it, since
+# without a stub a VM app has no way to start.
 R=/data/debian
 DIRS="$R/usr/local/share/applications $R/usr/share/applications"
 KEYS=/data/adb/awb
 REQUESTS=/data/user/10/dev.awb/files/stub-requests
 TMP=/data/local/tmp
+VMAPPS=/data/user/10/dev.awb/files/vm-apps
 
 # dev.awb.app.<id>, made a valid Java name, as stub/build.gradle.kts does.
 pkg() {
@@ -135,11 +142,69 @@ make_stub() {
     return $ok
 }
 
+# dev.awb.vm.<id>, a valid Java name as pkg makes it.
+vmpkg() {
+    echo "dev.awb.vm.$1" | sed 's/[^A-Za-z0-9_.]/_/g; s/\.\([^A-Za-z]\)/._\1/g'
+}
+
+# Key $2 of the VM app $1's info file.
+vmkey() {
+    sed -n "s/^$2=//p" "$VMAPPS/$1.info" | head -n 1
+}
+
+# Makes and installs the stub of the VM's app $1, of stub format $2.
+make_vm_stub() {
+    [ -f $KEYS/stub-key.pk8 ] || { echo "no signing key in $KEYS (deploy.sh pushes it)" >&2; return 1; }
+    [ -f "$VMAPPS/$1.info" ] || { echo "the VM has no app $1" >&2; return 1; }
+    name=$(vmkey "$1" name)
+    [ -n "$name" ] || { echo "vm:$1 has no name" >&2; return 1; }
+    png=$VMAPPS/$1.png
+    [ -s "$png" ] || png=
+    apk=$TMP/awb-stub-$$.apk
+    maker make $apk $KEYS/stub-key.pk8 $KEYS/stub-cert.der "$(vmpkg "$1")" "vm:$1" "$name" "$2-$(vmkey "$1" stamp)" \
+        "$(vmkey "$1" schemes)" $png && pm install -r $apk >/dev/null
+    ok=$?
+    rm -f $apk
+    [ $ok = 0 ] && echo "vm:$1: made $(vmpkg "$1"), '$name'${png:+ with its icon}"
+    return $ok
+}
+
+# The VM's stubs in line with files/vm-apps (none until dev.awb has heard
+# from the VM once).
+sync_vm() {
+    [ -d $VMAPPS ] || return 0
+    ids=$(for f in $VMAPPS/*.info; do [ -f "$f" ] && { f=${f##*/}; echo "${f%.info}"; }; done)
+    have=$(pm list packages dev.awb.vm. | sed -n 's/^package://p')
+    for p in $have; do
+        id=$(for i in $ids; do [ "$(vmpkg "$i")" = "$p" ] && { echo "$i"; break; }; done)
+        if [ -z "$id" ]; then
+            echo "removing $p: gone from the VM"
+            pm uninstall "$p" >/dev/null
+            continue
+        fi
+        v=$(dumpsys package "$p" | sed -n 's/^ *versionCode=\([0-9]*\).*/\1/p; s/^ *versionName=//p' | head -n 2 | paste -sd' ' -)
+        code=${v%% *}; vname=${v#* }
+        if [ "${code:-0}" -lt "$1" ]; then
+            echo "vm:$id: stub format $code, now $1"
+            make_vm_stub "$id" "$1"
+        elif [ "$vname" != "$1-$(vmkey "$id" stamp)" ]; then
+            echo "vm:$id: app or icon changed"
+            make_vm_stub "$id" "$1"
+        fi
+    done
+    for id in $ids; do
+        echo "$have" | grep -qxF "$(vmpkg "$id")" && continue
+        echo "vm:$id: in the VM"
+        make_vm_stub "$id" "$1"
+    done
+}
+
 # The sync command, under the lock on fd 9: one at a time (the launcher,
 # deploy.sh).
 sync_stubs() {
     flock 9
     FORMAT=$(maker format) || return 1
+    sync_vm "$FORMAT"
     STUBS=$(stubs) || return 1
     made=" "
     remake() { make_stub "$1" "$FORMAT" && made="$made$1 "; }
@@ -214,12 +279,16 @@ make)
     FORMAT=$(maker format) || exit 1
     make_stub "$2" "$FORMAT"
     ;;
+vm-make)
+    FORMAT=$(maker format) || exit 1
+    make_vm_stub "$2" "$FORMAT"
+    ;;
 sync)
     # A redirect, not exec: mksh would close it for flock.
     sync_stubs 9>$TMP/awb-stubs.lock
     ;;
 *)
-    echo "usage: awb-stubs.sh info <desktop id> | list | prune | make <desktop id> | sync" >&2
+    echo "usage: awb-stubs.sh info <desktop id> | list | prune | make <desktop id> | vm-make <desktop id> | sync" >&2
     exit 2
     ;;
 esac

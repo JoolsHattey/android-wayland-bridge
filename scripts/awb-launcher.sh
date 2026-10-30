@@ -40,12 +40,13 @@ OPENER=$!
     done
 ) &
 MOVER=$!
-# Stub apps: synced when dev.awb asks for one (stub-requests) or the
-# chroot's desktop files change, and every two minutes (app updates, a new
-# dev.awb with another stub format). Logged to awb-stubs.log.
+# Stub apps: synced when dev.awb asks for one (stub-requests), the
+# chroot's desktop files or the VM's app list (vm-apps) change, and every
+# two minutes (app updates, a new dev.awb with another stub format).
+# Logged to awb-stubs.log.
 (
     LOG=/data/local/tmp/awb-stubs.log
-    state() { stat -c '%Y %s' $APPDIR/stub-requests /data/debian/usr/share/applications /data/debian/usr/local/share/applications 2>/dev/null; }
+    state() { stat -c '%Y %s' $APPDIR/stub-requests $APPDIR/vm-apps /data/debian/usr/share/applications /data/debian/usr/local/share/applications 2>/dev/null; }
     last=; n=0
     while :; do
         now=$(state)
