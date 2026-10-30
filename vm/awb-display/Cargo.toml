@@ -2,10 +2,14 @@
 name = "awb-display"
 version = "0.1.0"
 edition = "2024"
-description = "Guest side of dev.awb's VM display: pairs waypipe servers with the app's vsock connections"
+description = "dev.awb's guest agent: pairs waypipe servers with the app's vsock connections, and carries appearance, links and apps"
 
 [dependencies]
 libc = "0.2"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
 [profile.release]
 strip = true
+opt-level = "s"
+lto = true
+codegen-units = 1

@@ -1,11 +1,22 @@
-//! Guest side of dev.awb's VM display (see dev.awb.VmDisplay).
+//! dev.awb's guest agent (see dev.awb.VmDisplay and dev.awb.VmAgent).
 //!
-//! Each Linux app runs under `waypipe server` (awb-run), which connects to
-//! $XDG_RUNTIME_DIR/awb-display.sock here. The Android app cannot accept
-//! connections from the VM, so it keeps a spare vsock connection open to
-//! port 7005 instead; each waypipe server is paired with the next spare,
-//! and the app hands it to its waypipe client, which talks to the
-//! compositor.
+//! The display: each Linux app runs under `waypipe server` (awb-run), which
+//! connects to $XDG_RUNTIME_DIR/awb-display.sock here. The Android app
+//! cannot accept connections from the VM, so it keeps a spare vsock
+//! connection open to port 7005 instead; each waypipe server is paired with
+//! the next spare, and the app hands it to its waypipe client, which talks
+//! to the compositor.
+//!
+//! The rest (agent.rs) gives the VM's apps what the chroot's get from the
+//! root side: Android's appearance (portal.rs), the caption CSS, links out
+//! to Android's browser and launcher icons (apps.rs), over a control
+//! connection the app keeps open to port 7006. `awb-display open <url>`, or
+//! the binary run as `awb-open`, hands links to it.
+
+mod agent;
+mod apps;
+mod portal;
+mod setup;
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -19,10 +30,28 @@ use std::thread;
 const PORT: u32 = 7005;
 
 fn main() -> io::Result<()> {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+    let mut args = std::env::args();
+    let argv0 = args.next().unwrap_or_default();
+    let first = args.next();
+    if argv0.rsplit('/').next() == Some("awb-open") {
+        std::process::exit(agent::open(first.into_iter().chain(args)));
+    }
+    if first.as_deref() == Some("open") {
+        std::process::exit(agent::open(args));
+    }
+    agent::start();
+    display()
+}
+
+/// $XDG_RUNTIME_DIR, where the sockets for the guest's own processes live.
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| format!("/run/user/{}", unsafe { libc::getuid() }).into());
-    let path = dir.join("awb-display.sock");
+        .unwrap_or_else(|| format!("/run/user/{}", unsafe { libc::getuid() }).into())
+}
+
+fn display() -> io::Result<()> {
+    let path = runtime_dir().join("awb-display.sock");
     let _ = std::fs::remove_file(&path);
     let apps = UnixListener::bind(&path)?;
 
@@ -97,7 +126,7 @@ fn pump(mut from: impl Read + AsRawFd, mut to: impl Write + AsRawFd) {
     }
 }
 
-fn vsock_listen(port: u32) -> io::Result<OwnedFd> {
+pub fn vsock_listen(port: u32) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -116,7 +145,7 @@ fn vsock_listen(port: u32) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-fn vsock_accept(listener: &OwnedFd) -> io::Result<OwnedFd> {
+pub fn vsock_accept(listener: &OwnedFd) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::accept4(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
