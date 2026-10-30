@@ -50,6 +50,10 @@ object VmImage {
     fun installed(context: Context) = REQUIRED.all { File(dir(context), it).isFile }
     fun buildId(context: Context): String? = runCatching { File(dir(context), "build_id").readText().trim() }.getOrNull()
 
+    /** Whether we installed the image (and made root_part larger for its file system to grow into). */
+    fun grows(context: Context) = File(dir(context), GROW_MARKER).isFile
+    private const val GROW_MARKER = "awb-grow-root"
+
     fun refresh(context: Context) {
         if (state !is State.Working) set(if (installed(context)) State.Installed else state.takeIf { it is State.Failed } ?: State.Missing)
     }
@@ -174,6 +178,7 @@ object VmImage {
         }
         for (name in REQUIRED + "build_id") if (!File(tmp, name).isFile) error("archive has no $name")
         RandomAccessFile(File(tmp, "root_part"), "rw").use { if (it.length() < ROOT_BYTES) it.setLength(ROOT_BYTES) }
+        File(tmp, GROW_MARKER).createNewFile()
         // Only logs, say, or a broken image: kept aside, not deleted.
         val dir = dir(context)
         if (dir.exists()) dir.renameTo(File(context.filesDir, "vm.old-${System.currentTimeMillis()}"))

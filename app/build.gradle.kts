@@ -30,6 +30,7 @@ android {
     // Extracted to the native library directory, so libwaypipe.so can run.
     packaging.jniLibs.useLegacyPackaging = true
     sourceSets["main"].assets.directories.add(layout.buildDirectory.dir("generated/stubTemplate").get().asFile.path)
+    sourceSets["main"].assets.directories.add(layout.buildDirectory.dir("generated/vmGuest").get().asFile.path)
 }
 
 // Builds native/ (the Rust compositor) with cargo-ndk into build/rustJniLibs.
@@ -54,6 +55,26 @@ val waypipeBuild by tasks.registering(Exec::class) {
     argumentProviders.add(CommandLineArgumentProvider {
         listOf(script.asFile.path, ndk.get().asFile.path, outDir.get().asFile.path)
     })
+}
+
+// The VM guest's side (vm/), as assets/vm/ next to src/main/assets/vm
+// (provision.sh, the unit): VmCiData puts it on the cidata disk, from which
+// the guest installs it on first boot. awb-display is built for the guest
+// (Debian, glibc), not for Android.
+val awbDisplayBuild by tasks.registering(Exec::class) {
+    val crate = rootProject.layout.projectDirectory.dir("vm/awb-display")
+    workingDir(crate)
+    inputs.dir(crate.dir("src"))
+    inputs.files(crate.file("Cargo.toml"), crate.file("Cargo.lock"))
+    outputs.file(crate.file("target/x86_64-unknown-linux-gnu/release/awb-display"))
+    commandLine("cargo", "build", "--release", "--target", "x86_64-unknown-linux-gnu")
+}
+
+val vmGuest by tasks.registering(Sync::class) {
+    val vm = rootProject.layout.projectDirectory.dir("vm")
+    from(awbDisplayBuild)
+    from(vm.file("awb-run"))
+    into(layout.buildDirectory.dir("generated/vmGuest/vm"))
 }
 
 // The template that StubMaker makes stubs from on the device: the stub
@@ -92,4 +113,4 @@ dependencies {
     implementation("com.android.tools.build:apksig:9.3.2")
 }
 
-tasks.named("preBuild") { dependsOn(cargoBuild, waypipeBuild, stubTemplate) }
+tasks.named("preBuild") { dependsOn(cargoBuild, waypipeBuild, stubTemplate, vmGuest) }

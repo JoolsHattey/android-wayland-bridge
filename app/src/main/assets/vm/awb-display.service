@@ -1,0 +1,11 @@
+# awb-display (vm/awb-display), in every user session; provision.sh installs it.
+[Unit]
+Description=Wayland Bridge display broker
+
+[Service]
+ExecStart=/usr/local/bin/awb-display
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target
